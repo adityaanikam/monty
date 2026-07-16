@@ -220,7 +220,7 @@ impl Checkout {
         mounts: Vec<MountSpec>,
         on_print: OnPrint<'_>,
     ) -> Result<(Option<TurnEvent>, Option<String>), PoolError> {
-        let state = self.pool.dump_key.verify(state)?;
+        let state = self.pool.dump_key().verify(state)?;
         // the dump carries its own limits/consumed time/script name — forget
         // what the worker's Configure established and re-adopt from the reply
         self.pending = None;
@@ -422,7 +422,7 @@ impl Checkout {
             kind: Some(pb::parent_request::Kind::Dump(pb::Dump {})),
         };
         match self.request_turn(&request, self.pool.config.request_timeout, &mut |_, _| {})? {
-            ControlEvent::Dump(state) => Ok(self.pool.dump_key.sign(&state)),
+            ControlEvent::Dump(state) => Ok(self.pool.dump_key().sign(&state)),
             other => Err(self.protocol_violation(&format!("unexpected reply to Dump: {other:?}"))),
         }
     }

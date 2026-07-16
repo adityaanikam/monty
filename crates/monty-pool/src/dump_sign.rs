@@ -43,7 +43,7 @@ const TAG_LEN: usize = 32;
 ///
 /// Supply one via [`crate::PoolConfig::dump_key`] to make dumps restorable
 /// across pools/processes; without one the pool generates a random ephemeral
-/// key at creation, so its dumps only restore into that same pool instance.
+/// key on first use, so its dumps only restore into that same pool instance.
 #[derive(Clone)]
 pub struct DumpKey(Vec<u8>);
 
@@ -59,12 +59,13 @@ impl DumpKey {
     }
 
     /// Generates a random 32-byte key from OS randomness, used when
-    /// [`crate::PoolConfig::dump_key`] is `None`.
-    pub(crate) fn ephemeral() -> Result<Self, PoolError> {
+    /// [`crate::PoolConfig::dump_key`] is `None`. Created lazily on the first
+    /// dump/restore, so pools that never dump draw no randomness. Panics if
+    /// the OS RNG fails — an unrecoverable environment fault, not a pool error.
+    pub(crate) fn ephemeral() -> Self {
         let mut key = vec![0u8; 32];
-        getrandom::fill(&mut key)
-            .map_err(|err| PoolError::Spawn(format!("failed to generate an ephemeral dump key: {err}")))?;
-        Ok(Self(key))
+        getrandom::fill(&mut key).expect("OS randomness unavailable — cannot generate a dump signing key");
+        Self(key)
     }
 
     /// Signs a worker dump envelope, prepending the version byte and MAC tag.

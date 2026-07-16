@@ -1,7 +1,7 @@
 //! The elastic worker pool: prewarming, checkout, replacement, teardown.
 
 use std::{
-    sync::{Arc, Condvar, Mutex, PoisonError},
+    sync::{Arc, Condvar, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
@@ -36,9 +36,11 @@ pub(crate) struct PoolInner {
     /// released, waking blocked `checkout` calls.
     available: Condvar,
     pub(crate) watchdog: Watchdog,
-    /// Signs every `Checkout::dump` and verifies every `Checkout::restore`:
-    /// the configured key, or a random per-pool ephemeral one.
-    pub(crate) dump_key: DumpKey,
+    /// The pool's ephemeral dump-signing key, generated lazily by
+    /// [`PoolInner::dump_key`] on the first dump/restore — used only when
+    /// [`PoolConfig::dump_key`] is `None` (a configured key is borrowed from
+    /// the config directly).
+    ephemeral_dump_key: OnceLock<DumpKey>,
 }
 
 struct PoolState {
@@ -59,7 +61,6 @@ impl Pool {
         }
         let watchdog =
             Watchdog::new().map_err(|err| PoolError::Spawn(format!("failed to spawn the watchdog thread: {err}")))?;
-        let dump_key = config.dump_key.clone().map_or_else(DumpKey::ephemeral, Ok)?;
         // Only the subprocess transport pre-warms workers; WebSocket connections
         // are made per-checkout (its `min_processes` is 0).
         let mut idle = Vec::with_capacity(config.min_processes);
@@ -75,7 +76,7 @@ impl Pool {
                 state: Mutex::new(PoolState { idle, total }),
                 available: Condvar::new(),
                 watchdog,
-                dump_key,
+                ephemeral_dump_key: OnceLock::new(),
             }),
         })
     }
@@ -109,6 +110,16 @@ impl Pool {
 }
 
 impl PoolInner {
+    /// The pool's dump-signing key: the configured [`PoolConfig::dump_key`],
+    /// or a random ephemeral key generated on the first dump/restore — pools
+    /// that never dump draw no OS randomness.
+    pub(crate) fn dump_key(&self) -> &DumpKey {
+        match &self.config.dump_key {
+            Some(key) => key,
+            None => self.ephemeral_dump_key.get_or_init(DumpKey::ephemeral),
+        }
+    }
+
     /// Takes a worker, reusing/spawning a local one or connecting a fresh remote
     /// one, waiting as capacity allows.
     fn acquire_worker(&self) -> Result<Worker, PoolError> {

@@ -14,7 +14,7 @@
 // string is a follow-up); mounts are rejected (no host filesystem in a worker).
 
 import type { InvalidDumpTurn, NativeException, NativeFrame, NativeFutureResult, NativeTurn } from '../native.js'
-import { generateDumpKey, importDumpKey, signDump, verifyDump } from './dumpSign.js'
+import { lazyDumpKey, signDump, verifyDump } from './dumpSign.js'
 import type { Dispatcher } from './host.js'
 import { Reader, Wire, Writer, deframe, frame } from './proto.js'
 import { decodeMontyObject, encodeMontyObject } from './value.js'
@@ -90,24 +90,25 @@ export class WorkerTransport {
 
   private constructor(
     private readonly dispatcher: Dispatcher,
-    private readonly dumpKey: CryptoKey,
+    /** Lazy: the key is imported/generated on the first dump/restore. */
+    private readonly dumpKey: () => Promise<CryptoKey>,
   ) {}
 
   /**
    * Creates the REPL session (`ReplCreate`) and returns the ready transport.
    *
-   * `dumpKey` HMAC-signs `dump()` bytes and verifies them in `restore()`
-   * (`WorkerPool` passes its pool-wide key so dumps restore across sessions).
-   * Omitted: a random per-transport key — such dumps only restore into this
-   * same transport's session, which a fresh checkout never is, so standalone
-   * users who want `restore` must supply a key.
+   * `dumpKey` lazily provides the key that HMAC-signs `dump()` bytes and
+   * verifies them in `restore()` (`WorkerPool` passes its pool-wide provider
+   * so dumps restore across sessions). Omitted: a random per-transport key —
+   * such dumps only restore into this same transport's session, which a fresh
+   * checkout never is, so standalone users who want `restore` must supply one.
    */
   static async create(
     dispatcher: Dispatcher,
     config: WorkerSessionConfig = {},
-    dumpKey?: CryptoKey,
+    dumpKey?: () => Promise<CryptoKey>,
   ): Promise<WorkerTransport> {
-    const transport = new WorkerTransport(dispatcher, dumpKey ?? (await importDumpKey(generateDumpKey())))
+    const transport = new WorkerTransport(dispatcher, dumpKey ?? lazyDumpKey())
     const create = new Writer()
     create.string(1, config.scriptName ?? 'main.py') // ReplCreate.script_name
     if (config.limits) create.lengthDelimited(2, encodeLimits(config.limits)) // ReplCreate.limits
@@ -214,7 +215,7 @@ export class WorkerTransport {
     const reader = new Reader(event.bytes)
     while (!reader.done) {
       const f = reader.next()
-      if (f.field === 1) return signDump(this.dumpKey, f.bytes) // DumpResult.state
+      if (f.field === 1) return signDump(await this.dumpKey(), f.bytes) // DumpResult.state
     }
     throw new Error('DumpResult carried no state')
   }
@@ -230,7 +231,7 @@ export class WorkerTransport {
     // verify before anything reaches the worker, mirroring the native pool
     let inner: Uint8Array
     try {
-      inner = await verifyDump(this.dumpKey, state)
+      inner = await verifyDump(await this.dumpKey(), state)
     } catch (err) {
       return { kind: 'invalidDump', message: err instanceof Error ? err.message : String(err) }
     }

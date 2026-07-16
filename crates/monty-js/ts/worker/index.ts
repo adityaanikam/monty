@@ -94,7 +94,7 @@ export {
   type ExceptionInfo,
   type Frame,
 } from '../errors.js'
-export { generateDumpKey, importDumpKey, MIN_DUMP_KEY_LEN, signDump, verifyDump } from './dumpSign.js'
+export { generateDumpKey, importDumpKey, lazyDumpKey, MIN_DUMP_KEY_LEN, signDump, verifyDump } from './dumpSign.js'
 export {
   type MontyDate,
   type MontyDateTime,

@@ -74,9 +74,9 @@ pub struct PoolConfig {
     pub max_checkouts_per_worker: Option<u32>,
     /// Key used to HMAC-sign [`Checkout::dump`] bytes and verify them in
     /// [`Checkout::restore`]. `None` (the default) generates a random
-    /// ephemeral key at pool creation, so dumps only restore into that same
-    /// pool instance; supply a key for cross-pool or persistent restore. The
-    /// key stays in the parent — it is never sent to workers.
+    /// ephemeral key on the pool's first dump/restore, so dumps only restore
+    /// into that same pool instance; supply a key for cross-pool or persistent
+    /// restore. The key stays in the parent — it is never sent to workers.
     pub dump_key: Option<DumpKey>,
 }
 

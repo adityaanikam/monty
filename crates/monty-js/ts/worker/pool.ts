@@ -18,7 +18,7 @@
 // interrupted, exactly as the plan notes.
 
 import { MontySession } from '../session.js'
-import { generateDumpKey, importDumpKey } from './dumpSign.js'
+import { lazyDumpKey } from './dumpSign.js'
 import { WasmHost, type Dispatcher, inProcessDispatcher } from './host.js'
 import { WorkerTransport, type WorkerSessionConfig } from './transport.js'
 
@@ -103,15 +103,16 @@ export class WorkerPool {
     private readonly factory: WorkerFactory,
     private readonly maxWorkers: number,
     private readonly maxCheckouts: number | undefined,
-    private readonly dumpKey: CryptoKey,
+    /** Lazy: the key is imported/generated on the first dump/restore. */
+    private readonly dumpKey: () => Promise<CryptoKey>,
   ) {}
 
   /** Creates the pool and prewarms `minWorkers` idle workers. */
   static async create(factory: WorkerFactory, options: WorkerPoolOptions = {}): Promise<WorkerPool> {
     const max = Math.max(1, options.maxWorkers ?? 4)
     const min = Math.min(Math.max(0, options.minWorkers ?? 1), max)
-    const dumpKey = await importDumpKey(options.dumpKey ?? generateDumpKey())
-    const pool = new WorkerPool(factory, max, options.maxCheckoutsPerWorker, dumpKey)
+    // validates the key length now; crypto happens on first dump/restore
+    const pool = new WorkerPool(factory, max, options.maxCheckoutsPerWorker, lazyDumpKey(options.dumpKey))
     const warm = await Promise.all(Array.from({ length: min }, () => pool.spawn()))
     pool.idle.push(...warm)
     return pool

@@ -43,6 +43,20 @@ export function importDumpKey(key: Uint8Array): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', copyBytes(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
 }
 
+/**
+ * A memoizing lazy dump-key provider: validates `bytes` eagerly (so a short
+ * key fails at pool creation) but defers key generation and the WebCrypto
+ * import to the first call — pools that never dump touch no crypto, and a
+ * non-secure browser context only fails on actual dump/load use.
+ */
+export function lazyDumpKey(bytes?: Uint8Array): () => Promise<CryptoKey> {
+  if (bytes !== undefined && bytes.length < MIN_DUMP_KEY_LEN) {
+    throw new Error(`dump key must be at least ${MIN_DUMP_KEY_LEN} bytes`)
+  }
+  let key: Promise<CryptoKey> | undefined
+  return () => (key ??= importDumpKey(bytes ?? generateDumpKey()))
+}
+
 /** Signs a worker dump envelope, prepending the version byte and MAC tag. */
 export async function signDump(key: CryptoKey, state: Uint8Array): Promise<Uint8Array> {
   const tag = await crypto.subtle.sign('HMAC', key, withContext(state))
