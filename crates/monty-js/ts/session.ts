@@ -249,8 +249,9 @@ export class MontySession {
    * whole session); throws otherwise. The dump's HMAC signature is verified
    * against the pool's `dumpKey` first — a tampered dump, or one from a pool
    * with a different (or omitted, i.e. ephemeral) key, throws
-   * [`MontyInvalidDumpError`]. The dump restores its own resource limits
-   * and type-check state. Throws if the dump is actually a suspended snapshot.
+   * [`MontyInvalidDumpError`], leaving the session fresh and usable. The dump
+   * restores its own resource limits and type-check state. Throws if the dump
+   * is actually a suspended snapshot.
    */
   async load(state: Uint8Array): Promise<void> {
     this.claimFresh()
@@ -267,7 +268,7 @@ export class MontySession {
       case 'protocol':
         throw await this.failedLoad(new ProtocolError(turn.message))
       case 'invalidDump':
-        throw await this.failedLoad(new MontyInvalidDumpError(turn.message))
+        throw this.rejectedLoad(new MontyInvalidDumpError(turn.message))
       case 'error':
         throw await this.failedLoad(montyErrorFromNative(turn.exception))
       default:
@@ -283,10 +284,10 @@ export class MontySession {
    * Valid only on a fresh session, before any feed or load; throws otherwise.
    * The dump's HMAC signature is verified against the pool's `dumpKey` first —
    * a tampered dump, or one from a pool with a different (or omitted, i.e.
-   * ephemeral) key, throws [`MontyInvalidDumpError`]. Re-supply the same
-   * `mount`s the paused feed used (their host paths are not
-   * in the dump); a missing, extra, or altered mount throws. Throws if the dump
-   * is actually an idle session.
+   * ephemeral) key, throws [`MontyInvalidDumpError`], leaving the session
+   * fresh and usable. Re-supply the same `mount`s the paused feed used (their
+   * host paths are not in the dump); a missing, extra, or altered mount
+   * throws. Throws if the dump is actually an idle session.
    */
   async loadSnapshot(state: Uint8Array, options: LoadSnapshotOptions = {}): Promise<Snapshot> {
     this.claimFresh()
@@ -299,7 +300,7 @@ export class MontySession {
       throw await this.failedLoad(new Error('this dump is an idle session — use load() to restore it'))
     }
     if (turn.kind === 'invalidDump') {
-      throw await this.failedLoad(new MontyInvalidDumpError(turn.message))
+      throw this.rejectedLoad(new MontyInvalidDumpError(turn.message))
     }
     try {
       return await driver.advance(turn)
@@ -333,6 +334,14 @@ export class MontySession {
     } catch {
       // the worker was already discarded (e.g. it crashed) — nothing to release
     }
+    return err
+  }
+
+  /** A load rejected before any worker I/O (dump signature verification
+   *  failed): un-claims the session, which stays fresh and usable — unlike
+   *  [`failedLoad`], where the worker's state is no longer trustworthy. */
+  private rejectedLoad(err: Error): Error {
+    this.driven = false
     return err
   }
 

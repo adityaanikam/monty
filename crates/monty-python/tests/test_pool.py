@@ -88,6 +88,10 @@ def test_tampered_dump_raises_value_error(pool: Monty):
         with pytest.raises(ValueError) as exc_info:
             session.load(tampered)
         assert exc_info.value.args[0] == snapshot(TAMPERED_DUMP_MESSAGE)
+        # the rejection happened before any worker I/O, so the session stays
+        # fresh: the load is retryable with the untampered bytes
+        session.load(state)
+        assert session.feed_run('x') == snapshot(1)
 
 
 def test_ephemeral_dump_cross_pool_raises(pool: Monty):
@@ -103,6 +107,8 @@ def test_ephemeral_dump_cross_pool_raises(pool: Monty):
             with pytest.raises(ValueError) as exc_info:
                 session.load(state)
             assert exc_info.value.args[0] == snapshot(TAMPERED_DUMP_MESSAGE)
+            # the rejected session stays fresh and usable
+            assert session.feed_run('1 + 1') == snapshot(2)
 
 
 def test_str_dump_key_encodes_to_the_same_key_as_bytes():
@@ -295,6 +301,22 @@ async def test_async_dump_key_cross_pool_restore():
         async with pool_b.checkout() as session:
             await session.load(state)
             assert await session.feed_run('x') == snapshot(42)
+
+
+async def test_async_tampered_dump_raises_and_session_stays_fresh():
+    async with AsyncMonty(dump_key=DUMP_KEY) as pool:
+        async with pool.checkout() as session:
+            await session.feed_run('x = 1')
+            state = await session.dump()
+        tampered = state[:-1] + bytes([state[-1] ^ 0xFF])
+        async with pool.checkout() as session:
+            with pytest.raises(ValueError) as exc_info:
+                await session.load(tampered)
+            assert exc_info.value.args[0] == snapshot(TAMPERED_DUMP_MESSAGE)
+            # the rejection happened before any worker I/O, so the session
+            # stays fresh: the load is retryable with the untampered bytes
+            await session.load(state)
+            assert await session.feed_run('x') == snapshot(1)
 
 
 async def test_async_short_dump_key_raises():

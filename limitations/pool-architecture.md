@@ -211,8 +211,9 @@ properties that real CPython does not provide, per the caveat above.
   the key is never sent to workers), and `load` / `load_snapshot` verify the
   signature before anything reaches a worker: a tampered or forged dump raises
   `ValueError` (Python) / `MontyInvalidDumpError` (JS) /
-  `PoolError::InvalidDump` (Rust) and, like any failed load, poisons the
-  session. The signing key comes from the pool constructor (`dump_key=` /
+  `PoolError::InvalidDump` (Rust). Unlike other failed loads this does not
+  poison the session — nothing reached the worker, so the session stays fresh
+  and usable. The signing key comes from the pool constructor (`dump_key=` /
   `dumpKey`, at least 16 bytes); when omitted, a random key is generated per
   pool, so unkeyed dumps only restore into sessions of the same pool object —
   supply a key to restore dumps across pools or processes. Dumps taken before

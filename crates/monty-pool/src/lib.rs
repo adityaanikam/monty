@@ -140,7 +140,8 @@ pub enum PoolError {
     Typing(String),
     /// The dump handed to [`Checkout::restore`] failed HMAC verification (or
     /// is not a signed dump). Raised before the worker is contacted — the
-    /// untrusted bytes never reach it and no load happened.
+    /// untrusted bytes never reach it, no load happened, and the checkout
+    /// stays usable (unlike other restore failures).
     InvalidDump(String),
     /// No worker became available within `checkout_timeout`.
     Exhausted,

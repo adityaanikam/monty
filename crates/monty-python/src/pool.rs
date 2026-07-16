@@ -420,11 +420,16 @@ impl PyMontySession {
                 .ok_or(PoolError::Finished)?
                 .restore(state, mounts, &mut |_, _| {})
         });
-        // a failed restore (bad mount, protocol desync, ...) leaves the worker
-        // in an untrusted state: discard it so a later feed fails fast rather
-        // than running on a half-restored session
-        if result.is_err() {
-            py.detach(|| discard_checkout(&checkout));
+        match &result {
+            // signature verification failed host-side, before any worker I/O —
+            // nothing happened, so un-claim the session: it stays fresh and
+            // usable (retry the load, or feed it)
+            Err(PoolError::InvalidDump(_)) => self.used.store(false, Ordering::Relaxed),
+            // any other failed restore (bad mount, protocol desync, ...) leaves
+            // the worker in an untrusted state: discard it so a later feed
+            // fails fast rather than running on a half-restored session
+            Err(_) => py.detach(|| discard_checkout(&checkout)),
+            Ok(_) => {}
         }
         result.map_err(|e| pool_err_to_py(py, e))
     }
@@ -529,7 +534,7 @@ impl PyAsyncMonty {
             repl_config: parse_repl_config(py, script_name, limits, type_check, type_check_stubs)?,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
             checkout: Arc::new(Mutex::new(None)),
-            used: AtomicBool::new(false),
+            used: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -633,7 +638,7 @@ impl PyAsyncMontyWebsocket {
             repl_config: parse_repl_config(py, script_name, limits, type_check, type_check_stubs)?,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
             checkout: Arc::new(Mutex::new(None)),
-            used: AtomicBool::new(false),
+            used: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -647,8 +652,9 @@ pub struct PyAsyncMontySession {
     dc_registry: DcRegistry,
     checkout: SharedCheckout,
     /// Set once the session has been fed or restored; `load_snapshot` is valid
-    /// only while unset. See [`PyMontySession::load_snapshot`].
-    used: AtomicBool,
+    /// only while unset. See [`PyMontySession::load_snapshot`]. `Arc` so the
+    /// off-thread restore can un-claim a load rejected before any worker I/O.
+    used: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -774,9 +780,10 @@ impl PyAsyncMontySession {
             return Err(session_used_err());
         }
         let checkout = Arc::clone(&self.checkout);
+        let used = Arc::clone(&self.used);
         future_into_py(py, async move {
             // an idle session has no snapshot, so the restored name is unused
-            if restore_turn_async(Arc::clone(&checkout), state, Vec::new())
+            if restore_turn_async(Arc::clone(&checkout), used, state, Vec::new())
                 .await?
                 .0
                 .is_some()
@@ -818,10 +825,11 @@ impl PyAsyncMontySession {
             return Err(session_used_err());
         }
         let checkout = Arc::clone(&self.checkout);
+        let used = Arc::clone(&self.used);
         let dc_registry = self.dc_registry.clone_ref(py);
         let config_script_name = self.repl_config.script_name.clone();
         future_into_py(py, async move {
-            let (event, restored_script_name) = restore_turn_async(Arc::clone(&checkout), state, mounts).await?;
+            let (event, restored_script_name) = restore_turn_async(Arc::clone(&checkout), used, state, mounts).await?;
             let Some(event) = event else {
                 spawn_blocking(move || discard_checkout(&checkout))
                     .await
@@ -965,10 +973,12 @@ fn session_used_err() -> PyErr {
 /// Runs the low-level restore off the event loop (via `spawn_blocking`),
 /// returning the re-announced suspension (`Some`) or `None` for an idle dump,
 /// paired with the dump's adopted script name. The restore turn runs no sandbox
-/// code, so it needs no print sink. Shared by the async
-/// [`PyAsyncMontySession::load`] / `load_snapshot`.
+/// code, so it needs no print sink. `used` is the session's claim flag, reset
+/// on an [`PoolError::InvalidDump`] rejection (no worker I/O happened). Shared
+/// by the async [`PyAsyncMontySession::load`] / `load_snapshot`.
 async fn restore_turn_async(
     checkout: SharedCheckout,
+    used: Arc<AtomicBool>,
     state: Vec<u8>,
     mounts: Vec<MountSpec>,
 ) -> PyResult<(Option<TurnEvent>, Option<String>)> {
@@ -980,10 +990,15 @@ async fn restore_turn_async(
                 .ok_or(PoolError::Finished)
                 .and_then(|checkout| checkout.restore(state, mounts, &mut |_, _| {}))
         };
-        // discard the worker on failure (the lock is released above) so a later
-        // feed fails fast — a failed load is not retryable
-        if result.is_err() {
-            discard_checkout(&checkout);
+        match &result {
+            // signature verification failed host-side, before any worker I/O —
+            // nothing happened, so un-claim the session: it stays fresh and
+            // usable (retry the load, or feed it)
+            Err(PoolError::InvalidDump(_)) => used.store(false, Ordering::Relaxed),
+            // any other failure: discard the worker (the lock is released
+            // above) so a later feed fails fast — that load is not retryable
+            Err(_) => discard_checkout(&checkout),
+            Ok(_) => {}
         }
         result
     })

@@ -750,7 +750,8 @@ fn dump_x_42(pool: &Pool) -> Vec<u8> {
     state
 }
 
-/// Asserts that restoring `state` fails signature verification.
+/// Asserts that restoring `state` fails signature verification, and that the
+/// rejection is non-destructive: the session stays usable.
 #[track_caller]
 fn expect_invalid_dump(pool: &Pool, state: Vec<u8>) {
     let mut session = pool.checkout(&ReplConfig::default()).unwrap();
@@ -765,6 +766,11 @@ fn expect_invalid_dump(pool: &Pool, state: Vec<u8>) {
         err.to_string(),
         "invalid dump: signature verification failed — the dump was signed with a different key or corrupted"
     );
+    // verification failed before any worker I/O, so the session (and its
+    // worker) must remain fresh and usable
+    let event = session.feed("1 + 1", vec![], vec![], false, &mut no_print).unwrap();
+    assert_eq!(expect_complete(event), MontyObject::Int(2));
+    session.finish().unwrap();
 }
 
 #[test]

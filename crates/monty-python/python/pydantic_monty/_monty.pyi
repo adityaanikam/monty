@@ -480,11 +480,11 @@ class MontySession:
         Valid only on a fresh session, before any feed or load; raises
         `RuntimeError` otherwise. The dump's HMAC signature is verified against
         the pool's `dump_key` first — a tampered dump, or one from a pool with
-        a different (or omitted, i.e. ephemeral) key, raises `ValueError`. The
-        dump restores its own `script_name` / limits / type-check state (the
-        `checkout()` config for those is not applied); the dataclass registry
-        from `checkout()` is reused. Raises if the dump is actually a suspended
-        snapshot.
+        a different (or omitted, i.e. ephemeral) key, raises `ValueError`,
+        leaving the session fresh and usable. The dump restores its own
+        `script_name` / limits / type-check state (the `checkout()` config for
+        those is not applied); the dataclass registry from `checkout()` is
+        reused. Raises if the dump is actually a suspended snapshot.
         """
 
     def load_snapshot(
@@ -504,10 +504,11 @@ class MontySession:
         Valid only on a fresh session, before any feed or load; raises
         `RuntimeError` otherwise. The dump's HMAC signature is verified against
         the pool's `dump_key` first — a tampered dump, or one from a pool with
-        a different (or omitted, i.e. ephemeral) key, raises `ValueError`. The
-        dump restores its own `script_name` / limits / type-check state (the
-        `checkout()` config for those is not applied); the dataclass registry
-        from `checkout()` is reused. `mount`
+        a different (or omitted, i.e. ephemeral) key, raises `ValueError`,
+        leaving the session fresh and usable. The dump restores its own
+        `script_name` / limits / type-check state (the `checkout()` config for
+        those is not applied); the dataclass registry from `checkout()` is
+        reused. `mount`
         re-establishes the suspended feed's mounts (whose host paths are not in
         the dump), validated against the dump's recorded requirements — a
         missing, extra, or altered mount raises. `'overlay'` writes made before

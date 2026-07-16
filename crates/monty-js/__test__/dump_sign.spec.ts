@@ -57,6 +57,12 @@ test('dump restores across pools sharing a dumpKey', async () => {
   try {
     const session = await poolB.checkout()
     try {
+      // a rejected load happens before any worker I/O and leaves the session
+      // fresh, so the load is retryable with the untampered bytes
+      // (new Uint8Array, not .slice(): `state` is a Buffer, whose slice aliases)
+      const tampered = new Uint8Array(state)
+      tampered[tampered.length - 1]! ^= 0xff
+      await t.throwsAsync(() => session.load(tampered), { instanceOf: MontyInvalidDumpError })
       await session.load(state)
       t.is(await session.feedRun('x'), 42)
     } finally {
@@ -87,6 +93,9 @@ test('ephemeral-key dumps do not restore into another pool', async () => {
     const session = await poolB.checkout()
     const error = await t.throwsAsync(() => session.load(state), { instanceOf: MontyInvalidDumpError })
     t.is(error.message, `ValueError: ${TAMPERED_MESSAGE}`)
+    // the rejection happened before any worker I/O — the session stays fresh
+    // and usable (a later load would also still be accepted)
+    t.is(await session.feedRun('1 + 1'), 2)
     await session.close()
   } finally {
     await poolB.close()

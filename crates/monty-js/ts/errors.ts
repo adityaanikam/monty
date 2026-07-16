@@ -203,8 +203,8 @@ export class MontyCrashedError extends MontyError {
  * Raised by `load` / `loadSnapshot` when the dump's HMAC signature does not
  * verify: a different `dumpKey` than the pool that produced it (including a
  * pool-local ephemeral key), tampered/corrupted bytes, or not a signed dump
- * at all. The bytes were never sent to a worker; like any failed load, the
- * session is poisoned — check out a fresh one.
+ * at all. The bytes were never sent to a worker and the session stays fresh
+ * and usable — retry the load with valid bytes, or feed it.
  */
 export class MontyInvalidDumpError extends MontyError {
   constructor(message: string) {
