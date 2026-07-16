@@ -294,7 +294,7 @@ class Monty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
-        dump_key: bytes | None = None,
+        dump_key: str | bytes | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `with`.
@@ -313,11 +313,12 @@ class Monty:
                 exceeds it is killed and the call raises `MontyCrashedError`
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
-            dump_key: Key (at least 16 bytes) used to HMAC-sign `dump()` bytes
-                and verify them on `load` / `load_snapshot`; a short key raises
-                `ValueError`. When omitted a random key is generated per pool,
-                so dumps only restore into sessions of this same pool object —
-                supply a key to restore dumps across pools or processes.
+            dump_key: Key used to HMAC-sign `dump()` bytes and verify them on
+                `load` / `load_snapshot` — `bytes`, or a `str` (UTF-8-encoded).
+                At least 16 bytes; shorter raises `ValueError`. When omitted a
+                random key is generated per pool, so dumps only restore into
+                sessions of this same pool object — supply a key to restore
+                dumps across pools or processes.
         """
 
     def __enter__(self) -> Self: ...
@@ -581,7 +582,7 @@ class AsyncMonty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
-        dump_key: bytes | None = None,
+        dump_key: str | bytes | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `async with`.
@@ -635,7 +636,7 @@ class AsyncMontyWebsocket:
         max_processes: int | None = None,
         checkout_timeout: float | None = None,
         request_timeout: float | None = 10.0,
-        dump_key: bytes | None = None,
+        dump_key: str | bytes | None = None,
     ) -> Self:
         """
         Configure a remote worker pool; connections are made by `async with` and
@@ -660,10 +661,10 @@ class AsyncMontyWebsocket:
                 10.0 is often too low for it — a real `uv pip install` can exceed
                 it. Raise `request_timeout` (or pass `None`) when installing
                 dependencies over the WebSocket transport.
-            dump_key: Key (at least 16 bytes) used to HMAC-sign `dump()` bytes
-                and verify them on `load` / `load_snapshot`, exactly as on
-                `Monty`. Omitted: a random per-pool key, so dumps only restore
-                into this same pool object.
+            dump_key: Key used to HMAC-sign `dump()` bytes and verify them on
+                `load` / `load_snapshot`, exactly as on `Monty` (`bytes`, or a
+                `str` UTF-8-encoded; at least 16 bytes). Omitted: a random
+                per-pool key, so dumps only restore into this same pool object.
         """
 
     async def __aenter__(self) -> Self: ...

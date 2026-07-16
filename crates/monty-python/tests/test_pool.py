@@ -105,10 +105,32 @@ def test_ephemeral_dump_cross_pool_raises(pool: Monty):
             assert exc_info.value.args[0] == snapshot(TAMPERED_DUMP_MESSAGE)
 
 
+def test_str_dump_key_encodes_to_the_same_key_as_bytes():
+    # a str key is UTF-8-encoded: pool A keyed with the str restores in pool B
+    # keyed with the equivalent bytes
+    with Monty(dump_key=DUMP_KEY.decode()) as pool_a:
+        with pool_a.checkout() as session:
+            session.feed_run('x = 42')
+            state = session.dump()
+    with Monty(dump_key=DUMP_KEY) as pool_b:
+        with pool_b.checkout() as session:
+            session.load(state)
+            assert session.feed_run('x') == snapshot(42)
+
+
 def test_short_dump_key_raises():
     with pytest.raises(ValueError) as exc_info:
         Monty(dump_key=b'short')
     assert exc_info.value.args[0] == snapshot('dump key must be at least 16 bytes')
+    with pytest.raises(ValueError) as exc_info:
+        Monty(dump_key='short')
+    assert exc_info.value.args[0] == snapshot('dump key must be at least 16 bytes')
+
+
+def test_wrong_type_dump_key_raises():
+    with pytest.raises(TypeError) as exc_info:
+        Monty(dump_key=123)  # pyright: ignore[reportArgumentType]
+    assert exc_info.value.args[0] == snapshot('dump_key must be str or bytes, not int')
 
 
 def test_worker_crash_raises_crashed_error_and_pool_recovers(pool: Monty):

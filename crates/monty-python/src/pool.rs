@@ -99,7 +99,7 @@ impl PyMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
-        dump_key: Option<Vec<u8>>,
+        dump_key: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -464,7 +464,7 @@ impl PyAsyncMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
-        dump_key: Option<Vec<u8>>,
+        dump_key: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -577,7 +577,7 @@ impl PyAsyncMontyWebsocket {
         max_processes: Option<usize>,
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
-        dump_key: Option<Vec<u8>>,
+        dump_key: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_websocket_config(url, max_processes, checkout_timeout, request_timeout, dump_key)?,
@@ -896,7 +896,7 @@ fn parse_pool_config(
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
     max_checkouts_per_worker: Option<u32>,
-    dump_key: Option<Vec<u8>>,
+    dump_key: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PoolConfig> {
     let binary_path = match binary_path {
         Some(path) => path,
@@ -918,12 +918,27 @@ fn parse_pool_config(
     Ok(config)
 }
 
-/// Validates a `dump_key=` constructor argument, rejecting short keys with a
-/// `ValueError` at pool construction rather than at the first dump.
-fn parse_dump_key(dump_key: Option<Vec<u8>>) -> PyResult<Option<DumpKey>> {
-    dump_key
-        .map(|key| DumpKey::new(key).map_err(|err| PyValueError::new_err(err.to_string())))
-        .transpose()
+/// Coerces a `dump_key=` constructor argument — `str` (UTF-8-encoded) or
+/// `bytes` — into a [`DumpKey`], rejecting other types with a `TypeError` and
+/// short keys with a `ValueError` at pool construction, not at the first dump.
+fn parse_dump_key(dump_key: Option<&Bound<'_, PyAny>>) -> PyResult<Option<DumpKey>> {
+    if let Some(key) = dump_key {
+        let bytes = if let Ok(s) = key.cast::<PyString>() {
+            s.to_str()?.as_bytes().to_vec()
+        } else if let Ok(b) = key.cast::<PyBytes>() {
+            b.as_bytes().to_vec()
+        } else {
+            return Err(PyTypeError::new_err(format!(
+                "dump_key must be str or bytes, not {}",
+                key.get_type().name()?
+            )));
+        };
+        DumpKey::new(bytes)
+            .map(Some)
+            .map_err(|err| PyValueError::new_err(err.to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Rejects a non-callable `os=` handler with the same `TypeError` for every
@@ -997,7 +1012,7 @@ fn parse_websocket_config(
     max_processes: Option<usize>,
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
-    dump_key: Option<Vec<u8>>,
+    dump_key: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PoolConfig> {
     let mut config = PoolConfig::websocket(url);
     if let Some(max) = max_processes {
