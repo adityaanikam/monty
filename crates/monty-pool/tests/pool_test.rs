@@ -13,8 +13,9 @@ use std::{
 #[cfg(unix)]
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
+use insta::assert_snapshot;
 use monty::{MontyObject, PrintStream, ResourceLimits};
-use monty_pool::{MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent};
+use monty_pool::{DumpKey, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent};
 
 /// Locates (building once if needed) the `monty` CLI binary for tests.
 fn monty_binary() -> PathBuf {
@@ -724,6 +725,98 @@ fn dump_survives_worker_death_and_loads_elsewhere() {
         .unwrap();
     assert_eq!(expect_complete(event), MontyObject::Int(42));
     restored.finish().unwrap();
+}
+
+// =============================================================================
+// Dump signing
+// =============================================================================
+
+/// A pool config with an explicit dump key, for cross-pool restore tests.
+fn config_with_key(key: &[u8]) -> PoolConfig {
+    let mut config = config();
+    config.dump_key = Some(DumpKey::new(key.to_vec()).unwrap());
+    config
+}
+
+/// Dumps a fresh session holding `x = 42` and returns the signed bytes.
+fn dump_x_42(pool: &Pool) -> Vec<u8> {
+    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    assert_eq!(
+        expect_complete(session.feed("x = 42", vec![], vec![], false, &mut no_print).unwrap()),
+        MontyObject::None
+    );
+    let state = session.dump().unwrap();
+    session.finish().unwrap();
+    state
+}
+
+/// Asserts that restoring `state` fails signature verification.
+#[track_caller]
+fn expect_invalid_dump(pool: &Pool, state: Vec<u8>) {
+    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    let err = session.restore(state, vec![], &mut no_print).unwrap_err();
+    assert!(
+        matches!(err, PoolError::InvalidDump(_)),
+        "expected InvalidDump, got {err:?}"
+    );
+    // assert_eq!, not an inline snapshot — insta rejects the same inline
+    // snapshot location asserted from multiple tests (this helper is shared)
+    assert_eq!(
+        err.to_string(),
+        "invalid dump: signature verification failed — the dump was signed with a different key or corrupted"
+    );
+}
+
+#[test]
+fn tampered_dump_is_rejected() {
+    let pool = Pool::new(config()).unwrap();
+    let mut state = dump_x_42(&pool);
+    // pin the signed format: [version 0x01][32-byte tag][inner envelope]
+    assert_eq!(state[0], 1, "signed-dump format version");
+    // flip one byte of the inner payload — the tag no longer matches
+    let last = state.len() - 1;
+    state[last] ^= 0xff;
+    expect_invalid_dump(&pool, state);
+}
+
+#[test]
+fn dump_restores_across_pools_with_shared_key() {
+    let key = b"an example 32-byte test dump key";
+    let pool_a = Pool::new(config_with_key(key)).unwrap();
+    let state = dump_x_42(&pool_a);
+    drop(pool_a);
+
+    let pool_b = Pool::new(config_with_key(key)).unwrap();
+    let mut restored = pool_b.checkout(&ReplConfig::default()).unwrap();
+    let (event, _script_name) = restored.restore(state, vec![], &mut no_print).unwrap();
+    assert!(event.is_none(), "an idle dump re-announces no suspension");
+    let event = restored.feed("x", vec![], vec![], false, &mut no_print).unwrap();
+    assert_eq!(expect_complete(event), MontyObject::Int(42));
+    restored.finish().unwrap();
+}
+
+#[test]
+fn ephemeral_key_dump_does_not_restore_in_another_pool() {
+    // neither pool configures a key, so each generates its own ephemeral one
+    let pool_a = Pool::new(config()).unwrap();
+    let state = dump_x_42(&pool_a);
+    let pool_b = Pool::new(config()).unwrap();
+    expect_invalid_dump(&pool_b, state);
+}
+
+#[test]
+fn wrong_key_dump_is_rejected() {
+    let pool_a = Pool::new(config_with_key(b"the first pool's signing key....")).unwrap();
+    let state = dump_x_42(&pool_a);
+    let pool_b = Pool::new(config_with_key(b"a different key for pool two....")).unwrap();
+    expect_invalid_dump(&pool_b, state);
+}
+
+#[test]
+fn short_dump_key_is_rejected() {
+    let err = DumpKey::new(vec![0; 15]).unwrap_err();
+    assert_snapshot!(err.to_string(), @"dump key must be at least 16 bytes");
+    assert!(DumpKey::new(vec![0; 16]).is_ok());
 }
 
 // =============================================================================

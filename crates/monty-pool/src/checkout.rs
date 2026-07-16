@@ -210,12 +210,17 @@ impl Checkout {
     /// Returns the re-announced suspension (`Some` — a suspended dump) or `None`
     /// (an idle dump), paired with the worker's adopted script name (the dump's,
     /// not the `Configure` one), which the parent surfaces in restored snapshots.
+    ///
+    /// `state` must carry a valid HMAC signature from the pool's dump key —
+    /// [`PoolError::InvalidDump`] otherwise, raised before the bytes ever
+    /// reach the worker.
     pub fn restore(
         &mut self,
         state: Vec<u8>,
         mounts: Vec<MountSpec>,
         on_print: OnPrint<'_>,
     ) -> Result<(Option<TurnEvent>, Option<String>), PoolError> {
+        let state = self.pool.dump_key.verify(state)?;
         // the dump carries its own limits/consumed time/script name — forget
         // what the worker's Configure established and re-adopt from the reply
         self.pending = None;
@@ -408,12 +413,16 @@ impl Checkout {
     /// Serializes the session (idle or suspended) into opaque bytes that
     /// [`Checkout::restore`] can restore — including into a
     /// different worker after this one crashes. The session stays live.
+    ///
+    /// The returned bytes are HMAC-signed with the pool's dump key
+    /// ([`crate::PoolConfig::dump_key`]), so `restore` rejects tampered or
+    /// forged dumps and dumps from a pool with a different (or ephemeral) key.
     pub fn dump(&mut self) -> Result<Vec<u8>, PoolError> {
         let request = pb::ParentRequest {
             kind: Some(pb::parent_request::Kind::Dump(pb::Dump {})),
         };
         match self.request_turn(&request, self.pool.config.request_timeout, &mut |_, _| {})? {
-            ControlEvent::Dump(state) => Ok(state),
+            ControlEvent::Dump(state) => Ok(self.pool.dump_key.sign(&state)),
             other => Err(self.protocol_violation(&format!("unexpected reply to Dump: {other:?}"))),
         }
     }

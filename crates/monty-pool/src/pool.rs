@@ -10,6 +10,7 @@ use monty_proto::pb;
 use crate::{
     PoolConfig, PoolError,
     checkout::{Checkout, ReplConfig},
+    dump_sign::DumpKey,
     watchdog::Watchdog,
     worker::{Worker, lock_ignore_poison},
 };
@@ -35,6 +36,9 @@ pub(crate) struct PoolInner {
     /// released, waking blocked `checkout` calls.
     available: Condvar,
     pub(crate) watchdog: Watchdog,
+    /// Signs every `Checkout::dump` and verifies every `Checkout::restore`:
+    /// the configured key, or a random per-pool ephemeral one.
+    pub(crate) dump_key: DumpKey,
 }
 
 struct PoolState {
@@ -55,6 +59,7 @@ impl Pool {
         }
         let watchdog =
             Watchdog::new().map_err(|err| PoolError::Spawn(format!("failed to spawn the watchdog thread: {err}")))?;
+        let dump_key = config.dump_key.clone().map_or_else(DumpKey::ephemeral, Ok)?;
         // Only the subprocess transport pre-warms workers; WebSocket connections
         // are made per-checkout (its `min_processes` is 0).
         let mut idle = Vec::with_capacity(config.min_processes);
@@ -70,6 +75,7 @@ impl Pool {
                 state: Mutex::new(PoolState { idle, total }),
                 available: Condvar::new(),
                 watchdog,
+                dump_key,
             }),
         })
     }

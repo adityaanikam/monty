@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod checkout;
+mod dump_sign;
 mod pool;
 mod watchdog;
 mod worker;
@@ -12,6 +13,7 @@ pub use monty_proto::{MAX_VALUE_DEPTH, exceeds_max_value_depth};
 
 pub use crate::{
     checkout::{Checkout, MountSpec, MountSpecMode, OnPrint, ReplConfig, ResumeValue, TurnEvent},
+    dump_sign::{DumpKey, InvalidDumpKey, MIN_DUMP_KEY_LEN},
     pool::Pool,
 };
 
@@ -70,6 +72,12 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
+    /// Key used to HMAC-sign [`Checkout::dump`] bytes and verify them in
+    /// [`Checkout::restore`]. `None` (the default) generates a random
+    /// ephemeral key at pool creation, so dumps only restore into that same
+    /// pool instance; supply a key for cross-pool or persistent restore. The
+    /// key stays in the parent — it is never sent to workers.
+    pub dump_key: Option<DumpKey>,
 }
 
 impl PoolConfig {
@@ -98,6 +106,7 @@ impl PoolConfig {
             request_timeout: None,
             duration_limit_grace: Some(Duration::from_secs(1)),
             max_checkouts_per_worker: None,
+            dump_key: None,
         }
     }
 }
@@ -129,6 +138,10 @@ pub enum PoolError {
     /// `type_check`). The worker and session remain alive; the snippet did
     /// not run.
     Typing(String),
+    /// The dump handed to [`Checkout::restore`] failed HMAC verification (or
+    /// is not a signed dump). Raised before the worker is contacted — the
+    /// untrusted bytes never reach it and no load happened.
+    InvalidDump(String),
     /// No worker became available within `checkout_timeout`.
     Exhausted,
     /// A worker process could not be spawned.
@@ -150,6 +163,7 @@ impl fmt::Display for PoolError {
             Self::Protocol(msg) => write!(f, "monty worker protocol error: {msg}"),
             Self::Runtime(exc) => write!(f, "{exc}"),
             Self::Typing(diagnostics) => write!(f, "type checking failed:\n{diagnostics}"),
+            Self::InvalidDump(msg) => write!(f, "invalid dump: {msg}"),
             Self::Exhausted => f.write_str("no monty worker became available within the checkout timeout"),
             Self::Spawn(msg) => write!(f, "failed to spawn monty worker: {msg}"),
             Self::Finished => f.write_str("this checkout has already been finished"),

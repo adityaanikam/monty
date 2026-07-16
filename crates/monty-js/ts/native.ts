@@ -108,6 +108,14 @@ export interface LoadedTurn {
   kind: 'loaded'
 }
 
+/** A restore's dump bytes failed HMAC verification — wrong `dumpKey`,
+ *  tampered bytes, or not a signed dump. Nothing was sent to the worker.
+ *  Only produced by `NativeSession.restore`. */
+export interface InvalidDumpTurn {
+  kind: 'invalidDump'
+  message: string
+}
+
 /** A non-feed request succeeded with no value or suspension. Only produced by
  *  `NativeSession.installDependencies`. */
 export interface OkTurn {

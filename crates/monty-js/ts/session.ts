@@ -14,6 +14,7 @@ import {
   MontyCrashedError,
   MontyError,
   montyErrorFromNative,
+  MontyInvalidDumpError,
   MontyTypingError,
   notCallableMessage,
   ProtocolError,
@@ -22,6 +23,7 @@ import { PYTHON_EXC_NAMES } from './errors.js'
 import { mountsToNative, type MountDir } from './mount.js'
 import type {
   FunctionCallTurn,
+  InvalidDumpTurn,
   LoadedTurn,
   NameLookupTurn,
   NativeFutureResult,
@@ -244,7 +246,10 @@ export class MontySession {
    * taken mid-execution.
    *
    * Valid only on a fresh session, before any feed or load (it replaces the
-   * whole session); throws otherwise. The dump restores its own resource limits
+   * whole session); throws otherwise. The dump's HMAC signature is verified
+   * against the pool's `dumpKey` first — a tampered dump, or one from a pool
+   * with a different (or omitted, i.e. ephemeral) key, throws
+   * [`MontyInvalidDumpError`]. The dump restores its own resource limits
    * and type-check state. Throws if the dump is actually a suspended snapshot.
    */
   async load(state: Uint8Array): Promise<void> {
@@ -253,6 +258,7 @@ export class MontySession {
     const turn = (await this.native.restore(bytesForNative(state), [], printTarget.write.bind(printTarget))) as
       | NativeTurn
       | LoadedTurn
+      | InvalidDumpTurn
     switch (turn.kind) {
       case 'loaded':
         return
@@ -260,6 +266,8 @@ export class MontySession {
         throw await this.failedLoad(new MontyCrashedError(turn.message, turn))
       case 'protocol':
         throw await this.failedLoad(new ProtocolError(turn.message))
+      case 'invalidDump':
+        throw await this.failedLoad(new MontyInvalidDumpError(turn.message))
       case 'error':
         throw await this.failedLoad(montyErrorFromNative(turn.exception))
       default:
@@ -273,7 +281,10 @@ export class MontySession {
    * for a dump taken between feeds.
    *
    * Valid only on a fresh session, before any feed or load; throws otherwise.
-   * Re-supply the same `mount`s the paused feed used (their host paths are not
+   * The dump's HMAC signature is verified against the pool's `dumpKey` first —
+   * a tampered dump, or one from a pool with a different (or omitted, i.e.
+   * ephemeral) key, throws [`MontyInvalidDumpError`]. Re-supply the same
+   * `mount`s the paused feed used (their host paths are not
    * in the dump); a missing, extra, or altered mount throws. Throws if the dump
    * is actually an idle session.
    */
@@ -283,8 +294,12 @@ export class MontySession {
     const turn = (await this.native.restore(bytesForNative(state), mountsToNative(options.mount), driver.onPrint)) as
       | NativeTurn
       | LoadedTurn
+      | InvalidDumpTurn
     if (turn.kind === 'loaded') {
       throw await this.failedLoad(new Error('this dump is an idle session — use load() to restore it'))
+    }
+    if (turn.kind === 'invalidDump') {
+      throw await this.failedLoad(new MontyInvalidDumpError(turn.message))
     }
     try {
       return await driver.advance(turn)

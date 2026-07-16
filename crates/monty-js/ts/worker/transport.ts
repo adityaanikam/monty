@@ -13,7 +13,8 @@
 // `traceback` strings are not yet rendered (frames are decoded; the rendered
 // string is a follow-up); mounts are rejected (no host filesystem in a worker).
 
-import type { NativeException, NativeFrame, NativeFutureResult, NativeTurn } from '../native.js'
+import type { InvalidDumpTurn, NativeException, NativeFrame, NativeFutureResult, NativeTurn } from '../native.js'
+import { generateDumpKey, importDumpKey, signDump, verifyDump } from './dumpSign.js'
 import type { Dispatcher } from './host.js'
 import { Reader, Wire, Writer, deframe, frame } from './proto.js'
 import { decodeMontyObject, encodeMontyObject } from './value.js'
@@ -38,8 +39,8 @@ export interface WorkerSessionConfig {
 }
 
 // ParentRequest oneof field numbers (see proto/monty/v1/monty.proto). Note
-// field 2 is InstallDependencies (CPython-only) and field 8 is Load, neither of
-// which the wasm transport sends — hence the gaps.
+// field 2 is InstallDependencies (CPython-only), which the wasm transport
+// never sends — hence the gap.
 const Req = {
   ReplCreate: 1,
   ReplFeed: 3,
@@ -87,11 +88,26 @@ export class WorkerTransport {
    */
   onFinish?: (reusable: boolean) => void
 
-  private constructor(private readonly dispatcher: Dispatcher) {}
+  private constructor(
+    private readonly dispatcher: Dispatcher,
+    private readonly dumpKey: CryptoKey,
+  ) {}
 
-  /** Creates the REPL session (`ReplCreate`) and returns the ready transport. */
-  static async create(dispatcher: Dispatcher, config: WorkerSessionConfig = {}): Promise<WorkerTransport> {
-    const transport = new WorkerTransport(dispatcher)
+  /**
+   * Creates the REPL session (`ReplCreate`) and returns the ready transport.
+   *
+   * `dumpKey` HMAC-signs `dump()` bytes and verifies them in `restore()`
+   * (`WorkerPool` passes its pool-wide key so dumps restore across sessions).
+   * Omitted: a random per-transport key — such dumps only restore into this
+   * same transport's session, which a fresh checkout never is, so standalone
+   * users who want `restore` must supply a key.
+   */
+  static async create(
+    dispatcher: Dispatcher,
+    config: WorkerSessionConfig = {},
+    dumpKey?: CryptoKey,
+  ): Promise<WorkerTransport> {
+    const transport = new WorkerTransport(dispatcher, dumpKey ?? (await importDumpKey(generateDumpKey())))
     const create = new Writer()
     create.string(1, config.scriptName ?? 'main.py') // ReplCreate.script_name
     if (config.limits) create.lengthDelimited(2, encodeLimits(config.limits)) // ReplCreate.limits
@@ -198,7 +214,7 @@ export class WorkerTransport {
     const reader = new Reader(event.bytes)
     while (!reader.done) {
       const f = reader.next()
-      if (f.field === 1) return f.bytes // DumpResult.state
+      if (f.field === 1) return signDump(this.dumpKey, f.bytes) // DumpResult.state
     }
     throw new Error('DumpResult carried no state')
   }
@@ -207,12 +223,19 @@ export class WorkerTransport {
     state: Uint8Array,
     mounts: readonly unknown[],
     onPrint: OnPrint,
-  ): Promise<NativeTurn | { kind: 'loaded' }> {
+  ): Promise<NativeTurn | { kind: 'loaded' } | InvalidDumpTurn> {
     if (mounts.length > 0) {
       throw new Error('the wasm worker does not support filesystem mounts (browser has no host filesystem)')
     }
+    // verify before anything reaches the worker, mirroring the native pool
+    let inner: Uint8Array
+    try {
+      inner = await verifyDump(this.dumpKey, state)
+    } catch (err) {
+      return { kind: 'invalidDump', message: err instanceof Error ? err.message : String(err) }
+    }
     const load = new Writer()
-    load.bytes(1, state) // Load.state
+    load.bytes(1, inner) // Load.state
     const event = await this.run(Req.Load, load.finish(), onPrint)
     if (!event) return crashed('worker exited without a turn-ending event')
     if (event.kind === Ev.Ok) return { kind: 'loaded' }

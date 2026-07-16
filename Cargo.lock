@@ -2105,9 +2105,13 @@ dependencies = [
 name = "monty-pool"
 version = "0.0.19-beta.4"
 dependencies = [
+ "getrandom 0.3.4",
+ "hmac",
+ "insta",
  "monty",
  "monty-proto",
  "rustls",
+ "sha2",
  "tempfile",
  "tungstenite",
 ]

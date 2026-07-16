@@ -30,6 +30,13 @@ export interface WasmPoolOptions {
   maxCheckoutsPerWorker?: number
   /** Overrides the worker entry URL used by the browser backend. */
   workerUrl?: string | URL
+  /**
+   * Key (at least 16 bytes) used to HMAC-sign `session.dump()` bytes and
+   * verify them on `load` / `loadSnapshot`, matching the native `dumpKey`.
+   * Omitted: a random per-pool key — dumps stay pool-local. Dump/load needs
+   * WebCrypto (`crypto.subtle`), i.e. a secure context in browsers.
+   */
+  dumpKey?: Uint8Array
 }
 
 /** Creates a pool over the best backend for this environment. */
@@ -43,6 +50,7 @@ export async function createWorkerPool(module: WebAssembly.Module, options: Wasm
     minWorkers: options.minProcesses,
     maxWorkers: options.maxProcesses,
     maxCheckoutsPerWorker: options.maxCheckoutsPerWorker,
+    ...(options.dumpKey !== undefined ? { dumpKey: options.dumpKey } : {}),
   })
 }
 
@@ -78,6 +86,7 @@ export type {
 export {
   MontyCrashedError,
   MontyError,
+  MontyInvalidDumpError,
   MontyRuntimeError,
   MontySyntaxError,
   MontyTypingError,
@@ -85,6 +94,7 @@ export {
   type ExceptionInfo,
   type Frame,
 } from '../errors.js'
+export { generateDumpKey, importDumpKey, MIN_DUMP_KEY_LEN, signDump, verifyDump } from './dumpSign.js'
 export {
   type MontyDate,
   type MontyDateTime,

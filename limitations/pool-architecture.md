@@ -207,6 +207,19 @@ properties that real CPython does not provide, per the caveat above.
 - **`dump()`** bytes use a subprocess-specific envelope and can only be
   restored into another subprocess worker of the same version, via
   `session.load` / `session.load_snapshot` (Rust `Checkout::restore`).
+- **`dump()` bytes are HMAC-SHA256-signed by the host** (the parent process —
+  the key is never sent to workers), and `load` / `load_snapshot` verify the
+  signature before anything reaches a worker: a tampered or forged dump raises
+  `ValueError` (Python) / `MontyInvalidDumpError` (JS) /
+  `PoolError::InvalidDump` (Rust) and, like any failed load, poisons the
+  session. The signing key comes from the pool constructor (`dump_key=` /
+  `dumpKey`, at least 16 bytes); when omitted, a random key is generated per
+  pool, so unkeyed dumps only restore into sessions of the same pool object —
+  supply a key to restore dumps across pools or processes. Dumps taken before
+  signing existed no longer load (they fail with an "unsupported signed-dump
+  version" error). Core `MontyRepl::dump` / `load` (the Rust embedder API
+  below the pool) remain unsigned. On the browser/wasm path, dump/load needs
+  WebCrypto (`crypto.subtle`), i.e. a secure context; execution does not.
 - **`feed_start` snapshots are live cursors, not owned state.** The execution
   state lives in the worker, so only one suspension is live per session, each
   snapshot may be resumed at most once (a second resume raises

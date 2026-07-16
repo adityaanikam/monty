@@ -22,6 +22,7 @@ export { MountDir, type MountDirMode, type MountDirOptions } from './mount.js'
 export {
   MontyCrashedError,
   MontyError,
+  MontyInvalidDumpError,
   MontyRuntimeError,
   MontySyntaxError,
   MontyTypingError,

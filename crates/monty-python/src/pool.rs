@@ -34,7 +34,9 @@ use std::{
 };
 
 use ::monty::{ExcType, ExtFunctionResult, MontyException, MontyObject};
-use monty_pool::{Checkout, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent};
+use monty_pool::{
+    Checkout, DumpKey, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent,
+};
 use monty_proto::python::{DcRegistry, exc_py_to_monty, monty_to_py, py_to_monty_value};
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError},
@@ -86,7 +88,9 @@ impl PyMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
+        dump_key = None,
     ))]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         binary_path: Option<PathBuf>,
@@ -95,6 +99,7 @@ impl PyMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
+        dump_key: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -105,6 +110,7 @@ impl PyMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
+                dump_key,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -447,7 +453,9 @@ impl PyAsyncMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
+        dump_key = None,
     ))]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         binary_path: Option<PathBuf>,
@@ -456,6 +464,7 @@ impl PyAsyncMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
+        dump_key: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -466,6 +475,7 @@ impl PyAsyncMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
+                dump_key,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -560,15 +570,17 @@ impl PyAsyncMontyWebsocket {
         max_processes = None,
         checkout_timeout = None,
         request_timeout = 10.0,
+        dump_key = None,
     ))]
     fn new(
         url: String,
         max_processes: Option<usize>,
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
+        dump_key: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         Ok(Self {
-            config: parse_websocket_config(url, max_processes, checkout_timeout, request_timeout)?,
+            config: parse_websocket_config(url, max_processes, checkout_timeout, request_timeout, dump_key)?,
             pool: Arc::new(Mutex::new(None)),
         })
     }
@@ -875,6 +887,7 @@ impl PyAsyncMontySession {
 /// Builds the subprocess-transport `monty-pool` config from the (shared)
 /// `Monty`/`AsyncMonty` constructor arguments, resolving the binary via
 /// `pydantic_monty._binary` when not given explicitly.
+#[expect(clippy::too_many_arguments)]
 fn parse_pool_config(
     py: Python<'_>,
     binary_path: Option<PathBuf>,
@@ -883,6 +896,7 @@ fn parse_pool_config(
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
     max_checkouts_per_worker: Option<u32>,
+    dump_key: Option<Vec<u8>>,
 ) -> PyResult<PoolConfig> {
     let binary_path = match binary_path {
         Some(path) => path,
@@ -900,7 +914,16 @@ fn parse_pool_config(
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
     config.max_checkouts_per_worker = max_checkouts_per_worker;
+    config.dump_key = parse_dump_key(dump_key)?;
     Ok(config)
+}
+
+/// Validates a `dump_key=` constructor argument, rejecting short keys with a
+/// `ValueError` at pool construction rather than at the first dump.
+fn parse_dump_key(dump_key: Option<Vec<u8>>) -> PyResult<Option<DumpKey>> {
+    dump_key
+        .map(|key| DumpKey::new(key).map_err(|err| PyValueError::new_err(err.to_string())))
+        .transpose()
 }
 
 /// Rejects a non-callable `os=` handler with the same `TypeError` for every
@@ -974,6 +997,7 @@ fn parse_websocket_config(
     max_processes: Option<usize>,
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
+    dump_key: Option<Vec<u8>>,
 ) -> PyResult<PoolConfig> {
     let mut config = PoolConfig::websocket(url);
     if let Some(max) = max_processes {
@@ -981,6 +1005,7 @@ fn parse_websocket_config(
     }
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
+    config.dump_key = parse_dump_key(dump_key)?;
     Ok(config)
 }
 
@@ -1493,6 +1518,7 @@ pub(crate) fn pool_err_to_py(py: Python<'_>, err: PoolError) -> PyErr {
         }
         PoolError::Timeout { .. } => MontyCrashedError::new_err(py, message, true, None),
         PoolError::Exhausted => PyTimeoutError::new_err(message),
+        PoolError::InvalidDump(_) => PyValueError::new_err(message),
         PoolError::Protocol(_) | PoolError::Spawn(_) | PoolError::Finished => PyRuntimeError::new_err(message),
     }
 }

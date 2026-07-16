@@ -18,6 +18,7 @@
 // interrupted, exactly as the plan notes.
 
 import { MontySession } from '../session.js'
+import { generateDumpKey, importDumpKey } from './dumpSign.js'
 import { WasmHost, type Dispatcher, inProcessDispatcher } from './host.js'
 import { WorkerTransport, type WorkerSessionConfig } from './transport.js'
 
@@ -67,6 +68,12 @@ export interface WorkerPoolOptions {
   maxWorkers?: number
   /** Recycle (terminate + replace) a worker after this many checkouts. */
   maxCheckoutsPerWorker?: number
+  /**
+   * Key (at least 16 bytes) used to HMAC-sign `session.dump()` bytes and
+   * verify them on `load` / `loadSnapshot`, matching the native pool's
+   * `dumpKey`. Omitted: a random per-pool key — dumps stay pool-local.
+   */
+  dumpKey?: Uint8Array
 }
 
 /** One pooled worker with its checkout bookkeeping. */
@@ -96,13 +103,15 @@ export class WorkerPool {
     private readonly factory: WorkerFactory,
     private readonly maxWorkers: number,
     private readonly maxCheckouts: number | undefined,
+    private readonly dumpKey: CryptoKey,
   ) {}
 
   /** Creates the pool and prewarms `minWorkers` idle workers. */
   static async create(factory: WorkerFactory, options: WorkerPoolOptions = {}): Promise<WorkerPool> {
     const max = Math.max(1, options.maxWorkers ?? 4)
     const min = Math.min(Math.max(0, options.minWorkers ?? 1), max)
-    const pool = new WorkerPool(factory, max, options.maxCheckoutsPerWorker)
+    const dumpKey = await importDumpKey(options.dumpKey ?? generateDumpKey())
+    const pool = new WorkerPool(factory, max, options.maxCheckoutsPerWorker, dumpKey)
     const warm = await Promise.all(Array.from({ length: min }, () => pool.spawn()))
     pool.idle.push(...warm)
     return pool
@@ -114,7 +123,7 @@ export class WorkerPool {
     const slot = await this.acquire()
     let transport: WorkerTransport
     try {
-      transport = await WorkerTransport.create(slot.worker.dispatch, config)
+      transport = await WorkerTransport.create(slot.worker.dispatch, config, this.dumpKey)
     } catch (err) {
       this.discard(slot)
       throw err

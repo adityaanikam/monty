@@ -25,9 +25,17 @@ tungstenite = { workspace = true }
 # Pulled in only so the pool can install a process-level rustls `CryptoProvider`
 # before the first `wss://` dial (see `install_crypto_provider` in worker.rs).
 rustls = { workspace = true }
+# HMAC-SHA256 signing of dump payloads: the parent signs `Checkout::dump` bytes
+# and verifies them in `Checkout::restore`, so tampered/forged dumps are
+# rejected before ever reaching a worker (see dump_sign.rs).
+hmac = { workspace = true }
+sha2 = { workspace = true }
+# OS randomness for the per-pool ephemeral dump key when none is configured.
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+insta = { workspace = true }
 
 [lints]
 workspace = true

@@ -23,6 +23,7 @@ export {
 export {
   MontyCrashedError,
   MontyError,
+  MontyInvalidDumpError,
   MontyRuntimeError,
   MontySyntaxError,
   MontyTypingError,

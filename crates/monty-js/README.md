@@ -145,6 +145,20 @@ with `await session.load(blob)` (which resolves to `void`) and keep feeding.
 Both `load` and `loadSnapshot` are valid only on a fresh session, before any
 feed; using the wrong one for a dump's kind throws.
 
+Dump bytes are HMAC-SHA256-signed with the pool's `dumpKey` so they cannot be
+forged or tampered with: `load` / `loadSnapshot` verify the signature before
+anything reaches a worker and throw `MontyInvalidDumpError` on a mismatch.
+When no `dumpKey` is given, each pool generates a random key, so its dumps
+only restore into sessions of that same pool object — pass the same
+`dumpKey` (at least 16 bytes) to two pools to restore dumps across them:
+
+```ts
+const pool = await Monty.create({ dumpKey: mySecretKey })
+```
+
+On the browser/wasm path, dump/load needs WebCrypto (`crypto.subtle`), which
+browsers only expose in a secure context; execution itself does not.
+
 ## Print Output
 
 ```ts

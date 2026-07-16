@@ -62,6 +62,55 @@ def test_dump_returns_bytes(session: MontySession) -> None:
     assert len(state) > 0
 
 
+DUMP_KEY = b'an example 32-byte test dump key'
+TAMPERED_DUMP_MESSAGE = (
+    'invalid dump: signature verification failed — the dump was signed with a different key or corrupted'
+)
+
+
+def test_dump_key_cross_pool_restore():
+    with Monty(dump_key=DUMP_KEY) as pool_a:
+        with pool_a.checkout() as session:
+            session.feed_run('x = 42')
+            state = session.dump()
+    with Monty(dump_key=DUMP_KEY) as pool_b:
+        with pool_b.checkout() as session:
+            session.load(state)
+            assert session.feed_run('x') == snapshot(42)
+
+
+def test_tampered_dump_raises_value_error(pool: Monty):
+    with pool.checkout() as session:
+        session.feed_run('x = 1')
+        state = session.dump()
+    tampered = state[:-1] + bytes([state[-1] ^ 0xFF])
+    with pool.checkout() as session:
+        with pytest.raises(ValueError) as exc_info:
+            session.load(tampered)
+        assert exc_info.value.args[0] == snapshot(TAMPERED_DUMP_MESSAGE)
+
+
+def test_ephemeral_dump_cross_pool_raises(pool: Monty):
+    # `pool` configures no dump_key, so its dumps are signed with a random
+    # per-pool key and only restore into that same pool object
+    with pool.checkout() as session:
+        session.feed_run('x = 1')
+        state = session.dump()
+    with pool.checkout() as session:
+        session.load(state)  # same pool: the ephemeral key verifies
+    with Monty() as other_pool:
+        with other_pool.checkout() as session:
+            with pytest.raises(ValueError) as exc_info:
+                session.load(state)
+            assert exc_info.value.args[0] == snapshot(TAMPERED_DUMP_MESSAGE)
+
+
+def test_short_dump_key_raises():
+    with pytest.raises(ValueError) as exc_info:
+        Monty(dump_key=b'short')
+    assert exc_info.value.args[0] == snapshot('dump key must be at least 16 bytes')
+
+
 def test_worker_crash_raises_crashed_error_and_pool_recovers(pool: Monty):
     with pool.checkout() as session:
         pid = session.worker_pid
@@ -213,6 +262,23 @@ async def test_async_dump():
             state = await session.dump()
             assert isinstance(state, bytes)
             assert len(state) > 0
+
+
+async def test_async_dump_key_cross_pool_restore():
+    async with AsyncMonty(dump_key=DUMP_KEY) as pool_a:
+        async with pool_a.checkout() as session:
+            await session.feed_run('x = 42')
+            state = await session.dump()
+    async with AsyncMonty(dump_key=DUMP_KEY) as pool_b:
+        async with pool_b.checkout() as session:
+            await session.load(state)
+            assert await session.feed_run('x') == snapshot(42)
+
+
+async def test_async_short_dump_key_raises():
+    with pytest.raises(ValueError) as exc_info:
+        AsyncMonty(dump_key=b'short')
+    assert exc_info.value.args[0] == snapshot('dump key must be at least 16 bytes')
 
 
 async def test_async_pool_not_entered():

@@ -294,6 +294,7 @@ class Monty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
+        dump_key: bytes | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `with`.
@@ -312,6 +313,11 @@ class Monty:
                 exceeds it is killed and the call raises `MontyCrashedError`
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
+            dump_key: Key (at least 16 bytes) used to HMAC-sign `dump()` bytes
+                and verify them on `load` / `load_snapshot`; a short key raises
+                `ValueError`. When omitted a random key is generated per pool,
+                so dumps only restore into sessions of this same pool object —
+                supply a key to restore dumps across pools or processes.
         """
 
     def __enter__(self) -> Self: ...
@@ -471,10 +477,13 @@ class MontySession:
         dump taken mid-execution.
 
         Valid only on a fresh session, before any feed or load; raises
-        `RuntimeError` otherwise. The dump restores its own `script_name` /
-        limits / type-check state (the `checkout()` config for those is not
-        applied); the dataclass registry from `checkout()` is reused. Raises if
-        the dump is actually a suspended snapshot.
+        `RuntimeError` otherwise. The dump's HMAC signature is verified against
+        the pool's `dump_key` first — a tampered dump, or one from a pool with
+        a different (or omitted, i.e. ephemeral) key, raises `ValueError`. The
+        dump restores its own `script_name` / limits / type-check state (the
+        `checkout()` config for those is not applied); the dataclass registry
+        from `checkout()` is reused. Raises if the dump is actually a suspended
+        snapshot.
         """
 
     def load_snapshot(
@@ -492,9 +501,12 @@ class MontySession:
         `load` for a dump taken between feeds.
 
         Valid only on a fresh session, before any feed or load; raises
-        `RuntimeError` otherwise. The dump restores its own `script_name` /
-        limits / type-check state (the `checkout()` config for those is not
-        applied); the dataclass registry from `checkout()` is reused. `mount`
+        `RuntimeError` otherwise. The dump's HMAC signature is verified against
+        the pool's `dump_key` first — a tampered dump, or one from a pool with
+        a different (or omitted, i.e. ephemeral) key, raises `ValueError`. The
+        dump restores its own `script_name` / limits / type-check state (the
+        `checkout()` config for those is not applied); the dataclass registry
+        from `checkout()` is reused. `mount`
         re-establishes the suspended feed's mounts (whose host paths are not in
         the dump), validated against the dump's recorded requirements — a
         missing, extra, or altered mount raises. `'overlay'` writes made before
@@ -515,6 +527,9 @@ class MontySession:
         """
         Serialize the worker's session state (idle or suspended) to opaque
         bytes using monty's existing dump format. The session stays usable.
+
+        The bytes are HMAC-signed with the pool's `dump_key` (or its ephemeral
+        per-pool key), and `load` / `load_snapshot` verify the signature.
         """
 
     def install_dependencies(self, requirements: list[str]) -> None:
@@ -566,6 +581,7 @@ class AsyncMonty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
+        dump_key: bytes | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `async with`.
@@ -619,6 +635,7 @@ class AsyncMontyWebsocket:
         max_processes: int | None = None,
         checkout_timeout: float | None = None,
         request_timeout: float | None = 10.0,
+        dump_key: bytes | None = None,
     ) -> Self:
         """
         Configure a remote worker pool; connections are made by `async with` and
@@ -643,6 +660,10 @@ class AsyncMontyWebsocket:
                 10.0 is often too low for it — a real `uv pip install` can exceed
                 it. Raise `request_timeout` (or pass `None`) when installing
                 dependencies over the WebSocket transport.
+            dump_key: Key (at least 16 bytes) used to HMAC-sign `dump()` bytes
+                and verify them on `load` / `load_snapshot`, exactly as on
+                `Monty`. Omitted: a random per-pool key, so dumps only restore
+                into this same pool object.
         """
 
     async def __aenter__(self) -> Self: ...
@@ -801,6 +822,9 @@ class AsyncMontySession:
         """
         Serialize the worker's session state (idle or suspended) to opaque
         bytes using monty's existing dump format. The session stays usable.
+
+        The bytes are HMAC-signed with the pool's `dump_key` (or its ephemeral
+        per-pool key), and `load` / `load_snapshot` verify the signature.
         """
 
     async def install_dependencies(self, requirements: list[str]) -> None:

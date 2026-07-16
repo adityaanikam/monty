@@ -30,13 +30,13 @@ use std::{
 
 use monty::{ExcType, MontyException, MontyObject, PrintStream, StackFrame};
 use monty_pool::{
-    exceeds_max_value_depth, Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, ReplConfig,
-    ResumeValue, TurnEvent,
+    exceeds_max_value_depth, Checkout, DumpKey, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError,
+    ReplConfig, ResumeValue, TurnEvent,
 };
 use napi::{
     bindgen_prelude::{
         block_on, spawn_blocking, Array, Buffer, FnArgs, FromNapiValue, Function, JsObjectValue, Object, PromiseRaw,
-        Unknown,
+        Uint8Array, Unknown,
     },
     threadsafe_function::UnknownReturnValue,
     Env, Result,
@@ -83,6 +83,9 @@ pub struct NativePoolOptions {
     pub duration_limit_grace_ms: Option<f64>,
     /// Recycle a worker after serving this many checkouts.
     pub max_checkouts_per_worker: Option<u32>,
+    /// Key (≥ 16 bytes) HMAC-signing `dump()` bytes and verifying them on
+    /// restore. Absent: a random per-pool key — dumps stay pool-local.
+    pub dump_key: Option<Uint8Array>,
 }
 
 /// Session options for `checkout()`.
@@ -132,6 +135,10 @@ impl NativePool {
         config.request_timeout = options.request_timeout_ms.map(duration_from_ms).transpose()?;
         config.duration_limit_grace = options.duration_limit_grace_ms.map(duration_from_ms).transpose()?;
         config.max_checkouts_per_worker = options.max_checkouts_per_worker;
+        config.dump_key = options
+            .dump_key
+            .map(|key| DumpKey::new(key.to_vec()).map_err(|err| invalid(&err.to_string())))
+            .transpose()?;
         if config.max_processes < 1 {
             return Err(invalid("maxProcesses must be at least 1"));
         }
@@ -561,6 +568,9 @@ enum TurnOutcome {
     },
     /// The worker (or caller) violated the protocol; the session is lost.
     Protocol(String),
+    /// A restore's dump bytes failed HMAC verification; nothing was sent to
+    /// the worker. Only produced by [`NativeSession::restore`].
+    InvalidDump(String),
     /// A `load` restored an idle (between-feeds) session — there is no
     /// suspension to resume. Only produced by [`NativeSession::load`].
     LoadedIdle,
@@ -585,6 +595,7 @@ impl From<StdResult<TurnEvent, PoolError>> for TurnOutcome {
                 timed_out: false,
                 exit_status: status.map(|status| status.to_string()),
             },
+            Err(err @ PoolError::InvalidDump(_)) => Self::InvalidDump(err.to_string()),
             Err(other) => Self::Protocol(other.to_string()),
         }
     }
@@ -661,6 +672,10 @@ fn turn_to_js(env: &Env, outcome: TurnOutcome) -> Result<Object<'_>> {
         }
         TurnOutcome::Protocol(message) => {
             obj.set("kind", "protocol")?;
+            obj.set("message", message)?;
+        }
+        TurnOutcome::InvalidDump(message) => {
+            obj.set("kind", "invalidDump")?;
             obj.set("message", message)?;
         }
         TurnOutcome::LoadedIdle => {
