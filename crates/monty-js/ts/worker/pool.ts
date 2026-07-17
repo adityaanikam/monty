@@ -69,11 +69,12 @@ export interface WorkerPoolOptions {
   /** Recycle (terminate + replace) a worker after this many checkouts. */
   maxCheckoutsPerWorker?: number
   /**
-   * Key (at least 16 bytes) used to HMAC-sign `session.dump()` bytes and
-   * verify them on `load` / `loadSnapshot`, matching the native pool's
-   * `dumpKey`. Omitted: a random per-pool key — dumps stay pool-local.
+   * Key used to HMAC-sign `session.dump()` bytes and verify them on `load` /
+   * `loadSnapshot`, matching the native pool's `dumpKey` — raw bytes, or a
+   * string (UTF-8-encoded); at least 16 bytes. Omitted: a random per-pool
+   * key — dumps stay pool-local.
    */
-  dumpKey?: Uint8Array
+  dumpKey?: string | Uint8Array
 }
 
 /** One pooled worker with its checkout bookkeeping. */

@@ -150,7 +150,8 @@ forged or tampered with: `load` / `loadSnapshot` verify the signature before
 anything reaches a worker and throw `MontyInvalidDumpError` on a mismatch.
 When no `dumpKey` is given, each pool generates a random key, so its dumps
 only restore into sessions of that same pool object — pass the same
-`dumpKey` (at least 16 bytes) to two pools to restore dumps across them:
+`dumpKey` (raw bytes, or a string UTF-8-encoded; at least 16 bytes) to two
+pools to restore dumps across them:
 
 ```ts
 const pool = await Monty.create({ dumpKey: mySecretKey })

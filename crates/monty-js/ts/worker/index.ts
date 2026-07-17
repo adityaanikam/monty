@@ -31,12 +31,13 @@ export interface WasmPoolOptions {
   /** Overrides the worker entry URL used by the browser backend. */
   workerUrl?: string | URL
   /**
-   * Key (at least 16 bytes) used to HMAC-sign `session.dump()` bytes and
-   * verify them on `load` / `loadSnapshot`, matching the native `dumpKey`.
-   * Omitted: a random per-pool key — dumps stay pool-local. Dump/load needs
-   * WebCrypto (`crypto.subtle`), i.e. a secure context in browsers.
+   * Key used to HMAC-sign `session.dump()` bytes and verify them on `load` /
+   * `loadSnapshot`, matching the native `dumpKey` — raw bytes, or a string
+   * (UTF-8-encoded); at least 16 bytes. Omitted: a random per-pool key — dumps
+   * stay pool-local. Dump/load needs WebCrypto (`crypto.subtle`), i.e. a
+   * secure context in browsers.
    */
-  dumpKey?: Uint8Array
+  dumpKey?: string | Uint8Array
 }
 
 /** Creates a pool over the best backend for this environment. */

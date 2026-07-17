@@ -93,11 +93,15 @@ impl DumpKey {
                 signed[0]
             )));
         }
-        let inner = signed.split_off(1 + TAG_LEN);
         let mut mac = self.mac();
-        mac.update(&inner);
-        match mac.verify_slice(&signed[1..]) {
-            Ok(()) => Ok(inner),
+        mac.update(&signed[1 + TAG_LEN..]);
+        match mac.verify_slice(&signed[1..=TAG_LEN]) {
+            Ok(()) => {
+                // strip the header in place — dumps can be large (the whole
+                // heap), so avoid reallocating the envelope
+                signed.drain(..=TAG_LEN);
+                Ok(signed)
+            }
             Err(_) => Err(PoolError::InvalidDump(
                 "signature verification failed — the dump was signed with a different key or corrupted".to_owned(),
             )),

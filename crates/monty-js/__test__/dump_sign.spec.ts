@@ -106,6 +106,40 @@ test('short pool dumpKey is rejected at creation', async () => {
   await t.throwsAsync(() => Monty.create({ dumpKey: new Uint8Array(15) }), {
     message: 'dump key must be at least 16 bytes',
   })
+  await t.throwsAsync(() => Monty.create({ dumpKey: 'short' }), {
+    message: 'dump key must be at least 16 bytes',
+  })
+})
+
+// a string key is UTF-8-encoded: a pool keyed with the string restores dumps
+// from a pool keyed with the equivalent bytes, matching the Python binding
+test('string dumpKey encodes to the same key as bytes', async () => {
+  const poolA = await Monty.create({ dumpKey: SHARED_KEY })
+  let state: Uint8Array
+  try {
+    const session = await poolA.checkout()
+    try {
+      await session.feedRun('x = 42')
+      state = await session.dump()
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await poolA.close()
+  }
+
+  const poolB = await Monty.create({ dumpKey: 'an example 32-byte test dump key' })
+  try {
+    const session = await poolB.checkout()
+    try {
+      await session.load(state)
+      t.is(await session.feedRun('x'), 42)
+    } finally {
+      await session.close()
+    }
+  } finally {
+    await poolB.close()
+  }
 })
 
 // The Rust signer (native pool) and the TS signer must be byte-compatible:

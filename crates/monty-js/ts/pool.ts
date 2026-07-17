@@ -8,6 +8,7 @@ import { availableParallelism } from 'node:os'
 import { NativePool } from '../native-addon.js'
 import { findMontyBinary } from './binary.js'
 import { MontySession } from './session.js'
+import { dumpKeyBytes } from './worker/dumpSign.js'
 
 /** Options for [`Monty`]. */
 export interface MontyOptions {
@@ -44,13 +45,13 @@ export interface MontyOptions {
   /** Recycle a worker (kill and replace) after serving this many sessions. */
   maxCheckoutsPerWorker?: number
   /**
-   * Key (at least 16 bytes) used to HMAC-sign `session.dump()` bytes and
-   * verify them on `load` / `loadSnapshot` (`MontyInvalidDumpError` on
-   * mismatch). Omitted: a random key is generated per pool, so dumps only
-   * restore into sessions of this same pool object — supply a key to restore
-   * dumps across pools or processes.
+   * Key used to HMAC-sign `session.dump()` bytes and verify them on `load` /
+   * `loadSnapshot` (`MontyInvalidDumpError` on mismatch) — raw bytes, or a
+   * string (UTF-8-encoded); at least 16 bytes. Omitted: a random key is
+   * generated per pool, so dumps only restore into sessions of this same pool
+   * object — supply a key to restore dumps across pools or processes.
    */
-  dumpKey?: Uint8Array
+  dumpKey?: string | Uint8Array
 }
 
 /** Options for [`Monty.checkout`], mirroring `pydantic_monty`. */
@@ -106,7 +107,7 @@ export class Monty {
         ? { durationLimitGraceMs: (options.durationLimitGrace ?? 1) * 1000 }
         : {}),
       ...(options.maxCheckoutsPerWorker !== undefined ? { maxCheckoutsPerWorker: options.maxCheckoutsPerWorker } : {}),
-      ...(options.dumpKey !== undefined ? { dumpKey: options.dumpKey } : {}),
+      ...(options.dumpKey !== undefined ? { dumpKey: dumpKeyBytes(options.dumpKey) } : {}),
     })
     await native.start()
     return new Monty(native)
