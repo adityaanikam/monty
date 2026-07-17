@@ -13,7 +13,7 @@ pub use monty_proto::{MAX_VALUE_DEPTH, exceeds_max_value_depth};
 
 pub use crate::{
     checkout::{Checkout, MountSpec, MountSpecMode, OnPrint, ReplConfig, ResumeValue, TurnEvent},
-    dump_sign::{DumpKey, InvalidDumpKey, MIN_DUMP_KEY_LEN},
+    dump_sign::{DumpKey, DumpSigning, InvalidDumpKey, MIN_DUMP_KEY_LEN},
     pool::Pool,
 };
 
@@ -72,12 +72,11 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
-    /// Key used to HMAC-sign [`Checkout::dump`] bytes and verify them in
-    /// [`Checkout::restore`]. `None` (the default) generates a random
-    /// ephemeral key on the pool's first dump/restore, so dumps only restore
-    /// into that same pool instance; supply a key for cross-pool or persistent
-    /// restore. The key stays in the parent — it is never sent to workers.
-    pub dump_key: Option<DumpKey>,
+    /// How [`Checkout::dump`] bytes are HMAC-signed and verified in
+    /// [`Checkout::restore`]. Defaults to [`DumpSigning::Ephemeral`] for the
+    /// subprocess transport and [`DumpSigning::Disabled`] for the WebSocket
+    /// transport (the server owns signing there).
+    pub dump_signing: DumpSigning,
 }
 
 impl PoolConfig {
@@ -89,10 +88,13 @@ impl PoolConfig {
     }
 
     /// Creates a WebSocket-transport config dialing `url` verbatim per checkout.
-    /// `min_processes` is 0 (no pre-warming — connections are made per-checkout).
+    /// `min_processes` is 0 (no pre-warming — connections are made per-checkout)
+    /// and dump signing is disabled: the dialed server owns signing, so dump
+    /// bytes pass through this client untouched.
     pub fn websocket(url: impl Into<String>) -> Self {
         let mut config = Self::with_transport(MontyTransport::Websocket(url.into()));
         config.min_processes = 0;
+        config.dump_signing = DumpSigning::Disabled;
         config
     }
 
@@ -106,7 +108,7 @@ impl PoolConfig {
             request_timeout: None,
             duration_limit_grace: Some(Duration::from_secs(1)),
             max_checkouts_per_worker: None,
-            dump_key: None,
+            dump_signing: DumpSigning::Ephemeral,
         }
     }
 }

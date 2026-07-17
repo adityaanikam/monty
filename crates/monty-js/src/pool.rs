@@ -30,8 +30,8 @@ use std::{
 
 use monty::{ExcType, MontyException, MontyObject, PrintStream, StackFrame};
 use monty_pool::{
-    exceeds_max_value_depth, Checkout, DumpKey, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError,
-    ReplConfig, ResumeValue, TurnEvent,
+    exceeds_max_value_depth, Checkout, DumpKey, DumpSigning, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig,
+    PoolError, ReplConfig, ResumeValue, TurnEvent,
 };
 use napi::{
     bindgen_prelude::{
@@ -135,10 +135,10 @@ impl NativePool {
         config.request_timeout = options.request_timeout_ms.map(duration_from_ms).transpose()?;
         config.duration_limit_grace = options.duration_limit_grace_ms.map(duration_from_ms).transpose()?;
         config.max_checkouts_per_worker = options.max_checkouts_per_worker;
-        config.dump_key = options
-            .dump_key
-            .map(|key| DumpKey::new(key.to_vec()).map_err(|err| invalid(&err.to_string())))
-            .transpose()?;
+        if let Some(key) = options.dump_key {
+            let key = DumpKey::new(key.to_vec()).map_err(|err| invalid(&err.to_string()))?;
+            config.dump_signing = DumpSigning::Key(key);
+        }
         if config.max_processes < 1 {
             return Err(invalid("maxProcesses must be at least 1"));
         }

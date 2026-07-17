@@ -637,11 +637,14 @@ class AsyncMontyWebsocket:
         max_processes: int | None = None,
         checkout_timeout: float | None = None,
         request_timeout: float | None = 10.0,
-        dump_key: str | bytes | None = None,
     ) -> Self:
         """
         Configure a remote worker pool; connections are made by `async with` and
         each checkout (no workers are pre-warmed).
+
+        Unlike `Monty` / `AsyncMonty` there is no `dump_key`: this client does
+        not sign or verify `dump()` bytes — the dialed server owns dump signing,
+        and dumps pass through this client untouched.
 
         Arguments:
             url: `ws://`/`wss://` URL to dial — a relay, or any server that
@@ -662,10 +665,6 @@ class AsyncMontyWebsocket:
                 10.0 is often too low for it — a real `uv pip install` can exceed
                 it. Raise `request_timeout` (or pass `None`) when installing
                 dependencies over the WebSocket transport.
-            dump_key: Key used to HMAC-sign `dump()` bytes and verify them on
-                `load` / `load_snapshot`, exactly as on `Monty` (`bytes`, or a
-                `str` UTF-8-encoded; at least 16 bytes). Omitted: a random
-                per-pool key, so dumps only restore into this same pool object.
         """
 
     async def __aenter__(self) -> Self: ...

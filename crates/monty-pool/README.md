@@ -59,9 +59,11 @@ snippet; `Checkout::feed` accepts inputs (host values exposed as sandbox globals
 per-feed filesystem mounts (`MountSpec`). Sessions can be snapshotted with `Checkout::dump`
 and restored later — including on a different worker or machine — with `Checkout::restore`.
 
-Dump bytes are HMAC-SHA256-signed with the pool's `PoolConfig::dump_key` (a random per-pool
-key when unset) and verified on restore, so tampered or forged dumps are rejected
+Dump bytes are HMAC-SHA256-signed per the pool's `PoolConfig::dump_signing` (a random
+per-pool key by default) and verified on restore, so tampered or forged dumps are rejected
 (`PoolError::InvalidDump`) before they ever reach a worker; the key never leaves the parent.
+The WebSocket transport defaults to `DumpSigning::Disabled` — the dialed server owns
+signing, and dump bytes pass through the client untouched.
 
 ## Protections over in-process execution
 

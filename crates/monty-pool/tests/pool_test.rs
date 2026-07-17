@@ -15,7 +15,9 @@ use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
 use insta::assert_snapshot;
 use monty::{MontyObject, PrintStream, ResourceLimits};
-use monty_pool::{DumpKey, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent};
+use monty_pool::{
+    DumpKey, DumpSigning, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent,
+};
 
 /// Locates (building once if needed) the `monty` CLI binary for tests.
 fn monty_binary() -> PathBuf {
@@ -734,7 +736,7 @@ fn dump_survives_worker_death_and_loads_elsewhere() {
 /// A pool config with an explicit dump key, for cross-pool restore tests.
 fn config_with_key(key: &[u8]) -> PoolConfig {
     let mut config = config();
-    config.dump_key = Some(DumpKey::new(key.to_vec()).unwrap());
+    config.dump_signing = DumpSigning::Key(DumpKey::new(key.to_vec()).unwrap());
     config
 }
 
@@ -816,6 +818,46 @@ fn wrong_key_dump_is_rejected() {
     let state = dump_x_42(&pool_a);
     let pool_b = Pool::new(config_with_key(b"a different key for pool two....")).unwrap();
     expect_invalid_dump(&pool_b, state);
+}
+
+#[test]
+fn disabled_signing_passes_dumps_through() {
+    // both pools disable signing (the WebSocket-transport default, here on the
+    // subprocess transport): dumps are the worker's raw envelope, unsigned,
+    // and restore accepts them from any pool without verification
+    let mut config_a = config();
+    config_a.dump_signing = DumpSigning::Disabled;
+    let pool_a = Pool::new(config_a).unwrap();
+    let state = dump_x_42(&pool_a);
+    drop(pool_a);
+
+    let mut config_b = config();
+    config_b.dump_signing = DumpSigning::Disabled;
+    let pool_b = Pool::new(config_b).unwrap();
+    let mut restored = pool_b.checkout(&ReplConfig::default()).unwrap();
+    let (event, _script_name) = restored.restore(state, vec![], &mut no_print).unwrap();
+    assert!(event.is_none(), "an idle dump re-announces no suspension");
+    let event = restored.feed("x", vec![], vec![], false, &mut no_print).unwrap();
+    assert_eq!(expect_complete(event), MontyObject::Int(42));
+    restored.finish().unwrap();
+}
+
+#[test]
+fn unsigned_dump_is_rejected_by_a_signing_pool() {
+    // a dump from a signing-disabled pool is raw, so a (default, ephemeral-key)
+    // signing pool must reject it before it reaches a worker
+    let mut config_a = config();
+    config_a.dump_signing = DumpSigning::Disabled;
+    let pool_a = Pool::new(config_a).unwrap();
+    let state = dump_x_42(&pool_a);
+
+    let pool_b = Pool::new(config()).unwrap();
+    let mut session = pool_b.checkout(&ReplConfig::default()).unwrap();
+    let err = session.restore(state, vec![], &mut no_print).unwrap_err();
+    assert!(
+        matches!(err, PoolError::InvalidDump(_)),
+        "expected InvalidDump, got {err:?}"
+    );
 }
 
 #[test]

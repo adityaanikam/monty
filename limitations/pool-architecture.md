@@ -219,7 +219,11 @@ properties that real CPython does not provide, per the caveat above.
   supply a key to restore dumps across pools or processes. Dumps taken before
   signing existed no longer load (they fail with an "unsupported signed-dump
   version" error). Core `MontyRepl::dump` / `load` (the Rust embedder API
-  below the pool) remain unsigned. Signing provides integrity only, not
+  below the pool) remain unsigned. The WebSocket transport
+  (`AsyncMontyWebsocket`, Rust `PoolConfig::websocket`) does no client-side
+  signing at all — it has no `dump_key`, and dump bytes pass through the
+  client untouched: the dialed server performs the deserialization, so dump
+  signing is the server's responsibility. Signing provides integrity only, not
   confidentiality: dumps are not encrypted, and anyone holding the bytes can
   read the session's code and values. On the browser/wasm path, dump/load
   needs WebCrypto (`crypto.subtle`), i.e. a secure context; execution does not.

@@ -10,7 +10,7 @@ use monty_proto::pb;
 use crate::{
     PoolConfig, PoolError,
     checkout::{Checkout, ReplConfig},
-    dump_sign::DumpKey,
+    dump_sign::{DumpKey, DumpSigning},
     watchdog::Watchdog,
     worker::{Worker, lock_ignore_poison},
 };
@@ -37,9 +37,9 @@ pub(crate) struct PoolInner {
     available: Condvar,
     pub(crate) watchdog: Watchdog,
     /// The pool's ephemeral dump-signing key, generated lazily by
-    /// [`PoolInner::dump_key`] on the first dump/restore — used only when
-    /// [`PoolConfig::dump_key`] is `None` (a configured key is borrowed from
-    /// the config directly).
+    /// [`PoolInner::dump_key`] on the first dump/restore — used only for
+    /// [`DumpSigning::Ephemeral`] (a configured key is borrowed from the
+    /// config directly; disabled signing uses no key at all).
     ephemeral_dump_key: OnceLock<DumpKey>,
 }
 
@@ -110,13 +110,15 @@ impl Pool {
 }
 
 impl PoolInner {
-    /// The pool's dump-signing key: the configured [`PoolConfig::dump_key`],
-    /// or a random ephemeral key generated on the first dump/restore — pools
-    /// that never dump draw no OS randomness.
-    pub(crate) fn dump_key(&self) -> &DumpKey {
-        match &self.config.dump_key {
-            Some(key) => key,
-            None => self.ephemeral_dump_key.get_or_init(DumpKey::ephemeral),
+    /// The pool's dump-signing key per [`PoolConfig::dump_signing`]: the
+    /// configured key, a random ephemeral key generated on the first
+    /// dump/restore (pools that never dump draw no OS randomness), or `None`
+    /// when signing is disabled (dump bytes pass through untouched).
+    pub(crate) fn dump_key(&self) -> Option<&DumpKey> {
+        match &self.config.dump_signing {
+            DumpSigning::Key(key) => Some(key),
+            DumpSigning::Ephemeral => Some(self.ephemeral_dump_key.get_or_init(DumpKey::ephemeral)),
+            DumpSigning::Disabled => None,
         }
     }
 

@@ -35,7 +35,8 @@ use std::{
 
 use ::monty::{ExcType, ExtFunctionResult, MontyException, MontyObject};
 use monty_pool::{
-    Checkout, DumpKey, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent,
+    Checkout, DumpKey, DumpSigning, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue,
+    TurnEvent,
 };
 use monty_proto::python::{DcRegistry, exc_py_to_monty, monty_to_py, py_to_monty_value};
 use pyo3::{
@@ -575,17 +576,15 @@ impl PyAsyncMontyWebsocket {
         max_processes = None,
         checkout_timeout = None,
         request_timeout = 10.0,
-        dump_key = None,
     ))]
     fn new(
         url: String,
         max_processes: Option<usize>,
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
-        dump_key: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
-            config: parse_websocket_config(url, max_processes, checkout_timeout, request_timeout, dump_key)?,
+            config: parse_websocket_config(url, max_processes, checkout_timeout, request_timeout)?,
             pool: Arc::new(Mutex::new(None)),
         })
     }
@@ -922,7 +921,9 @@ fn parse_pool_config(
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
     config.max_checkouts_per_worker = max_checkouts_per_worker;
-    config.dump_key = parse_dump_key(dump_key)?;
+    if let Some(key) = parse_dump_key(dump_key)? {
+        config.dump_signing = DumpSigning::Key(key);
+    }
     Ok(config)
 }
 
@@ -1021,13 +1022,13 @@ pub(crate) fn discard_checkout(checkout: &SharedCheckout) {
 /// Builds the WebSocket-transport `monty-pool` config from the `AsyncMontyWebsocket`
 /// constructor arguments. Each checkout dials `url` verbatim; there is no
 /// pre-warming, so `min_processes` stays 0 and `max_processes` caps concurrent
-/// connections.
+/// connections. Dump signing stays [`DumpSigning::Disabled`] (the
+/// `PoolConfig::websocket` default): the dialed server owns signing.
 fn parse_websocket_config(
     url: String,
     max_processes: Option<usize>,
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
-    dump_key: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PoolConfig> {
     let mut config = PoolConfig::websocket(url);
     if let Some(max) = max_processes {
@@ -1035,7 +1036,6 @@ fn parse_websocket_config(
     }
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
-    config.dump_key = parse_dump_key(dump_key)?;
     Ok(config)
 }
 

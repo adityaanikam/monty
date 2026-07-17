@@ -6,6 +6,9 @@
 //! attack surface. Every dump is therefore signed with the pool's [`DumpKey`]
 //! and verified before a `Load` is ever sent to a worker. The key lives only
 //! in the parent process; workers (which run untrusted code) never see it.
+//! The exception is [`DumpSigning::Disabled`] (the WebSocket-transport
+//! default), where the dialed server owns signing and the client passes dump
+//! bytes through untouched.
 //!
 //! Signed payload layout (`SIGNED_DUMP_VERSION` = 1):
 //!
@@ -39,11 +42,28 @@ const CONTEXT: &[u8] = b"monty-dump-sign-v1";
 /// HMAC-SHA256 output length in bytes.
 const TAG_LEN: usize = 32;
 
+/// How a pool signs [`crate::Checkout::dump`] bytes and verifies them in
+/// [`crate::Checkout::restore`]; set via [`crate::PoolConfig::dump_signing`].
+#[derive(Debug, Clone, Default)]
+pub enum DumpSigning {
+    /// A random key generated on the pool's first dump/restore: dumps only
+    /// restore into that same pool instance. The subprocess-transport default.
+    #[default]
+    Ephemeral,
+    /// A caller-supplied key: dumps restore across pools/processes sharing it.
+    Key(DumpKey),
+    /// No client-side signing — dump/restore bytes pass through untouched and
+    /// unverified. The WebSocket-transport default: the dialed server performs
+    /// the deserialization, so signing is its responsibility, and this client
+    /// only carries opaque bytes.
+    Disabled,
+}
+
 /// A pool's dump-signing key.
 ///
-/// Supply one via [`crate::PoolConfig::dump_key`] to make dumps restorable
-/// across pools/processes; without one the pool generates a random ephemeral
-/// key on first use, so its dumps only restore into that same pool instance.
+/// Supply one via [`DumpSigning::Key`] to make dumps restorable across
+/// pools/processes; the [`DumpSigning::Ephemeral`] default instead generates a
+/// random key on first use, so dumps only restore into that pool instance.
 #[derive(Clone)]
 pub struct DumpKey(Vec<u8>);
 
@@ -58,10 +78,10 @@ impl DumpKey {
         }
     }
 
-    /// Generates a random 32-byte key from OS randomness, used when
-    /// [`crate::PoolConfig::dump_key`] is `None`. Created lazily on the first
-    /// dump/restore, so pools that never dump draw no randomness. Panics if
-    /// the OS RNG fails — an unrecoverable environment fault, not a pool error.
+    /// Generates a random 32-byte key from OS randomness, backing
+    /// [`DumpSigning::Ephemeral`]. Created lazily on the first dump/restore,
+    /// so pools that never dump draw no randomness. Panics if the OS RNG
+    /// fails — an unrecoverable environment fault, not a pool error.
     pub(crate) fn ephemeral() -> Self {
         let mut key = vec![0u8; 32];
         getrandom::fill(&mut key).expect("OS randomness unavailable — cannot generate a dump signing key");
