@@ -30,7 +30,8 @@ use sha2::Sha256;
 use crate::PoolError;
 
 /// Minimum accepted [`DumpKey`] length; shorter keys are rejected at
-/// construction so weak keys never make it into a pool.
+/// construction. Length is the only check — the key must still be secret,
+/// high-entropy material (e.g. 32 bytes from a CSPRNG), not a password.
 pub const MIN_DUMP_KEY_LEN: usize = 16;
 
 /// Format version prepended to every signed dump.

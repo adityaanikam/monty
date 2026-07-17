@@ -228,10 +228,13 @@ export class WorkerTransport {
     if (mounts.length > 0) {
       throw new Error('the wasm worker does not support filesystem mounts (browser has no host filesystem)')
     }
+    // resolved outside the catch: an unavailable-WebCrypto/key failure must
+    // throw, not masquerade as an invalid dump
+    const key = await this.dumpKey()
     // verify before anything reaches the worker, mirroring the native pool
     let inner: Uint8Array
     try {
-      inner = await verifyDump(await this.dumpKey(), state)
+      inner = await verifyDump(key, state)
     } catch (err) {
       return { kind: 'invalidDump', message: err instanceof Error ? err.message : String(err) }
     }

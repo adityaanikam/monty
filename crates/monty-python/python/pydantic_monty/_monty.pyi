@@ -824,8 +824,10 @@ class AsyncMontySession:
         Serialize the worker's session state (idle or suspended) to opaque
         bytes using monty's existing dump format. The session stays usable.
 
-        The bytes are HMAC-signed with the pool's `dump_key` (or its ephemeral
-        per-pool key), and `load` / `load_snapshot` verify the signature.
+        For `AsyncMonty` pools, the bytes are HMAC-signed with the pool's
+        `dump_key` (or its ephemeral per-pool key), and `load` /
+        `load_snapshot` verify the signature. `AsyncMontyWebsocket` sessions
+        pass dump bytes through unsigned — the dialed server owns signing.
         """
 
     async def install_dependencies(self, requirements: list[str]) -> None:

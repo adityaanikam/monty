@@ -24,6 +24,10 @@ const TAG_LEN = 32
 
 /** Generates a random 32-byte ephemeral dump key (pool-local dumps). */
 export function generateDumpKey(): Uint8Array {
+  // requireSubtle so a crypto-less environment gets the clear WebCrypto error
+  // here rather than a bare ReferenceError on `crypto` (and a key generated in
+  // a non-secure context would be unusable anyway — import needs `subtle`)
+  requireSubtle()
   return crypto.getRandomValues(new Uint8Array(32))
 }
 
@@ -44,10 +48,10 @@ export function importDumpKey(key: string | Uint8Array): Promise<CryptoKey> {
   if (bytes.length < MIN_DUMP_KEY_LEN) {
     throw new Error(`dump key must be at least ${MIN_DUMP_KEY_LEN} bytes`)
   }
-  if (typeof crypto === 'undefined' || crypto.subtle === undefined) {
-    throw new Error('dump signing needs WebCrypto (crypto.subtle) — unavailable outside a secure context')
-  }
-  return crypto.subtle.importKey('raw', copyBytes(bytes), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+  return requireSubtle().importKey('raw', copyBytes(bytes), { name: 'HMAC', hash: 'SHA-256' }, false, [
+    'sign',
+    'verify',
+  ])
 }
 
 /**
@@ -57,7 +61,9 @@ export function importDumpKey(key: string | Uint8Array): Promise<CryptoKey> {
  * non-secure browser context only fails on actual dump/load use.
  */
 export function lazyDumpKey(key?: string | Uint8Array): () => Promise<CryptoKey> {
-  const bytes = key === undefined ? undefined : dumpKeyBytes(key)
+  // snapshot the key bytes now — the import is deferred, and a caller mutating
+  // its Uint8Array after pool creation must not change the pool's signing key
+  const bytes = key === undefined ? undefined : copyBytes(dumpKeyBytes(key))
   if (bytes !== undefined && bytes.length < MIN_DUMP_KEY_LEN) {
     throw new Error(`dump key must be at least ${MIN_DUMP_KEY_LEN} bytes`)
   }
@@ -111,6 +117,15 @@ function withContext(state: Uint8Array): Uint8Array<ArrayBuffer> {
   buf.set(CONTEXT, 0)
   buf.set(state, CONTEXT.length)
   return buf
+}
+
+/** Returns `crypto.subtle`, throwing the standard dump-signing error when
+ *  WebCrypto is unavailable (a browser page not in a secure context). */
+function requireSubtle(): SubtleCrypto {
+  if (typeof crypto === 'undefined' || crypto.subtle === undefined) {
+    throw new Error('dump signing needs WebCrypto (crypto.subtle) — unavailable outside a secure context')
+  }
+  return crypto.subtle
 }
 
 /** Copies bytes into a fresh `ArrayBuffer`-backed array (WebCrypto rejects
