@@ -2478,3 +2478,43 @@ fn repr_interned_literal_aliasing_memory_bounded() {
     let exc = result.expect_err("1GB repr of aliased interned literal should exceed the 8MB memory limit");
     assert_eq!(exc.exc_type(), ExcType::MemoryError);
 }
+
+/// Pretty-printed `json.dumps` indentation must be tracker-bounded: `indent`
+/// is an arbitrary user string written `depth` times per line, so
+/// `indent_len x depth` can dwarf the limit in a single untracked write, and
+/// closing indents on the unwind are not followed by any `serialize_value`
+/// entry settle. Here ~1 MB of tracked heap (the indent string plus 50 nested
+/// lists) would pretty-print to ~2.5 GB.
+#[test]
+fn json_dumps_indent_memory_bounded() {
+    let code = "
+import json
+x = []
+for i in range(50):
+    x = [x]
+json.dumps(x, indent=' ' * 1_000_000)
+";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let limits = ResourceLimits::new()
+        .max_memory(8_388_608)
+        .max_duration(Duration::from_secs(30));
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+
+    let exc = result.expect_err("giant-indent pretty print should exceed the 8MB memory limit");
+    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+
+    // A normal pretty print under the same limit is unaffected.
+    let ex = MontyRun::new(
+        "import json\njson.dumps([1, [2]], indent=2)".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let limits = ResourceLimits::new().max_memory(8_388_608);
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+    assert_eq!(
+        result.expect("small pretty json.dumps should succeed"),
+        MontyObject::String("[\n  1,\n  [\n    2\n  ]\n]".to_owned())
+    );
+}

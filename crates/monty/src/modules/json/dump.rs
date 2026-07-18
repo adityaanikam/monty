@@ -14,7 +14,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
     heap::{ContainsHeap, DropGuard, Heap, HeapData, HeapId, HeapRead, HeapReadOutput},
-    resource::{ResourceError, ResourceTracker},
+    resource::{ResourceError, ResourceTracker, check_repeat_size},
     sorting::{apply_permutation, sort_indices},
     types::{Dict, PyTrait, long_int::check_bigint_str_digits_limit, str::allocate_string},
     value::Value,
@@ -512,7 +512,7 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
             }
             if pretty {
                 self.out.push('\n');
-                write_indent(self.out, self.config, depth + 1);
+                self.write_indent(depth + 1)?;
             }
             let body_start = self.out.len();
             if !write_next(self, depth + 1)? {
@@ -527,7 +527,7 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
         }
         if pretty && wrote_any {
             self.out.push('\n');
-            write_indent(self.out, self.config, depth);
+            self.write_indent(depth)?;
         }
         self.out.push(']');
         Ok(())
@@ -571,7 +571,7 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
             }
             if pretty {
                 self.out.push('\n');
-                write_indent(self.out, self.config, depth + 1);
+                self.write_indent(depth + 1)?;
             }
             write_json_key(key, self.out, self.config, self.vm)?;
             self.out.push_str(&self.config.key_separator);
@@ -579,9 +579,29 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
         }
         if pretty && !entries.is_empty() {
             self.out.push('\n');
-            write_indent(self.out, self.config, depth);
+            self.write_indent(depth)?;
         }
         self.out.push('}');
+        Ok(())
+    }
+
+    /// Writes indentation for pretty-printed JSON output: the `indent` string
+    /// repeated once per nesting level, matching CPython for both numeric and
+    /// string indentation.
+    ///
+    /// `indent` is an arbitrary user string, so `indent_len × depth` can dwarf
+    /// the memory limit in this single write — pre-check it like other repeat
+    /// operations, then settle so closing indents written while *unwinding*
+    /// (which no `serialize_value` entry settle follows) stay reserved too.
+    fn write_indent(&mut self, depth: usize) -> RunResult<()> {
+        let config = self.config;
+        if let Some(indent) = &config.indent {
+            check_repeat_size(indent.len(), depth, self.vm.heap.tracker())?;
+            for _ in 0..depth {
+                self.out.push_str(indent);
+            }
+            self.settle()?;
+        }
         Ok(())
     }
 
@@ -818,18 +838,6 @@ fn write_json_float_text(value: f64, out: &mut String) {
         write!(out, "{value}").expect("writing to String cannot fail");
         if !out[start..].contains('.') {
             out.push_str(".0");
-        }
-    }
-}
-
-/// Writes indentation for pretty-printed JSON output.
-///
-/// The `indent` string is repeated once for each nesting level, matching
-/// CPython's behavior for both numeric and string indentation.
-fn write_indent(out: &mut String, config: &JsonDumpsConfig, depth: usize) {
-    if let Some(indent) = &config.indent {
-        for _ in 0..depth {
-            out.push_str(indent);
         }
     }
 }
