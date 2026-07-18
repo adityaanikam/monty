@@ -2368,15 +2368,20 @@ fn finditer_shares_subject_memory() {
 /// arbitrarily far past the configured limit.
 #[test]
 fn repr_shared_structure_memory_bounded() {
-    let code = "xs = ['x' * 500] * 4000\nrepr(xs)";
-    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let limits = ResourceLimits::new()
-        .max_memory(1_048_576)
-        .max_duration(Duration::from_secs(30));
-    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+    // `str(xs)` covers the `HeapReadOutput::py_str` → PyTrait-default
+    // `py_repr` entry, which starts the recursion at the container rather
+    // than at a `Value` — element settling must bound it identically.
+    for call in ["repr", "str"] {
+        let code = format!("xs = ['x' * 500] * 4000\n{call}(xs)");
+        let ex = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).unwrap();
+        let limits = ResourceLimits::new()
+            .max_memory(1_048_576)
+            .max_duration(Duration::from_secs(30));
+        let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
 
-    let exc = result.expect_err("2MB repr should exceed the 1MB memory limit");
-    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+        let exc = result.expect_err("2MB repr should exceed the 1MB memory limit");
+        assert_eq!(exc.exc_type(), ExcType::MemoryError, "{call}: wrong exc type");
+    }
 
     // A small repr under the same limit is unaffected.
     let ex = MontyRun::new(
