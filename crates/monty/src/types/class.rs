@@ -1,4 +1,4 @@
-use std::{fmt::Write, mem};
+use std::mem;
 
 use super::{Dict, LazyHeapSet, PyTrait, Type};
 use crate::{
@@ -9,6 +9,7 @@ use crate::{
     hash::{HashValue, identity_hash},
     heap::{BorrowedHeapReadMut, DropWithContext, HeapId, HeapItem, HeapRead, heap_read_ref_as_field_mut},
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::str::allocate_string,
     value::{EitherStr, Value},
 };
@@ -98,7 +99,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Class> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

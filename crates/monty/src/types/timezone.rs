@@ -4,7 +4,6 @@
 
 use std::{
     collections::hash_map::DefaultHasher,
-    fmt::Write,
     hash::{Hash, Hasher},
     mem,
 };
@@ -18,6 +17,7 @@ use crate::{
     heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::Interns,
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{
         LazyHeapSet, PyTrait, Type,
         str::{StringRepr, allocate_string},
@@ -252,7 +252,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeZone> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

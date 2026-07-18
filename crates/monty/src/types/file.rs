@@ -62,7 +62,7 @@
 //! Any code path that needs one of these should be added explicitly
 //! rather than relying on CPython parity.
 
-use std::{borrow::Cow, fmt::Write, mem, str::FromStr};
+use std::{borrow::Cow, mem, str::FromStr};
 
 use super::{
     LazyHeapSet, List, PyTrait, Type,
@@ -77,6 +77,7 @@ use crate::{
     intern::StaticStrings,
     os::{MontyPath, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs},
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::str::StringRepr,
     value::{EitherStr, Value},
 };
@@ -535,7 +536,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

@@ -9,11 +9,11 @@
 ///
 /// The trait is designed to work with `enum_dispatch` for efficient virtual
 /// dispatch on `HeapData` without boxing overhead.
-use std::{cmp::Ordering, fmt::Write};
+use std::cmp::Ordering;
 
 use ahash::AHashSet;
 
-use super::{Type, allocate_string};
+use super::Type;
 use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
@@ -23,6 +23,7 @@ use crate::{
     intern::StringId,
     os::OsFunctionCall,
     resource::{ResourceError, ResourceTracker},
+    string_builder::{ReprBuilder, ReprWrite},
     value::{EitherStr, Value},
 };
 
@@ -228,30 +229,28 @@ pub(crate) trait PyTrait<'h> {
     /// * `heap_ids` - Set of heap IDs currently being repr'd (for cycle detection)
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()>;
 
     /// Returns the Python `repr()` string for this value as a heap `str` `Value`.
     ///
-    /// Convenience wrapper around `py_repr_fmt` that allocates the result.
-    ///
-    /// TODO: the intermediate `String` here is *not* tracked, so recursive
-    /// `repr()` of nested containers can amplify into a multi-gigabyte
-    /// host-side buffer before `allocate_string` consults the tracker.
-    /// `StringBuilder` is the canonical fix: now that `py_repr` returns a
-    /// `Value`, the builder can be `finish`ed here (outside the recursion),
-    /// but `py_repr_fmt` still borrows `&mut vm` while writing, so plugging it
-    /// in first needs `py_repr_fmt` to no longer need `&mut vm` while the
-    /// builder is alive. Today's per-type protections (`INT_MAX_STR_DIGITS`,
-    /// `check_repeat_size`, etc.) blunt the worst amplifications but don't
-    /// fully cover container `repr()`.
+    /// Convenience wrapper around `py_repr_fmt` that builds into a
+    /// [`ReprBuilder`], so the intermediate buffer is reserved with the
+    /// resource tracker as the recursion settles it (see [`ReprWrite`]) —
+    /// shared/nested containers cannot amplify a small tracked heap into an
+    /// unbounded host-side allocation.
     fn py_repr(&self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
-        let mut s = String::new();
+        let mut builder = ReprBuilder::new();
         let mut heap_ids = LazyHeapSet::default();
-        self.py_repr_fmt(&mut s, vm, &mut heap_ids)?;
-        Ok(allocate_string(s, vm.heap)?)
+        match self.py_repr_fmt(&mut builder, vm, &mut heap_ids) {
+            Ok(()) => builder.finish(vm.heap),
+            Err(e) => {
+                builder.cancel(vm.heap.tracker());
+                Err(e)
+            }
+        }
     }
 
     /// Returns the Python `str()` string for this value.

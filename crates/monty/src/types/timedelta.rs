@@ -22,6 +22,7 @@ use crate::{
     heap::{HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::StaticStrings,
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{CmpOrder, LazyHeapSet, PyTrait, Type, str::allocate_string},
     value::{EitherStr, Value},
 };
@@ -338,7 +339,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

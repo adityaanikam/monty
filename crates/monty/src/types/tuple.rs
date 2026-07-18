@@ -18,7 +18,6 @@ use std::{
     cell::Cell,
     cmp::Ordering,
     collections::hash_map::DefaultHasher,
-    fmt::Write,
     hash::{Hash, Hasher},
     mem,
 };
@@ -35,6 +34,7 @@ use crate::{
     heap::{DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::StaticStrings,
     resource::{ResourceError, ResourceTracker},
+    string_builder::ReprWrite,
     types::{
         LazyHeapSet, Type,
         list::repr_sequence_fmt,
@@ -443,7 +443,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

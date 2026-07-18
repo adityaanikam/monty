@@ -1,4 +1,4 @@
-use std::{cell::Cell, fmt::Write, mem};
+use std::{cell::Cell, mem};
 
 use hashbrown::HashTable;
 use smallvec::SmallVec;
@@ -16,6 +16,7 @@ use crate::{
     },
     intern::StaticStrings,
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{LazyHeapSet, Type},
     value::{EitherStr, Value},
 };
@@ -503,7 +504,7 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// Writes the repr format to a formatter.
     fn repr_fmt<T: ResourceTracker>(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, T>,
         heap_ids: &mut LazyHeapSet,
         type_name: &str,
@@ -1002,7 +1003,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Set> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -1293,7 +1294,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, FrozenSet> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

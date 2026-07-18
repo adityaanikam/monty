@@ -11,6 +11,7 @@ use crate::{
     heap::{DropGuard, HeapData},
     intern::{StaticStrings, StringId},
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{LazyHeapSet, PyTrait, Type},
     value::Value,
 };
@@ -530,6 +531,9 @@ impl TruncatingWriter {
         self.buf
     }
 }
+
+/// The byte cap bounds the buffer, so no tracker settlement is needed.
+impl ReprWrite for TruncatingWriter {}
 
 impl Write for TruncatingWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {

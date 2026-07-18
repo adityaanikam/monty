@@ -22,6 +22,7 @@ use crate::{
     intern::{Interns, StaticStrings},
     os::OsFunctionCall,
     resource::{ResourceError, ResourceTracker},
+    string_builder::ReprWrite,
     types::{
         AttrCallResult, CmpOrder, LazyHeapSet, PyTrait, TimeDelta, Type,
         str::{allocate_string, allocate_string_no_interning},
@@ -231,7 +232,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Date> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

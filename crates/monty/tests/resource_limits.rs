@@ -2357,3 +2357,105 @@ fn finditer_shares_subject_memory() {
         MontyObject::Int(4000)
     );
 }
+
+/// Regression: `repr()` of an aliased container must be bounded by the memory
+/// limit *while formatting*, not only when the final string is allocated.
+///
+/// The tracked heap here is tiny (4000 pointers to one shared 500-char
+/// string, ~64 KB) but the repr is ~2 MB. Before `ReprBuilder` settled the
+/// buffer with the tracker per heap value, the whole repr was built in an
+/// untracked Rust `String`, so shared structures could grow host memory
+/// arbitrarily far past the configured limit.
+#[test]
+fn repr_shared_structure_memory_bounded() {
+    let code = "xs = ['x' * 500] * 4000\nrepr(xs)";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let limits = ResourceLimits::new()
+        .max_memory(1_048_576)
+        .max_duration(Duration::from_secs(30));
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+
+    let exc = result.expect_err("2MB repr should exceed the 1MB memory limit");
+    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+
+    // A small repr under the same limit is unaffected.
+    let ex = MontyRun::new(
+        "repr(['x' * 5] * 4)".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let limits = ResourceLimits::new().max_memory(1_048_576);
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+    assert_eq!(
+        result.expect("small repr should succeed"),
+        MontyObject::String("['xxxxx', 'xxxxx', 'xxxxx', 'xxxxx']".to_owned())
+    );
+}
+
+/// A raising user `__repr__` must release the repr buffer's tracker
+/// reservation (`ReprBuilder::cancel`): the exception is catchable, so a
+/// leaked reservation would accumulate across iterations and spuriously
+/// trip the memory limit even though no memory is actually retained.
+#[test]
+fn repr_error_path_releases_reservation() {
+    let code = r"
+class Bad:
+    def __repr__(self):
+        raise ValueError('nope')
+
+xs = ['x' * 500] * 100 + [Bad()]
+for i in range(100):
+    try:
+        repr(xs)
+    except ValueError:
+        pass
+'ok'
+";
+    // Each failed repr settles ~50 KB before `Bad.__repr__` raises; leaking
+    // those reservations would exceed the 2 MB limit well before the loop ends.
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let limits = ResourceLimits::new()
+        .max_memory(2_097_152)
+        .max_duration(Duration::from_secs(30));
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+    assert_eq!(
+        result.expect("cancelled repr reservations must not accumulate"),
+        MontyObject::String("ok".to_owned())
+    );
+}
+
+/// Regression: `json.dumps` output must be bounded by the memory limit while
+/// serializing. The encoder writes into a Rust `String` outside the tracker;
+/// before `Encoder::settle` a shared (DAG) structure like this one — ~64 KB
+/// of tracked heap serializing to ~2 MB of JSON — bypassed the limit
+/// entirely, since `json.dumps` never consulted the tracker until the final
+/// `allocate_string`.
+#[test]
+fn json_dumps_shared_structure_memory_bounded() {
+    let code = "import json\nx = ['a' * 500] * 4000\njson.dumps(x)";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let limits = ResourceLimits::new()
+        .max_memory(1_048_576)
+        .max_duration(Duration::from_secs(30));
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+
+    let exc = result.expect_err("2MB JSON should exceed the 1MB memory limit");
+    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+
+    // A small document under the same limit still serializes correctly.
+    let ex = MontyRun::new(
+        "import json\njson.dumps([1, 2])".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let limits = ResourceLimits::new().max_memory(1_048_576);
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+    assert_eq!(
+        result.expect("small json.dumps should succeed"),
+        MontyObject::String("[1, 2]".to_owned())
+    );
+}

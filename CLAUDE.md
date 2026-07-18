@@ -263,6 +263,8 @@ builder.finish(vm.heap)
 
 When the input *is* already bounded (e.g. `s.to_lowercase()`, slicing, `to_owned()` of an existing tracked string), passing a plain `String` / `&str` to `allocate_string` is fine — the result is bounded by a known multiple of an already-tracked input, so no amplification is possible.
 
+Code that needs `&mut VM` while building cannot hold `StringBuilder`'s tracker borrow. For that there is the settle-point variant in the same file: the `py_repr_fmt` sink is `&mut impl ReprWrite`, and `Value::py_repr_fmt` calls `f.settle(vm.heap.tracker())` once per heap value, reserving the buffer's bytes as the recursion proceeds (`ReprBuilder` is the buffering sink; `json.dumps`'s `Encoder::settle` does the same per serialized value). Untracked slack between settles is bounded by a single value's leaf writes. `ReprBuilder` holds no tracker reference, so it MUST be consumed with `finish(heap)` or `cancel(tracker)` — plain drop leaks its reservation.
+
 ## Dev Commands
 
 **IMPORTANT**: before running `cargo build` or `cargo run`, it is likely necessary to run `make install-py` to ensure that the Python virtual environment is available for build.

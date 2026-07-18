@@ -85,6 +85,7 @@ use crate::{
     heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, heap_read_ref_as_field},
     intern::{StaticStrings, StringId},
     resource::{ResourceError, ResourceTracker, check_repeat_size, check_replace_size},
+    string_builder::ReprWrite,
     types::{
         List,
         slice::{normalize_sequence_index, slice_collect_iterator},
@@ -292,7 +293,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

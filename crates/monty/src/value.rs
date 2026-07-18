@@ -27,6 +27,7 @@ use crate::{
         ResourceError, ResourceTracker, check_div_size, check_lshift_size, check_mult_size, check_pow_size,
         check_repeat_size,
     },
+    string_builder::{ReprBuilder, ReprWrite},
     types::{
         Bytes, CmpOrder, LazyHeapSet, List, LongInt, Property, PyTrait, Type, allocate_tuple,
         bytes::{bytes_repr_fmt, get_byte_at_index},
@@ -339,7 +340,7 @@ impl<'h> PyTrait<'h> for Value {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'_, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -368,6 +369,11 @@ impl<'h> PyTrait<'h> for Value {
             Self::Marker(m) => Ok(m.py_repr_fmt(f)?),
             Self::Property(p) => Ok(write!(f, "<property {p:?}>")?),
             Self::Ref(id) => {
+                // Settle the sink before each heap value: untracked bytes in
+                // `f` stay bounded by a single value's writes between tracker
+                // reservations, so shared/nested structures cannot amplify a
+                // small tracked heap into a huge untracked repr buffer.
+                f.settle(vm.heap.tracker())?;
                 if heap_ids.contains(id) {
                     // Cycle detected - write type-specific placeholder following Python semantics
                     match vm.heap.get(*id) {
@@ -417,10 +423,15 @@ impl<'h> PyTrait<'h> for Value {
             Self::Ellipsis => Ok(Self::InternString(StaticStrings::EllipsisRepr.into())),
             Self::Int(i) => Ok(allocate_string(itoa::Buffer::new().format(*i), vm.heap)?),
             _ => {
-                let mut s = String::new();
+                let mut builder = ReprBuilder::new();
                 let mut heap_ids = LazyHeapSet::default();
-                self.py_repr_fmt(&mut s, vm, &mut heap_ids)?;
-                Ok(allocate_string(s, vm.heap)?)
+                match self.py_repr_fmt(&mut builder, vm, &mut heap_ids) {
+                    Ok(()) => builder.finish(vm.heap),
+                    Err(e) => {
+                        builder.cancel(vm.heap.tracker());
+                        Err(e)
+                    }
+                }
             }
         }
     }

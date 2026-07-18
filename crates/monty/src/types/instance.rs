@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Write, mem};
+use std::{borrow::Cow, mem};
 
 use super::{Dict, LazyHeapSet, PyTrait, Type};
 use crate::{
@@ -14,6 +14,7 @@ use crate::{
     },
     intern::Interns,
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::allocate_string,
     value::{EitherStr, Value},
 };
@@ -110,7 +111,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Instance> {
     /// never reached.
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -276,7 +277,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, BoundMethod> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         _vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

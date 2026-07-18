@@ -3,13 +3,18 @@
 //! `StringBuilder` is the canonical way to build a Python-visible string whose
 //! final size is *not* already bounded by an already-tracked input. Operations
 //! that grow a `String` in a loop — padding methods (`ljust`, `center`, …),
-//! tab expansion, string repetition, container `repr()`, etc. — must use
-//! `StringBuilder` rather than `String::with_capacity(...).push(...)`, because
-//! the intermediate `String` lives on the Rust heap *outside* the
-//! [`ResourceTracker`]. Without a builder, a malicious script can amplify a
-//! small tracked input into a multi-gigabyte intermediate before the final
+//! tab expansion, string repetition, etc. — must use `StringBuilder` rather
+//! than `String::with_capacity(...).push(...)`, because the intermediate
+//! `String` lives on the Rust heap *outside* the [`ResourceTracker`]. Without
+//! a builder, a malicious script can amplify a small tracked input into a
+//! multi-gigabyte intermediate before the final
 //! [`allocate_string`](crate::types::str::allocate_string) ever consults the
 //! tracker — bypassing the configured memory limit and OOMing the host.
+//!
+//! Code that needs `&mut VM` *while* building — the `py_repr_fmt` recursion,
+//! the `json.dumps` encoder — cannot hold `StringBuilder`'s tracker borrow;
+//! it uses the settle-point variant instead: [`ReprWrite`] + [`ReprBuilder`]
+//! (see their docs at the bottom of this file).
 //!
 //! # Active reservation, not preview
 //!
@@ -229,5 +234,88 @@ impl<T: ResourceTracker> Drop for StringBuilder<'_, T> {
         // `pending_error` short-circuiting `finish`). `finish`'s success path
         // zeroes `reserved` before this runs, so it's a no-op there.
         self.release();
+    }
+}
+
+/// Sink trait for `py_repr_fmt`: a [`fmt::Write`] that can additionally settle
+/// its untracked bytes with the resource tracker at heap-value boundaries.
+///
+/// `py_repr_fmt` borrows the VM mutably for the whole recursion, so its sink
+/// cannot hold a tracker reference the way [`StringBuilder`] does. Instead the
+/// recursion calls [`settle`](Self::settle) where the VM *is* in scope — once
+/// per heap value in `Value::py_repr_fmt` — keeping the untracked slack
+/// bounded by a single value's leaf writes, themselves bounded multiples of
+/// already-tracked input.
+pub trait ReprWrite: fmt::Write {
+    /// Reserves bytes written since the last settle with `tracker`. The
+    /// default is a no-op for sinks bounded some other way (e.g. a hard byte
+    /// cap, or a builder that reserves on every write).
+    fn settle(&mut self, _tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+        Ok(())
+    }
+}
+
+/// [`StringBuilder`] already reserves on every write, so `settle` stays a no-op.
+impl<T: ResourceTracker> ReprWrite for StringBuilder<'_, T> {}
+
+/// Tracker-reserved buffer for building `repr()` strings via `py_repr_fmt`.
+///
+/// Unlike [`StringBuilder`] this holds no tracker reference (see [`ReprWrite`]
+/// for why); reservation happens in `settle`, driven by the repr recursion.
+/// Because `Drop` cannot reach a tracker, callers MUST consume the builder
+/// with [`finish`](Self::finish) on success or [`cancel`](Self::cancel) on
+/// error — dropping it any other way leaks the reservation.
+#[derive(Default)]
+pub struct ReprBuilder {
+    inner: String,
+    /// Bytes currently reserved with the tracker via `on_grow`.
+    reserved: usize,
+}
+
+impl ReprBuilder {
+    /// Creates an empty builder with nothing reserved.
+    pub fn new() -> Self {
+        Self {
+            inner: String::new(),
+            reserved: 0,
+        }
+    }
+
+    /// Consumes the builder: releases the reservation, then allocates the
+    /// result via [`allocate_string`], which re-counts the exact final size
+    /// through `on_allocate` — so bytes written since the last settle are
+    /// still checked against the limit here.
+    pub fn finish(self, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+        heap.tracker().on_free(|| self.reserved);
+        Ok(allocate_string(self.inner, heap)?)
+    }
+
+    /// Releases the reservation on error paths where no string is produced
+    /// (e.g. a user `__repr__` raising a catchable exception mid-recursion).
+    pub fn cancel(self, tracker: &impl ResourceTracker) {
+        tracker.on_free(|| self.reserved);
+    }
+}
+
+/// Writes are unconditionally buffered; the tracker catches up at the next
+/// [`ReprWrite::settle`] call (or in [`finish`](ReprBuilder::finish)).
+impl fmt::Write for ReprBuilder {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.inner.push_str(s);
+        Ok(())
+    }
+}
+
+impl ReprWrite for ReprBuilder {
+    fn settle(&mut self, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+        if self.inner.len() > self.reserved {
+            // Double the reservation (saturating) but at least to the current
+            // length, matching `StringBuilder`'s policy: O(log n) tracker
+            // calls for an n-byte repr.
+            let new_reserved = self.reserved.saturating_mul(2).max(self.inner.len());
+            tracker.on_grow(new_reserved - self.reserved)?;
+            self.reserved = new_reserved;
+        }
+        Ok(())
     }
 }

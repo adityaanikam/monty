@@ -9,7 +9,7 @@
 //! is held as a single refcounted heap reference shared across every match from
 //! one `finditer`/`findall` call, so `py_dec_ref_ids` releases that reference.
 
-use std::{cell::OnceCell, cmp::Ordering, fmt::Write, mem};
+use std::{cell::OnceCell, cmp::Ordering, mem};
 
 use smallvec::smallvec;
 
@@ -21,6 +21,7 @@ use crate::{
     heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
     intern::StaticStrings,
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{
         Dict, LazyHeapSet, PyTrait, Type, allocate_tuple,
         str::{allocate_string, string_repr_fmt},
@@ -331,7 +332,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, ReMatch> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

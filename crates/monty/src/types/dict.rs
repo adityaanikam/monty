@@ -1,6 +1,5 @@
 use std::{
     collections::hash_map::DefaultHasher,
-    fmt::Write,
     hash::{Hash, Hasher},
     mem, slice, vec,
 };
@@ -18,6 +17,7 @@ use crate::{
     heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::Type,
     value::{EitherStr, VALUE_SIZE, Value},
 };
@@ -819,7 +819,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dict> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

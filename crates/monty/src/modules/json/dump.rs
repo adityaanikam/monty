@@ -14,7 +14,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
     heap::{ContainsHeap, DropGuard, Heap, HeapData, HeapId, HeapRead, HeapReadOutput},
-    resource::ResourceTracker,
+    resource::{ResourceError, ResourceTracker},
     sorting::{apply_permutation, sort_indices},
     types::{Dict, PyTrait, long_int::check_bigint_str_digits_limit, str::allocate_string},
     value::Value,
@@ -146,19 +146,25 @@ pub(super) fn call_dumps(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues)
     let mut obj_guard = DropGuard::new(obj, vm);
     let mut output = String::new();
     let mut active_containers = Vec::new();
-    {
+    // Tracker bytes reserved for `output` (see `Encoder::settle`). Captured
+    // here so the reservation is released on success and error paths alike.
+    let mut reserved = 0usize;
+    let result = {
         let (obj, vm) = obj_guard.as_parts_mut();
         let mut encoder = Encoder {
             out: &mut output,
             config: &config,
             active_containers: &mut active_containers,
+            reserved: &mut reserved,
             vm,
         };
-        encoder.serialize_value(obj, 0)?;
-    }
+        encoder.serialize_value(obj, 0)
+    };
 
     let (obj, vm) = obj_guard.into_parts();
     obj.drop_with(vm);
+    vm.heap.tracker().on_free(|| reserved);
+    result?;
     Ok(allocate_string(output, vm.heap)?)
 }
 
@@ -346,6 +352,9 @@ struct Encoder<'a, 'h, R: ResourceTracker> {
     out: &'a mut String,
     config: &'a JsonDumpsConfig,
     active_containers: &'a mut Vec<HeapId>,
+    /// Bytes of `out` currently reserved with the resource tracker (borrowed
+    /// so `call_dumps` can release the reservation after the encoder is gone).
+    reserved: &'a mut usize,
     vm: &'a mut VM<'h, R>,
 }
 
@@ -382,6 +391,10 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
     /// Handles immediate primitives directly and delegates to type-specific
     /// helpers for strings, long integers, lists, tuples, and dicts.
     fn serialize_value(&mut self, value: &Value, depth: usize) -> RunResult<()> {
+        // Settle once per value: `out` lives outside the tracker, so without
+        // this a shared (DAG) structure could amplify a small tracked heap
+        // into an unbounded untracked JSON buffer.
+        self.settle()?;
         match value {
             Value::None => {
                 self.out.push_str("null");
@@ -569,6 +582,19 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
             write_indent(self.out, self.config, depth);
         }
         self.out.push('}');
+        Ok(())
+    }
+
+    /// Reserves `out` bytes written since the last settle with the resource
+    /// tracker. Doubling (like `StringBuilder`) keeps tracker calls `O(log n)`
+    /// for an `n`-byte document. Untracked slack between settles is bounded by
+    /// a single value's writes, themselves bounded by already-tracked input.
+    fn settle(&mut self) -> Result<(), ResourceError> {
+        if self.out.len() > *self.reserved {
+            let new_reserved = self.reserved.saturating_mul(2).max(self.out.len());
+            self.vm.heap.tracker().on_grow(new_reserved - *self.reserved)?;
+            *self.reserved = new_reserved;
+        }
         Ok(())
     }
 

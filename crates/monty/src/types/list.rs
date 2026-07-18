@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, fmt::Write, mem};
+use std::{cmp::Ordering, mem};
 
 use smallvec::SmallVec;
 
@@ -12,6 +12,7 @@ use crate::{
     intern::StaticStrings,
     resource::{ResourceError, ResourceTracker},
     sorting::parse_and_sort,
+    string_builder::ReprWrite,
     types::{
         LazyHeapSet, Type,
         slice::{normalize_sequence_index, slice_collect_iterator},
@@ -476,7 +477,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, List> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -890,7 +891,7 @@ pub(crate) fn repr_sequence_fmt<'h, T: ResourceTracker>(
     end: char,
     len: usize,
     get_item: impl for<'r> Fn(&'r HeapReader<'h, T>, usize) -> &'r Value,
-    f: &mut impl Write,
+    f: &mut impl ReprWrite,
     vm: &mut VM<'h, T>,
     heap_ids: &mut LazyHeapSet,
 ) -> RunResult<()> {

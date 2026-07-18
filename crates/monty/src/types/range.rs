@@ -5,7 +5,6 @@
 
 use std::{
     collections::hash_map::DefaultHasher,
-    fmt::Write,
     hash::{Hash, Hasher},
     mem,
 };
@@ -20,6 +19,7 @@ use crate::{
     hash::HashValue,
     heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{LazyHeapSet, PyTrait, Type},
     value::Value,
 };
@@ -282,7 +282,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

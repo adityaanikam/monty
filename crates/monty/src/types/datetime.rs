@@ -25,6 +25,7 @@ use crate::{
     object::MontyObject,
     os::OsFunctionCall,
     resource::{ResourceError, ResourceTracker},
+    string_builder::ReprWrite,
     types::{
         AttrCallResult, CmpOrder, LazyHeapSet, PyTrait, TimeDelta, TimeZone, Type,
         date::{self, StrftimeArgs},
@@ -940,7 +941,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DateTime> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

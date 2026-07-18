@@ -25,6 +25,12 @@ inside the sandbox).
   rather than attempting the allocation.
 - `bigint.pow(base, exp)` estimates result size as `bits(base) * exp` with
   a 4× safety multiplier to cover repeated-squaring intermediate values.
+- `repr()` / `str()` of containers and `json.dumps` reserve their output
+  buffer with the tracker incrementally while formatting (once per nested
+  value). Aliased/shared structures whose text form is much larger than the
+  tracked heap (e.g. `repr(['x' * 500] * 4000)` under a 1 MB limit) raise
+  `ResourceError` mid-format instead of bypassing the limit; CPython would
+  simply build the string.
 
 ## Integer-specific caps
 

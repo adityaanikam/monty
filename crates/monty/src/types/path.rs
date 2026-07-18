@@ -7,7 +7,6 @@
 use std::{
     cell::Cell,
     collections::hash_map::DefaultHasher,
-    fmt::Write,
     hash::{Hash, Hasher},
     mem,
 };
@@ -25,6 +24,7 @@ use crate::{
     intern::{Interns, StaticStrings},
     os::{MontyPath, build_path_os_call, is_path_os_method},
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{LazyHeapSet, PyTrait, Type, allocate_tuple, str::allocate_string},
     value::{EitherStr, Value},
 };
@@ -495,7 +495,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {

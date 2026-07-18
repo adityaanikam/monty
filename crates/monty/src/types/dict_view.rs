@@ -1,4 +1,4 @@
-use std::{fmt::Write, mem};
+use std::mem;
 
 use smallvec::smallvec;
 
@@ -10,6 +10,7 @@ use crate::{
     heap::{DropGuard, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::StaticStrings,
     resource::ResourceTracker,
+    string_builder::ReprWrite,
     types::{Dict, FrozenSet, LazyHeapSet, MontyIter, PyTrait, Set, Type, allocate_tuple},
     value::{EitherStr, Value},
 };
@@ -159,7 +160,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DictKeysView> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -315,7 +316,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DictItemsView> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -407,7 +408,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DictValuesView> {
 
     fn py_repr_fmt(
         &self,
-        f: &mut impl Write,
+        f: &mut impl ReprWrite,
         vm: &mut VM<'h, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
@@ -480,7 +481,7 @@ fn dict_items_eq_set_like<'h, T: ResourceTracker>(
 
 /// Writes the repr payload for a keys view without its outer wrapper.
 fn write_dict_keys_contents<'h>(
-    f: &mut impl Write,
+    f: &mut impl ReprWrite,
     dict: &HeapRead<'h, Dict>,
     vm: &mut VM<'h, impl ResourceTracker>,
     heap_ids: &mut LazyHeapSet,
@@ -500,7 +501,7 @@ fn write_dict_keys_contents<'h>(
 
 /// Writes the repr payload for an items view without its outer wrapper.
 fn write_dict_items_contents<'h>(
-    f: &mut impl Write,
+    f: &mut impl ReprWrite,
     dict: &HeapRead<'h, Dict>,
     vm: &mut VM<'h, impl ResourceTracker>,
     heap_ids: &mut LazyHeapSet,
@@ -524,7 +525,7 @@ fn write_dict_items_contents<'h>(
 
 /// Writes the repr payload for a values view without its outer wrapper.
 fn write_dict_values_contents<'h>(
-    f: &mut impl Write,
+    f: &mut impl ReprWrite,
     dict: &HeapRead<'h, Dict>,
     vm: &mut VM<'h, impl ResourceTracker>,
     heap_ids: &mut LazyHeapSet,
