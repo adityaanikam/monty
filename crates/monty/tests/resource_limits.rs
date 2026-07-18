@@ -2459,3 +2459,22 @@ fn json_dumps_shared_structure_memory_bounded() {
         MontyObject::String("[1, 2]".to_owned())
     );
 }
+
+/// Immediate (non-`Ref`) values must also settle the repr buffer: an interned
+/// string is a 16-byte `Value` whose repr writes the whole interned payload,
+/// so a container aliasing a large *source literal* amplifies without bound —
+/// here ~1.6 MB of tracked heap (100k pointers) whose repr is ~1 GB. Settling
+/// only at heap references would materialize the full untracked buffer before
+/// the final allocation check fired.
+#[test]
+fn repr_interned_literal_aliasing_memory_bounded() {
+    let code = format!("xs = ['{}'] * 100_000\nrepr(xs)", "x".repeat(10_000));
+    let ex = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).unwrap();
+    let limits = ResourceLimits::new()
+        .max_memory(8_388_608)
+        .max_duration(Duration::from_secs(30));
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+
+    let exc = result.expect_err("1GB repr of aliased interned literal should exceed the 8MB memory limit");
+    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+}

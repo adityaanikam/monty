@@ -344,6 +344,13 @@ impl<'h> PyTrait<'h> for Value {
         vm: &mut VM<'_, impl ResourceTracker>,
         heap_ids: &mut LazyHeapSet,
     ) -> RunResult<()> {
+        // Settle the sink once per value — every value, not just heap refs:
+        // an interned string/bytes is a 16-byte `Value` whose repr writes the
+        // whole interned payload, so a container aliasing a large source
+        // literal would otherwise amplify a small tracked heap into an
+        // unbounded untracked repr buffer. Untracked slack between settles
+        // stays bounded by a single value's leaf writes.
+        f.settle(vm.heap.tracker())?;
         let interns = vm.interns;
         match self {
             Self::Undefined => Ok(f.write_str("Undefined")?),
@@ -369,11 +376,6 @@ impl<'h> PyTrait<'h> for Value {
             Self::Marker(m) => Ok(m.py_repr_fmt(f)?),
             Self::Property(p) => Ok(write!(f, "<property {p:?}>")?),
             Self::Ref(id) => {
-                // Settle the sink before each heap value: untracked bytes in
-                // `f` stay bounded by a single value's writes between tracker
-                // reservations, so shared/nested structures cannot amplify a
-                // small tracked heap into a huge untracked repr buffer.
-                f.settle(vm.heap.tracker())?;
                 if heap_ids.contains(id) {
                     // Cycle detected - write type-specific placeholder following Python semantics
                     match vm.heap.get(*id) {
