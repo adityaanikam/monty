@@ -2522,4 +2522,21 @@ json.dumps(x, indent=' ' * 1_000_000)
         result.expect("small pretty json.dumps should succeed"),
         MontyObject::String("[\n  1,\n  [\n    2\n  ]\n]".to_owned())
     );
+
+    // Empty containers never write indentation (CPython short-circuits them
+    // to `[]`/`{}`), so a huge indent must not trip the limit check.
+    let ex = MontyRun::new(
+        "import json\ni = ' ' * 6_000_000\njson.dumps([], indent=i) + json.dumps((), indent=i) + json.dumps({}, indent=i)"
+            .to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let limits = ResourceLimits::new().max_memory(8_388_608);
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+    assert_eq!(
+        result.expect("empty containers with huge indent should succeed"),
+        MontyObject::String("[][]{}".to_owned())
+    );
 }

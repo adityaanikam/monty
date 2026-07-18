@@ -438,9 +438,10 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
                     Ok(())
                 }
                 HeapReadOutput::List(list) => self.with_entered_container(*heap_id, |enc| {
+                    let is_empty = list.get(enc.vm.heap).as_slice().is_empty();
                     let iter = list.iter(enc.vm)?;
                     defer_drop_mut!(iter, enc);
-                    enc.serialize_array(depth, |enc, depth| {
+                    enc.serialize_array(depth, is_empty, |enc, depth| {
                         if let Some(item) = iter.next(enc.vm)? {
                             enc.serialize_value(item, depth)?;
                             Ok(true)
@@ -450,9 +451,10 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
                     })
                 }),
                 HeapReadOutput::Tuple(tuple) => self.with_entered_container(*heap_id, |enc| {
+                    let is_empty = tuple.get(enc.vm.heap).as_slice().is_empty();
                     let iter = tuple.iter(enc.vm)?;
                     defer_drop_mut!(iter, enc);
-                    enc.serialize_array(depth, |enc, depth| {
+                    enc.serialize_array(depth, is_empty, |enc, depth| {
                         if let Some(item) = iter.next(enc.vm)? {
                             enc.serialize_value(item, depth)?;
                             Ok(true)
@@ -497,8 +499,16 @@ impl<'h, R: ResourceTracker> Encoder<'_, 'h, R> {
     fn serialize_array(
         &mut self,
         depth: usize,
+        is_empty: bool,
         mut write_next: impl FnMut(&mut Self, usize) -> RunResult<bool>,
     ) -> RunResult<()> {
+        // CPython short-circuits empty arrays before writing any indentation,
+        // so a huge `indent` must not trip the limit check in `write_indent`
+        // via the speculative prefix below when the output is just `[]`.
+        if is_empty {
+            self.out.push_str("[]");
+            return Ok(());
+        }
         self.out.push('[');
         let pretty = self.config.indent.is_some();
         let mut wrote_any = false;
