@@ -523,7 +523,7 @@ impl<const N: usize> Bound<N> {
     }
 }
 
-impl<C: ContainsHeap, const N: usize> DropWithContext<C> for Bound<N> {
+impl<'h, C: ContainsHeap<'h>, const N: usize> DropWithContext<'h, C> for Bound<N> {
     fn drop_with(self, heap: &mut C) {
         for slot in self.slots {
             slot.drop_with(heap);
@@ -544,7 +544,7 @@ struct IterState {
     kwargs: KwargsValuesIter,
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for IterState {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for IterState {
     fn drop_with(self, heap: &mut C) {
         self.pos.drop_with(heap);
         self.kwargs.drop_with(heap);

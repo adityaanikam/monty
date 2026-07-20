@@ -32,7 +32,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
     hash::HashValue,
-    heap::{DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{DropWithContext, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::StaticStrings,
     resource::{ResourceError, ResourceTracker},
     types::{
@@ -161,7 +161,7 @@ impl From<Tuple> for TupleVec {
 /// ```
 pub fn allocate_tuple(
     items: SmallVec<[Value; TUPLE_INLINE_CAPACITY]>,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Value, ResourceError> {
     if items.is_empty() {
         Ok(heap.get_empty_tuple())
@@ -278,7 +278,7 @@ impl<'a, 'h> TupleIter<'a, 'h> {
     }
 }
 
-impl<'h, C: ContainsVM<'h>> DropWithContext<C> for TupleIter<'_, 'h> {
+impl<'h, C: ContainsVM<'h>> DropWithContext<'h, C> for TupleIter<'_, 'h> {
     fn drop_with(self, container: &mut C) {
         self.current.drop_with(container);
         self.token.drop_with(container);

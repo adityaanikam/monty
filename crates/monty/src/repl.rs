@@ -65,7 +65,11 @@ pub struct MontyRepl<T: ResourceTracker> {
     #[serde(default)]
     options: CompileOptions,
     /// Persistent heap across snippets.
-    heap: Heap<T>,
+    heap: Heap,
+    /// Persistent resource tracker. Held alongside `heap` so the execution
+    /// path can borrow it into a [`HeapReader`] for each snippet without
+    /// imposing a self-referential ownership constraint.
+    tracker: T,
     /// Persistent global variable values across snippets.
     ///
     /// Indexed by `NamespaceId` slots from `global_names`. Between snippet
@@ -82,7 +86,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
     /// The [`CompileOptions`] apply to every snippet fed to the session.
     #[must_use]
     pub fn new(script_name: &str, resource_tracker: T, options: CompileOptions) -> Self {
-        let heap = Heap::new(0, resource_tracker);
+        let heap = Heap::new(0);
 
         Self {
             script_name: script_name.to_owned(),
@@ -92,6 +96,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
             sources: AHashMap::new(),
             options,
             heap,
+            tracker: resource_tracker,
             globals: Vec::new(),
         }
     }
@@ -101,7 +106,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
     /// This is primarily intended for host integrations that need to attach
     /// per-execution state, such as cancellation markers, to an existing REPL.
     pub fn tracker(&self) -> &T {
-        self.heap.tracker()
+        &self.tracker
     }
 
     /// Returns mutable access to the resource tracker for the next snippet.
@@ -109,7 +114,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
     /// REPL hosts use this to install ephemeral execution controls, such as
     /// async cancellation flags, before calling `feed_start()`.
     pub fn tracker_mut(&mut self) -> &mut T {
-        self.heap.tracker_mut()
+        &mut self.tracker
     }
 
     /// Starts executing a new snippet and returns suspendable REPL progress.
@@ -162,33 +167,38 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         this.ensure_globals_size(executor.namespace_size());
 
-        match HeapReader::with(&mut this.heap, &mut (&executor, print), |reader, (executor, print)| {
-            let mut vm = VM::new(
-                mem::take(&mut this.globals),
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                executor.assert_repr_max_bytes,
-            );
+        match HeapReader::with(
+            &mut this.heap,
+            &this.tracker,
+            &mut (&executor, print),
+            |reader, (executor, print)| {
+                let mut vm = VM::new(
+                    mem::take(&mut this.globals),
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    executor.assert_repr_max_bytes,
+                );
 
-            // Inject inputs with VM alive
-            if let Err(error) = inject_inputs_into_vm(executor, input_values, &mut vm) {
-                this.globals = vm.take_globals();
-                return Err(error);
-            }
+                // Inject inputs with VM alive
+                if let Err(error) = inject_inputs_into_vm(executor, input_values, &mut vm) {
+                    this.globals = vm.take_globals();
+                    return Err(error);
+                }
 
-            let vm_result = vm.run_module(&executor.module_code);
+                let vm_result = vm.run_module(&executor.module_code);
 
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                this.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    this.globals = vm.take_globals();
+                    None
+                };
+                Ok((converted, vm_state))
+            },
+        ) {
             Ok((converted, vm_state)) => build_repl_progress(converted, vm_state, executor, this),
             Err(error) => Err(Box::new(ReplStartError { repl: this, error })),
         }
@@ -233,26 +243,31 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         self.ensure_globals_size(executor.namespace_size());
 
-        let result = HeapReader::with(&mut self.heap, &mut (&executor, print), |reader, (executor, print)| {
-            let mut vm = VM::new(
-                mem::take(&mut self.globals),
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                executor.assert_repr_max_bytes,
-            );
+        let result = HeapReader::with(
+            &mut self.heap,
+            &self.tracker,
+            &mut (&executor, print),
+            |reader, (executor, print)| {
+                let mut vm = VM::new(
+                    mem::take(&mut self.globals),
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    executor.assert_repr_max_bytes,
+                );
 
-            if let Err(e) = inject_inputs_into_vm(executor, input_values, &mut vm) {
+                if let Err(e) = inject_inputs_into_vm(executor, input_values, &mut vm) {
+                    self.globals = vm.take_globals();
+                    return Err(e);
+                }
+
+                let result = executor.run_to_completion(&mut vm);
+
+                // Reclaim globals before cleanup.
                 self.globals = vm.take_globals();
-                return Err(e);
-            }
-
-            let result = executor.run_to_completion(&mut vm);
-
-            // Reclaim globals before cleanup.
-            self.globals = vm.take_globals();
-            Ok(result)
-        })?;
+                Ok(result)
+            },
+        )?;
 
         // Commit compiler metadata even on runtime errors.
         // Snippets can mutate globals before raising, and those values may contain
@@ -296,6 +311,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
         let assert_repr_max_bytes = self.options.assert_message_annotations.max_bytes();
         HeapReader::with(
             &mut self.heap,
+            &self.tracker,
             &mut (&self.interns, print),
             |reader, (interns, print)| {
                 let vm = &mut VM::new(
@@ -417,7 +433,10 @@ impl<T: ResourceTracker + DeserializeOwned> MontyRepl<T> {
 
 impl<T: ResourceTracker> Drop for MontyRepl<T> {
     fn drop(&mut self) {
-        self.globals.drain(..).drop_with(&mut self.heap);
+        let globals = mem::take(&mut self.globals);
+        HeapReader::with(&mut self.heap, &self.tracker, &mut (), |reader, ()| {
+            globals.drop_with(reader);
+        });
     }
 }
 
@@ -706,61 +725,66 @@ impl<T: ResourceTracker> ReplNameLookup<T> {
             vm_state,
         } = snapshot;
 
-        match HeapReader::with(&mut repl.heap, &mut (&executor, print), |reader, (executor, print)| {
-            // Restore the VM first, then convert inside its lifetime
-            let mut vm = VM::restore(
-                vm_state,
-                &executor.module_code,
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                executor.assert_repr_max_bytes,
-            );
+        match HeapReader::with(
+            &mut repl.heap,
+            &repl.tracker,
+            &mut (&executor, print),
+            |reader, (executor, print)| {
+                // Restore the VM first, then convert inside its lifetime
+                let mut vm = VM::restore(
+                    vm_state,
+                    &executor.module_code,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    executor.assert_repr_max_bytes,
+                );
 
-            // Resolve the name lookup result with the VM alive
-            let vm_result = match result {
-                NameLookupResult::Value(obj) => {
-                    let value = match obj.to_value(&mut vm) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            repl.globals = vm.take_globals();
-                            return Err(MontyException::runtime_error(format!(
-                                "invalid name lookup result: {e}"
-                            )));
-                        }
-                    };
+                // Resolve the name lookup result with the VM alive
+                let vm_result = match result {
+                    NameLookupResult::Value(obj) => {
+                        let value = match obj.to_value(&mut vm) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                repl.globals = vm.take_globals();
+                                return Err(MontyException::runtime_error(format!(
+                                    "invalid name lookup result: {e}"
+                                )));
+                            }
+                        };
 
-                    // Cache the resolved value in the appropriate slot
-                    let slot_idx = namespace_slot as usize;
-                    let cloned = value.clone_with_heap(&vm);
-                    let slot = if is_global {
-                        &mut vm.globals[slot_idx]
-                    } else {
-                        let stack_base = vm.current_stack_base();
-                        &mut vm.stack[stack_base + slot_idx]
-                    };
-                    let old = mem::replace(slot, cloned);
-                    old.drop_with(&mut vm);
+                        // Cache the resolved value in the appropriate slot
+                        let slot_idx = namespace_slot as usize;
+                        let cloned = value.clone_with_heap(&vm);
+                        let slot = if is_global {
+                            &mut vm.globals[slot_idx]
+                        } else {
+                            let stack_base = vm.current_stack_base();
+                            &mut vm.stack[stack_base + slot_idx]
+                        };
+                        let old = mem::replace(slot, cloned);
+                        old.drop_with(&mut vm);
 
-                    vm.push(value);
-                    vm.run_external()
-                }
-                NameLookupResult::Undefined => {
-                    let err: RunError = ExcType::name_error(&name).into();
-                    vm.resume_with_exception(err)
-                }
-            };
+                        vm.push(value);
+                        vm.run_external()
+                    }
+                    NameLookupResult::Undefined => {
+                        let err: RunError = ExcType::name_error(&name).into();
+                        vm.resume_with_exception(err)
+                    }
+                };
 
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                repl.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    repl.globals = vm.take_globals();
+                    None
+                };
+                Ok((converted, vm_state))
+            },
+        ) {
             Ok((converted, vm_state)) => build_repl_progress(converted, vm_state, executor, repl),
             Err(error) => Err(Box::new(ReplStartError { repl, error })),
         }
@@ -832,35 +856,40 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
             .find(|(call_id, _)| !pending_call_ids.contains(call_id))
             .map(|(call_id, _)| *call_id);
 
-        match HeapReader::with(&mut repl.heap, &mut (&executor, print), |reader, (executor, print)| {
-            let mut vm = VM::restore(
-                vm_state,
-                &executor.module_code,
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                executor.assert_repr_max_bytes,
-            );
+        match HeapReader::with(
+            &mut repl.heap,
+            &repl.tracker,
+            &mut (&executor, print),
+            |reader, (executor, print)| {
+                let mut vm = VM::restore(
+                    vm_state,
+                    &executor.module_code,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    executor.assert_repr_max_bytes,
+                );
 
-            if let Some(call_id) = invalid_call_id {
-                repl.globals = vm.take_globals();
-                return Err(MontyException::runtime_error(format!(
-                    "unknown call_id {call_id}, expected one of: {pending_call_ids:?}"
-                )));
-            }
+                if let Some(call_id) = invalid_call_id {
+                    repl.globals = vm.take_globals();
+                    return Err(MontyException::runtime_error(format!(
+                        "unknown call_id {call_id}, expected one of: {pending_call_ids:?}"
+                    )));
+                }
 
-            let vm_result = vm.resume_with_resolved_futures(results);
+                let vm_result = vm.resume_with_resolved_futures(results);
 
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                repl.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    repl.globals = vm.take_globals();
+                    None
+                };
+                Ok((converted, vm_state))
+            },
+        ) {
             Ok((converted, vm_state)) => build_repl_progress(converted, vm_state, executor, repl),
             Err(error) => Err(Box::new(ReplStartError { repl, error })),
         }
@@ -967,8 +996,11 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
 
         let ext_result = result.into();
 
-        let (converted, vm_state) =
-            HeapReader::with(&mut repl.heap, &mut (&executor, print), |reader, (executor, print)| {
+        let (converted, vm_state) = HeapReader::with(
+            &mut repl.heap,
+            &repl.tracker,
+            &mut (&executor, print),
+            |reader, (executor, print)| {
                 let mut vm = VM::restore(
                     vm_state,
                     &executor.module_code,
@@ -1002,7 +1034,8 @@ impl<T: ResourceTracker> ReplSnapshot<T> {
                     None
                 };
                 (converted, vm_state)
-            });
+            },
+        );
         build_repl_progress(converted, vm_state, executor, repl)
     }
 }
@@ -1175,7 +1208,9 @@ fn convert_args(args: Vec<MontyObject>, vm: &mut VM<'_, impl ResourceTracker>) -
 ///
 /// Deliberately narrower than [`Value::is_callable`]: it omits `Class` and
 /// `BoundMethod`, which are not what a host means by "a function it can invoke".
-fn is_callable(value: &Value, heap: &Heap<impl ResourceTracker>) -> bool {
+/// Heap references are accepted only for closures, functions with defaults,
+/// and heap-allocated external functions.
+fn is_callable(value: &Value, heap: &Heap) -> bool {
     match value {
         Value::DefFunction(_) | Value::Builtin(_) | Value::ExtFunction(_) | Value::ModuleFunction(_) => true,
         Value::Ref(id) => matches!(

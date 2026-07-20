@@ -13,7 +13,7 @@ use crate::{
     bytecode::{ContainsVM, VM},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{ContainsHeap, DropGuard, Heap, HeapData, HeapId, HeapRead, HeapReadOutput},
+    heap::{ContainsHeap, DropGuard, HeapData, HeapId, HeapRead, HeapReadOutput, HeapReader},
     resource::ResourceTracker,
     sorting::{apply_permutation, sort_indices},
     types::{Dict, PyTrait, long_int::check_bigint_str_digits_limit, str::allocate_string},
@@ -353,14 +353,14 @@ struct Encoder<'a, 'h, R: ResourceTracker> {
 /// pattern: passing the encoder as the "heap" argument re-borrows the whole
 /// encoder (including its `vm`) into the guard, which is exactly what we need
 /// so the rebound iter and the rebound encoder share a lifetime.
-impl<R: ResourceTracker> ContainsHeap for Encoder<'_, '_, R> {
-    type ResourceTracker = R;
+impl<'h, R: ResourceTracker> ContainsHeap<'h> for Encoder<'_, 'h, R> {
+    type Tracker = R;
 
-    fn heap(&self) -> &Heap<R> {
+    fn heap(&self) -> &HeapReader<'h, R> {
         self.vm.heap()
     }
 
-    fn heap_mut(&mut self) -> &mut Heap<R> {
+    fn heap_mut(&mut self) -> &mut HeapReader<'h, R> {
         self.vm.heap_mut()
     }
 }
@@ -371,7 +371,7 @@ impl<R: ResourceTracker> ContainsHeap for Encoder<'_, '_, R> {
 impl<'h, R: ResourceTracker> ContainsVM<'h> for Encoder<'_, 'h, R> {
     type Tracker = R;
 
-    fn vm(&mut self) -> &mut VM<'h, Self::Tracker> {
+    fn vm(&mut self) -> &mut VM<'h, <Self as ContainsVM<'h>>::Tracker> {
         self.vm
     }
 }

@@ -9,25 +9,26 @@
 //! `heap_reader_compile_fail_tests` cfg (plus a per-test cfg) is set.
 
 use super::*;
-#[cfg(heap_reader_compile_fail_test_heap_mutation_while_reading)]
-use crate::types::str::allocate_string;
 
-/// Must not compile: allocating on the heap while holding a reference derived from `HeapRead::get`.
+/// Must not compile: mutating heap entries via `dec_ref` while holding a reference
+/// derived from `HeapRead::get`.
 ///
-/// `a.get(heap)` borrows `heap` immutably, and the resulting slice keeps that borrow alive.
-/// `heap.heap_mut().allocate(...)` requires mutable access to `heap`, which
-/// conflicts with the live immutable borrow.
+/// `a.get(heap)` borrows `heap` immutably, and the resulting slice keeps that borrow
+/// alive. `heap.dec_ref(...)` requires mutable access to the reader, which
+/// conflicts with the live immutable borrow. Allocation alone is `&self` on
+/// `HeapReader` (Cell-based bookkeeping), so this test now exercises the `&mut`
+/// path through `dec_ref` rather than `allocate`.
 ///
 /// Expected: E0502 (cannot borrow `*heap` as mutable because it is also borrowed as immutable)
 #[cfg(heap_reader_compile_fail_test_heap_mutation_while_reading)]
-fn heap_mutation_while_reading(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
-    HeapReader::with(heap, &mut (), |heap, ()| {
+fn heap_mutation_while_reading(list_id: HeapId, heap: &mut Heap, tracker: &impl ResourceTracker) {
+    HeapReader::with(heap, tracker, &mut (), |heap, ()| {
         let a = match heap.read(list_id) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
         };
         let slice = a.get(heap).as_slice();
-        let _ = allocate_string("boom", heap.heap_mut());
+        heap.dec_ref(list_id);
         let _ = slice.len();
     });
 }
@@ -39,8 +40,8 @@ fn heap_mutation_while_reading(list_id: HeapId, heap: &mut Heap<impl ResourceTra
 ///
 /// Expected: E0499 (cannot borrow `*heap` as mutable more than once at a time)
 #[cfg(heap_reader_compile_fail_test_double_get_mut)]
-fn double_get_mut(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
-    HeapReader::with(heap, &mut (), |heap, ()| {
+fn double_get_mut(list_id: HeapId, heap: &mut Heap, tracker: &impl ResourceTracker) {
+    HeapReader::with(heap, tracker, &mut (), |heap, ()| {
         let mut a = match heap.read(list_id) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
@@ -62,14 +63,14 @@ fn double_get_mut(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
 ///
 /// Expected: E0502 (cannot borrow `*heap` as mutable because it is also borrowed as immutable)
 #[cfg(heap_reader_compile_fail_test_dec_ref_while_reading)]
-fn dec_ref_while_reading(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
-    HeapReader::with(heap, &mut (), |heap, ()| {
+fn dec_ref_while_reading(list_id: HeapId, heap: &mut Heap, tracker: &impl ResourceTracker) {
+    HeapReader::with(heap, tracker, &mut (), |heap, ()| {
         let a = match heap.read(list_id) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
         };
         let list_ref = a.get(heap);
-        heap.heap_mut().dec_ref(list_id);
+        heap.dec_ref(list_id);
         let _ = list_ref.as_slice().len();
     });
 }
@@ -81,9 +82,9 @@ fn dec_ref_while_reading(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>)
 ///
 /// Expected: E0521 (borrowed data escapes outside of closure)
 #[cfg(heap_reader_compile_fail_test_smuggle_heap_read)]
-fn smuggle_heap_read(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
+fn smuggle_heap_read(list_id: HeapId, heap: &mut Heap, tracker: &impl ResourceTracker) {
     let mut smuggled: Option<HeapRead<'_, List>> = None;
-    HeapReader::with(heap, &mut (), |heap, ()| {
+    HeapReader::with(heap, tracker, &mut (), |heap, ()| {
         let a = match heap.read(list_id) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
@@ -101,8 +102,8 @@ fn smuggle_heap_read(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
 ///
 /// Expected: E0500 (closure requires unique access to `*heap` but it is already borrowed)
 #[cfg(heap_reader_compile_fail_test_mutation_in_map_closure)]
-fn mutation_in_map_closure(list_id: HeapId, other_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
-    HeapReader::with(heap, &mut (), |heap, ()| {
+fn mutation_in_map_closure(list_id: HeapId, other_id: HeapId, heap: &mut Heap, tracker: &impl ResourceTracker) {
+    HeapReader::with(heap, tracker, &mut (), |heap, ()| {
         let a = match heap.read(list_id) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
@@ -112,7 +113,7 @@ fn mutation_in_map_closure(list_id: HeapId, other_id: HeapId, heap: &mut Heap<im
             .as_slice()
             .iter()
             .map(|_v| {
-                heap.heap_mut().dec_ref(other_id);
+                heap.dec_ref(other_id);
                 true
             })
             .collect();
@@ -125,8 +126,8 @@ fn mutation_in_map_closure(list_id: HeapId, other_id: HeapId, heap: &mut Heap<im
 ///
 /// Expected: E0502 (cannot borrow `*heap` as mutable because it is also borrowed as immutable)
 #[cfg(heap_reader_compile_fail_test_read_while_ref_alive)]
-fn read_while_ref_alive(id_a: HeapId, id_b: HeapId, heap: &mut Heap<impl ResourceTracker>) {
-    HeapReader::with(heap, &mut (), |heap, ()| {
+fn read_while_ref_alive(id_a: HeapId, id_b: HeapId, heap: &mut Heap, tracker: &impl ResourceTracker) {
+    HeapReader::with(heap, tracker, &mut (), |heap, ()| {
         let a = match heap.read(id_a) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
@@ -147,12 +148,14 @@ fn read_while_ref_alive(id_a: HeapId, id_b: HeapId, heap: &mut Heap<impl Resourc
 /// Expected: a borrow-check error preventing the VM from escaping.
 #[cfg(heap_reader_compile_fail_test_smuggle_vm)]
 fn smuggle_vm<T: ResourceTracker>(
-    heap: &mut Heap<T>,
+    heap: &mut Heap,
+    tracker: &T,
     interns: &crate::intern::Interns,
 ) -> crate::bytecode::VM<'static, T> {
     use crate::bytecode::VM;
     HeapReader::with(
         heap,
+        tracker,
         &mut (interns, crate::io::PrintWriter::Disabled),
         |reader, (interns, print)| VM::new(Vec::new(), reader, *interns, print.reborrow(), 120),
     )
@@ -176,9 +179,9 @@ fn smuggle_vm<T: ResourceTracker>(
 /// Expected: lifetime/type mismatch error from `mem::swap` — the inner closure's
 /// universally-quantified lifetime cannot be unified with the outer call's.
 #[cfg(heap_reader_compile_fail_test_smuggle_and_swap_reader)]
-fn smuggle_and_swap_reader<T: ResourceTracker>(heap_a: &mut Heap<T>, heap_b: &mut Heap<T>) {
-    HeapReader::with(heap_a, &mut (), |reader_a, ()| {
-        HeapReader::with(heap_b, reader_a, |reader_b, smuggled| {
+fn smuggle_and_swap_reader<T: ResourceTracker>(heap_a: &mut Heap, heap_b: &mut Heap, tracker: &T) {
+    HeapReader::with(heap_a, tracker, &mut (), |reader_a, ()| {
+        HeapReader::with(heap_b, tracker, reader_a, |reader_b, smuggled| {
             // `reader_b: &'inner mut HeapReader<'inner, T>` and
             // `smuggled: &'inner mut HeapReader<'outer, T>` — invariant lifetimes
             // prevent unification, so this swap must be rejected.

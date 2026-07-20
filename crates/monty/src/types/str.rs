@@ -15,7 +15,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
     hash::{HashValue, hash_python_str},
-    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, heap_read_ref_as_field},
+    heap::{DropGuard, DropWithContext, HeapData, HeapId, HeapItem, HeapRead, HeapReader, heap_read_ref_as_field},
     intern::{StaticStrings, StringId},
     resource::{ResourceError, ResourceTracker, check_replace_size},
     string_builder::StringBuilder,
@@ -182,7 +182,7 @@ fn ctor_str_arg<'a>(
 /// `RunResult` and other error types that implement `From<ResourceError>`.
 pub fn allocate_string(
     s: impl AsRef<str> + Into<Box<str>>,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Value, ResourceError> {
     let bytes = s.as_ref().as_bytes();
     match bytes.len() {
@@ -201,7 +201,7 @@ pub fn allocate_string(
 /// Accepts `impl Into<Box<str>>` for the same reasons as [`allocate_string`].
 pub fn allocate_string_no_interning(
     s: impl Into<Box<str>>,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Value, ResourceError> {
     let heap_id = heap.allocate(HeapData::Str(Str::new(s)))?;
     Ok(Value::Ref(heap_id))
@@ -213,7 +213,7 @@ pub fn allocate_string_no_interning(
 /// Non-ASCII characters are allocated on the heap.
 ///
 /// This is used by string iteration and `chr()` builtin.
-pub fn allocate_char(c: char, heap: &Heap<impl ResourceTracker>) -> Result<Value, ResourceError> {
+pub fn allocate_char(c: char, heap: &HeapReader<'_, impl ResourceTracker>) -> Result<Value, ResourceError> {
     if c.is_ascii() {
         Ok(Value::InternString(StringId::from_ascii(c as u8)))
     } else {
@@ -228,7 +228,11 @@ pub fn allocate_char(c: char, heap: &Heap<impl ResourceTracker>) -> Result<Value
 /// via `push_str`, instead of `format!`'s runtime formatting machinery. The
 /// result size is bounded by two already-tracked inputs, so a plain `String`
 /// is fine per the `StringBuilder` rule.
-pub(crate) fn concat_allocate_str(a: &str, b: &str, heap: &Heap<impl ResourceTracker>) -> Result<Value, ResourceError> {
+pub(crate) fn concat_allocate_str(
+    a: &str,
+    b: &str,
+    heap: &HeapReader<'_, impl ResourceTracker>,
+) -> Result<Value, ResourceError> {
     let mut concat = String::with_capacity(a.len() + b.len());
     concat.push_str(a);
     concat.push_str(b);

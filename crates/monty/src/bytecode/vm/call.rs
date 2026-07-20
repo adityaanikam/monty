@@ -78,7 +78,7 @@ pub(crate) enum CallResult {
     OsCallStoreBuffer { call: OsFunctionCall, file_id: HeapId },
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for CallResult {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for CallResult {
     fn drop_with(self, heap: &mut C) {
         match self {
             Self::Value(value) | Self::AwaitValue(value) => value.drop_with(heap),
@@ -870,7 +870,7 @@ impl<T: ResourceTracker> VM<'_, T> {
         // stack (pushed per-comp), not in any frame-level region, so they
         // don't enter this accounting.
         let size = namespace_size * mem::size_of::<Value>();
-        self.heap.tracker_mut().on_allocate(|| size)?;
+        self.heap.tracker().on_allocate(|| size)?;
 
         // 1. Build the namespace in the reusable scratch buffer to avoid a
         //    per-call allocation. On error `DropGuard` drops the buffer, so the
@@ -885,7 +885,7 @@ impl<T: ResourceTracker> VM<'_, T> {
             let bind_result = func.signature.bind(args, defaults, this, func.name, namespace);
 
             if let Err(e) = bind_result {
-                this.heap.tracker_mut().on_free(|| size);
+                this.heap.tracker().on_free(|| size);
                 return Err(e);
             }
         }

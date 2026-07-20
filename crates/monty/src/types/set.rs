@@ -70,7 +70,7 @@ impl SetStorage {
     }
 
     /// Clones entries with proper reference counting.
-    fn clone_entries(&self, heap: &impl ContainsHeap) -> Vec<(Value, u64)> {
+    fn clone_entries<'h>(&self, heap: &impl ContainsHeap<'h>) -> Vec<(Value, u64)> {
         self.entries
             .iter()
             .map(|e| (e.value.clone_with_heap(heap), e.hash))
@@ -205,7 +205,7 @@ impl<'h> HeapRead<'h, SetStorage> {
 
 impl SetStorage {
     /// Creates a deep clone with proper reference counting.
-    fn clone_with_heap(&self, heap: &impl ContainsHeap) -> Self {
+    fn clone_with_heap<'h>(&self, heap: &impl ContainsHeap<'h>) -> Self {
         Self {
             indices: self.indices.clone(),
             entries: self
@@ -371,7 +371,7 @@ impl<'a, 'h> SetIter<'a, 'h> {
     }
 }
 
-impl<'h, C: ContainsVM<'h>> DropWithContext<C> for SetIter<'_, 'h> {
+impl<'h, C: ContainsVM<'h>> DropWithContext<'h, C> for SetIter<'_, 'h> {
     fn drop_with(self, container: &mut C) {
         self.current.drop_with(container);
         self.token.drop_with(container);
@@ -864,19 +864,19 @@ enum SetComparison {
     Disjoint,
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for Set {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for Set {
     fn drop_with(self, heap: &mut C) {
         self.0.drop_with(heap);
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for SetStorage {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for SetStorage {
     fn drop_with(self, heap: &mut C) {
         self.entries.drop_with(heap);
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for FrozenSet {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for FrozenSet {
     fn drop_with(self, heap: &mut C) {
         self.storage.drop_with(heap);
     }
@@ -970,7 +970,7 @@ impl<'h> HeapRead<'h, FrozenSet> {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for SetEntry {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for SetEntry {
     fn drop_with(self, heap: &mut C) {
         self.value.drop_with(heap);
     }

@@ -54,7 +54,7 @@ use std::{fmt, mem};
 
 use crate::{
     exception_private::RunResult,
-    heap::Heap,
+    heap::HeapReader,
     resource::{ResourceError, ResourceTracker},
     types::str::allocate_string,
     value::Value,
@@ -146,7 +146,7 @@ impl<'t, T: ResourceTracker> StringBuilder<'t, T> {
     /// (or interns the result for empty / single-ASCII strings). If a prior
     /// [`fmt::Write`] call captured a tracker error, that error is returned
     /// here rather than the (now-stale) inner string.
-    pub fn finish(mut self, heap: &Heap<T>) -> RunResult<Value> {
+    pub fn finish(mut self, heap: &HeapReader<'_, T>) -> RunResult<Value> {
         if let Some(e) = self.pending_error.take() {
             // The reservation is released by Drop when `self` goes out of
             // scope at function return — no need to release here.

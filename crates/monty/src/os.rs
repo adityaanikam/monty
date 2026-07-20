@@ -26,7 +26,7 @@ use crate::{
     args::{ArgValues, FromArgs, LaxBool, ToArgs, ToMontyObject},
     bytecode::VM,
     exception_private::RunResult,
-    heap::{ContainsHeap, DropWithContext, Heap, HeapData},
+    heap::{ContainsHeap, DropWithContext, HeapData, HeapReader},
     intern::{Interns, StaticStrings},
     object::MontyTimeZone,
     resource::ResourceTracker,
@@ -305,7 +305,7 @@ impl fmt::Display for OsFunctionCall {
         f.write_str(self.name())
     }
 }
-impl<C: ContainsHeap> DropWithContext<C> for OsFunctionCall {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for OsFunctionCall {
     // Owned args (String/Vec<u8>/bool/MontyPath/MontyObject) hold no live
     // heap references, so a plain drop is correct.
     fn drop_with(self, _heap: &mut C) {
@@ -523,7 +523,7 @@ fn extract_str_data(
     method: &'static str,
     path: MontyPath,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<PathStringDataArgs> {
     let data = arg_or_missing_data(method, args, heap)?;
@@ -544,7 +544,7 @@ fn extract_bytes_data(
     method: &'static str,
     path: MontyPath,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<PathBytesDataArgs> {
     let data = arg_or_missing_data(method, args, heap)?;
@@ -607,7 +607,7 @@ fn extract_mkdir_args(
 fn extract_rename_args(
     src: MontyPath,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<RenameCallArgs> {
     let target = args.get_one_arg("rename", heap)?;
@@ -629,7 +629,7 @@ fn extract_rename_args(
 fn arg_or_missing_data(
     method: &'static str,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
 ) -> RunResult<Value> {
     if matches!(args, ArgValues::Empty) {
         return Err(ExcType::type_error(format!(
@@ -641,7 +641,11 @@ fn arg_or_missing_data(
 
 /// Owned `String` if `value` is a `str` or `Path`, else `None`. Caller drops
 /// the source value afterwards.
-fn value_to_owned_string(value: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<String> {
+fn value_to_owned_string(
+    value: &Value,
+    heap: &HeapReader<'_, impl ResourceTracker>,
+    interns: &Interns,
+) -> Option<String> {
     match value {
         Value::InternString(id) => Some(interns.get_str(*id).to_owned()),
         Value::Ref(id) => match heap.get(*id) {
@@ -654,7 +658,11 @@ fn value_to_owned_string(value: &Value, heap: &Heap<impl ResourceTracker>, inter
 }
 
 /// Owned `Vec<u8>` if `value` is a `bytes` (interned or heap), else `None`.
-fn value_to_owned_bytes(value: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<Vec<u8>> {
+fn value_to_owned_bytes(
+    value: &Value,
+    heap: &HeapReader<'_, impl ResourceTracker>,
+    interns: &Interns,
+) -> Option<Vec<u8>> {
     match value {
         Value::InternBytes(id) => Some(interns.get_bytes(*id).to_owned()),
         Value::Ref(id) => match heap.get(*id) {

@@ -12,7 +12,7 @@ use crate::{
     args::{ArgValues, FromArgs},
     bytecode::VM,
     exception_private::{ExcType, RunError, RunResult},
-    heap::{ContainsHeap, DropGuard, HeapData, HeapReader},
+    heap::{DropGuard, HeapData, HeapReader},
     resource::{ResourceError, ResourceTracker},
     types::{
         Dict, List, LongInt,
@@ -190,7 +190,7 @@ fn allocate_cached_string(
 ) -> ParseResult<Value> {
     if s.len() < 2 {
         // Empty and single-char strings are interned by allocate_string.
-        Ok(allocate_string(s, heap.heap())?)
+        Ok(allocate_string(s, heap)?)
     } else {
         Ok(cache.get_or_allocate(s, heap)?)
     }

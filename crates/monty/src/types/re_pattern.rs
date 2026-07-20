@@ -20,7 +20,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, RunError, RunResult},
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::StaticStrings,
     modules::re::{ASCII, DOTALL, IGNORECASE, MULTILINE},
     resource::{ResourceTracker, check_estimated_size},
@@ -176,7 +176,7 @@ impl RePattern {
         caps: &fancy_regex::Captures<'_>,
         subject: &Value,
         all_ascii: bool,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &HeapReader<'_, impl ResourceTracker>,
     ) -> RunResult<Value> {
         let m = ReMatch::from_captures(caps, subject.clone_with_heap(heap), all_ascii, &self.compiled);
         Ok(Value::Ref(heap.allocate(HeapData::ReMatch(m))?))
@@ -186,7 +186,7 @@ impl RePattern {
     ///
     /// `subject` is the subject `Value` (stored by the match); `text` is its
     /// borrowed contents. Returns a `ReMatch` heap object, or `Value::None`.
-    pub fn search(&self, subject: &Value, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn search(&self, subject: &Value, text: &str, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         match self.compiled.captures(text) {
             Ok(Some(caps)) => self.build_match(&caps, subject, text.is_ascii(), heap),
             Ok(None) => Ok(Value::None),
@@ -201,7 +201,12 @@ impl RePattern {
     /// anchor forces the engine to try all alternatives at position 0.
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
-    pub fn match_start(&self, subject: &Value, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn match_start(
+        &self,
+        subject: &Value,
+        text: &str,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<Value> {
         match self.match_regex()?.captures(text) {
             Ok(Some(caps)) => self.build_match(&caps, subject, text.is_ascii(), heap),
             Ok(None) => Ok(Value::None),
@@ -216,7 +221,12 @@ impl RePattern {
     /// anchors force the engine to try all alternatives for a full-string match.
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
-    pub fn fullmatch(&self, subject: &Value, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn fullmatch(
+        &self,
+        subject: &Value,
+        text: &str,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<Value> {
         match self.fullmatch_regex()?.captures(text) {
             Ok(Some(caps)) => self.build_match(&caps, subject, text.is_ascii(), heap),
             Ok(None) => Ok(Value::None),
@@ -230,7 +240,7 @@ impl RePattern {
     /// - No capture groups: returns a list of matched strings
     /// - One capture group: returns a list of the group's matched strings
     /// - Multiple capture groups: returns a list of tuples of matched strings
-    pub fn findall(&self, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn findall(&self, text: &str, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         let cap_count = self.compiled.captures_len();
         let mut results = Vec::new();
 
@@ -279,7 +289,13 @@ impl RePattern {
     /// after each match, bailing out immediately if the budget is exceeded. This
     /// avoids both false rejections from conservative pre-estimates and untracked
     /// Rust heap allocations from delegating to `fancy_regex::replace_all()`.
-    pub fn sub(&self, repl: &str, text: &str, count: usize, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn sub(
+        &self,
+        repl: &str,
+        text: &str,
+        count: usize,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<Value> {
         // Translate Python-style backreferences (\1, \2) to regex crate style ($1, $2)
         let rust_repl = translate_replacement(repl);
         let effective_count = if count == 0 { usize::MAX } else { count };
@@ -307,7 +323,7 @@ impl RePattern {
     /// splits occur and the remainder of the string is returned as the final
     /// element; if it is negative, no splits occur at all (CPython's split loop
     /// runs zero times), returning the whole subject as a single element.
-    pub fn split(&self, text: &str, maxsplit: i64, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn split(&self, text: &str, maxsplit: i64, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         let pieces: Vec<&str> = match maxsplit.cmp(&0) {
             Ordering::Less => vec![text],
             Ordering::Equal => self
@@ -340,7 +356,12 @@ impl RePattern {
     /// Eagerly collects all match objects into a list. This differs from CPython's
     /// lazy iterator but produces the same results when iterated. The VM's `GetIter`
     /// opcode handles iteration over the returned list.
-    pub fn finditer(&self, subject: &Value, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn finditer(
+        &self,
+        subject: &Value,
+        text: &str,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<Value> {
         // Every match shares one refcounted subject reference, not a copy each.
         let all_ascii = text.is_ascii();
 

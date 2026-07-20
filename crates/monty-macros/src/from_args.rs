@@ -374,7 +374,9 @@ impl Signature {
             }
 
             #[automatically_derived]
-            impl<__C: crate::heap::ContainsHeap> crate::heap::DropWithContext<__C> for #slots_struct_ident {
+            impl<'__h, __C: crate::heap::ContainsHeap<'__h>> crate::heap::DropWithContext<'__h, __C>
+                for #slots_struct_ident
+            {
                 fn drop_with(self, heap: &mut __C) {
                     crate::heap::DropWithContext::drop_with(self.raw, heap);
                     #(

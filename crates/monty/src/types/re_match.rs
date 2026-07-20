@@ -18,7 +18,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
+    heap::{HeapData, HeapId, HeapItem, HeapRead, HeapReader},
     intern::StaticStrings,
     resource::ResourceTracker,
     types::{
@@ -172,7 +172,7 @@ impl ReMatch {
     /// Group 0 is the full match, groups 1..N are capture groups.
     /// Returns `Value::None` for unmatched optional groups.
     /// Raises `IndexError` for invalid group numbers.
-    fn get_group(&self, n: i64, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    fn get_group(&self, n: i64, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         match n.cmp(&0) {
             Ordering::Equal => Ok(allocate_string(self.full_match.as_str(), heap)?),
             Ordering::Less => Err(ExcType::re_match_group_index_error()),
@@ -193,7 +193,7 @@ impl ReMatch {
     ///
     /// Looks up the group name in `named_groups` and delegates to `get_group`.
     /// Raises `IndexError` if the name is not found.
-    fn get_group_by_name(&self, name: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    fn get_group_by_name(&self, name: &str, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         for (group_name, idx) in &self.named_groups {
             if group_name == name {
                 #[expect(clippy::cast_possible_wrap, reason = "group indices are always small")]
@@ -234,7 +234,7 @@ impl ReMatch {
     /// Returns a tuple of all capture group strings.
     ///
     /// Unmatched optional groups appear as `None`.
-    fn get_groups(&self, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    fn get_groups(&self, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         let mut elements = smallvec![];
         for group in &self.groups {
             match group {
@@ -510,7 +510,7 @@ fn extract_optional_group_arg(
     args: ArgValues,
     name: &str,
     default: i64,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
 ) -> RunResult<i64> {
     let opt = args.get_zero_one_arg(name, heap)?;
     match opt {

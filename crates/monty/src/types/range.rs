@@ -18,7 +18,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunResult},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     resource::ResourceTracker,
     types::{LazyHeapSet, PyTrait, Type},
     value::Value,
@@ -151,7 +151,7 @@ impl Range {
     ///
     /// Returns a new range object representing the sliced view.
     /// The new range has computed start, stop, and step values.
-    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    fn getitem_slice(&self, slice: &super::Slice, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         let range_len = self.len();
         let (start, stop, step) = slice.indices(range_len)?;
 

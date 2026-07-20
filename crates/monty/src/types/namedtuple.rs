@@ -261,7 +261,7 @@ impl<'a, 'h> NamedTupleIter<'a, 'h> {
     }
 }
 
-impl<'h, C: ContainsVM<'h>> DropWithContext<C> for NamedTupleIter<'_, 'h> {
+impl<'h, C: ContainsVM<'h>> DropWithContext<'h, C> for NamedTupleIter<'_, 'h> {
     fn drop_with(self, container: &mut C) {
         self.current.drop_with(container);
         self.token.drop_with(container);

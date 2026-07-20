@@ -73,7 +73,7 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{DropGuard, DropWithContext, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::StaticStrings,
     os::{MontyPath, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs},
     resource::ResourceTracker,
@@ -1607,7 +1607,7 @@ fn parse_read_size_arg(size_arg: Option<Value>, vm: &mut VM<'_, impl ResourceTra
 /// path so a hot `read(0)` does not allocate. Binary mode still allocates
 /// a fresh empty `Bytes` because there is no equivalent interned bytes
 /// singleton.
-fn empty_result(binary: bool, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn empty_result(binary: bool, heap: &mut HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     if binary {
         let id = heap.allocate(HeapData::Bytes(Bytes::new(Vec::new())))?;
         Ok(Value::Ref(id))
@@ -1664,7 +1664,7 @@ fn extract_bytes_payload(data: &Value, vm: &VM<'_, impl ResourceTracker>) -> Opt
 }
 
 /// Returns whether a value is a Python `bytes` object.
-fn is_bytes(data: &Value, heap: &Heap<impl ResourceTracker>) -> bool {
+fn is_bytes(data: &Value, heap: &HeapReader<'_, impl ResourceTracker>) -> bool {
     match data {
         Value::InternBytes(_) => true,
         Value::Ref(id) => matches!(heap.get(*id), HeapData::Bytes(_)),

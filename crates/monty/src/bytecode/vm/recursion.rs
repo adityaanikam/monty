@@ -204,17 +204,18 @@ pub(crate) struct RecursionToken(());
 /// counter — e.g. dropping a [`RecursionToken`] — while a wrapper like the encoder
 /// stays borrowable through the same handle. Because `ContainsVM: ContainsHeap`,
 /// such a context can still drop plain heap fields via `drop_with(ctx)`.
-pub(crate) trait ContainsVM<'h>: ContainsHeap {
-    // `+ 'h` because `VM<'h, T>` is only well-formed when its tracker outlives the
-    // brand; making it part of the associated-type bound means callers of `vm()`
-    // get `Self::Tracker: 'h` for free instead of having to prove it.
+pub(crate) trait ContainsVM<'h>: ContainsHeap<'h, Tracker = <Self as ContainsVM<'h>>::Tracker> {
+    /// Tracker shared by the VM and heap cleanup context.
     type Tracker: ResourceTracker + 'h;
-    fn vm(&mut self) -> &mut VM<'h, Self::Tracker>;
+
+    /// Returns the VM whose heap and tracker back this cleanup context.
+    fn vm(&mut self) -> &mut VM<'h, <Self as ContainsVM<'h>>::Tracker>;
 }
 
 impl<'h, T: ResourceTracker> ContainsVM<'h> for VM<'h, T> {
     type Tracker = T;
-    fn vm(&mut self) -> &mut VM<'h, Self::Tracker> {
+
+    fn vm(&mut self) -> &mut VM<'h, <Self as ContainsVM<'h>>::Tracker> {
         self
     }
 }
@@ -224,7 +225,7 @@ impl<'h, T: ResourceTracker> ContainsVM<'h> for VM<'h, T> {
 /// confines token cleanup to a `VM`/`Encoder` — a bare heap cannot reach the
 /// counter — and there is no overlap with the heap-only impls because those are
 /// for different `Self` types.
-impl<'h, C: ContainsVM<'h>> DropWithContext<C> for RecursionToken {
+impl<'h, C: ContainsVM<'h>> DropWithContext<'h, C> for RecursionToken {
     fn drop_with(self, ctx: &mut C) {
         ctx.vm().decr_recursion();
     }

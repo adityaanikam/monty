@@ -10,7 +10,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{Heap, HeapData},
+    heap::{HeapData, HeapReader},
     resource::{ResourceTracker, check_pow_size},
     types::{LongInt, PyTrait},
     value::Value,
@@ -203,7 +203,7 @@ fn two_arg_pow(base: &Value, exp: &Value, vm: &mut VM<'_, impl ResourceTracker>)
 }
 
 /// int ** int with LongInt promotion on overflow.
-fn int_pow_int(b: i64, e: i64, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn int_pow_int(b: i64, e: i64, heap: &mut HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     if e < 0 {
         // Negative exponent returns float
         if b == 0 {
@@ -234,7 +234,7 @@ fn int_pow_int(b: i64, e: i64, heap: &mut Heap<impl ResourceTracker>) -> RunResu
 }
 
 /// int ** LongInt with LongInt result.
-fn int_pow_longint(b: i64, e: &BigInt, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn int_pow_longint(b: i64, e: &BigInt, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     if b == 0 && e.is_negative() {
         return Err(ExcType::zero_negative_power());
     }
@@ -268,7 +268,7 @@ fn int_pow_longint(b: i64, e: &BigInt, heap: &Heap<impl ResourceTracker>) -> Run
 }
 
 /// LongInt ** int with LongInt result.
-fn longint_pow_int(b: &BigInt, e: i64, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn longint_pow_int(b: &BigInt, e: i64, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     if b.is_zero() && e < 0 {
         return Err(ExcType::zero_negative_power());
     }
@@ -297,7 +297,7 @@ fn longint_pow_int(b: &BigInt, e: i64, heap: &Heap<impl ResourceTracker>) -> Run
 }
 
 /// LongInt ** LongInt with LongInt result.
-fn longint_pow_longint(b: &BigInt, e: &BigInt, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn longint_pow_longint(b: &BigInt, e: &BigInt, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     if b.is_zero() && e.is_negative() {
         return Err(ExcType::zero_negative_power());
     }

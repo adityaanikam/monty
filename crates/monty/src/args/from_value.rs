@@ -120,7 +120,7 @@ pub(crate) trait FromValue: Sized {
     ///
     /// For primitives this is a no-op; for `Value` / [`StrArg`] it decrements
     /// the held reference.
-    fn drop_extracted(self, heap: &mut impl ContainsHeap) {
+    fn drop_extracted<'h>(self, heap: &mut impl ContainsHeap<'h>) {
         // Default: no heap references held. Specialise in impls that hold them.
         let _ = heap;
         drop(self);
@@ -187,7 +187,7 @@ impl FromValue for Value {
         Ok(value)
     }
 
-    fn drop_extracted(self, heap: &mut impl ContainsHeap) {
+    fn drop_extracted<'h>(self, heap: &mut impl ContainsHeap<'h>) {
         self.drop_with(heap);
     }
 }
@@ -296,7 +296,7 @@ impl FromValue for StrArg {
         }
     }
 
-    fn drop_extracted(self, heap: &mut impl ContainsHeap) {
+    fn drop_extracted<'h>(self, heap: &mut impl ContainsHeap<'h>) {
         self.0.drop_with(heap);
     }
 }
@@ -312,7 +312,7 @@ impl StrArg {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for StrArg {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for StrArg {
     fn drop_with(self, ctx: &mut C) {
         self.0.drop_with(ctx);
     }
@@ -344,7 +344,7 @@ impl<T: FromValue> FromValue for Option<T> {
         T::type_error(got)
     }
 
-    fn drop_extracted(self, heap: &mut impl ContainsHeap) {
+    fn drop_extracted<'h>(self, heap: &mut impl ContainsHeap<'h>) {
         if let Some(inner) = self {
             inner.drop_extracted(heap);
         }

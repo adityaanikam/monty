@@ -31,7 +31,7 @@ use crate::{
         op::{Opcode, decode_assert_flags},
     },
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapReadOutput, HeapReader},
+    heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapReadOutput, HeapReader},
     heap_data::{Closure, FunctionDefaults},
     intern::{FunctionId, Interns, StaticStrings, StringId},
     io::PrintWriter,
@@ -303,7 +303,7 @@ pub enum FrameExit {
     },
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for FrameExit {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for FrameExit {
     fn drop_with(self, heap: &mut C) {
         match self {
             Self::Return(value) => value.drop_with(heap),
@@ -2027,7 +2027,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         // spawned coroutine).
         if frame.locals_count > 0 {
             let size = usize::from(frame.locals_count) * mem::size_of::<Value>();
-            self.heap.tracker_mut().on_free(|| size);
+            self.heap.tracker().on_free(|| size);
         }
     }
 
@@ -2366,12 +2366,14 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
 }
 
 // `heap` is not a public field on VM, so this implementation needs to go here rather than in `heap.rs`
-impl<T: ResourceTracker> ContainsHeap for VM<'_, T> {
-    type ResourceTracker = T;
-    fn heap(&self) -> &Heap<T> {
+impl<'h, T: ResourceTracker> ContainsHeap<'h> for VM<'h, T> {
+    type Tracker = T;
+
+    fn heap(&self) -> &HeapReader<'h, T> {
         self.heap
     }
-    fn heap_mut(&mut self) -> &mut Heap<T> {
+
+    fn heap_mut(&mut self) -> &mut HeapReader<'h, T> {
         self.heap
     }
 }

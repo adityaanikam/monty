@@ -7,7 +7,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{DropWithContext, Heap, HeapData, HeapId},
+    heap::{DropWithContext, Heap, HeapData, HeapId, HeapReader},
     intern::{Interns, StaticStrings, StringId},
     resource::ResourceTracker,
     types::{
@@ -175,7 +175,7 @@ impl Type {
     /// class names are cloned into `Cow::Owned`), so it can be captured
     /// before heap-mutating cleanup (`drop_with`) at error sites and
     /// formatted after.
-    pub(crate) fn name<'i>(self, heap: &Heap<impl ResourceTracker>, interns: &'i Interns) -> Cow<'i, str> {
+    pub(crate) fn name<'i>(self, heap: &Heap, interns: &'i Interns) -> Cow<'i, str> {
         match self {
             Self::Instance(class_id) => class_name(class_id, heap, interns),
             Self::Exception(exc_type) => Cow::Borrowed(exc_type.into()),
@@ -189,7 +189,7 @@ impl Type {
     /// `arg == Py_None ? "None" : Py_TYPE(arg)->tp_name`, and since `NoneType`
     /// is a singleton, branching on the type is equivalent to branching on the
     /// value. Use for the "not Y" half of arg-type error messages only.
-    pub(crate) fn cpython_arg_name<'i>(self, heap: &Heap<impl ResourceTracker>, interns: &'i Interns) -> Cow<'i, str> {
+    pub(crate) fn cpython_arg_name<'i>(self, heap: &Heap, interns: &'i Interns) -> Cow<'i, str> {
         match self {
             Self::NoneType => Cow::Borrowed("None"),
             other => other.name(heap, interns),
@@ -591,7 +591,7 @@ fn int_base(base: Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<u32
 /// `base` is `0` (auto-detect from a `0x`/`0o`/`0b` prefix) or `2..=36`.
 /// Returns `Value::Int` if the value fits in i64, otherwise allocates a
 /// `LongInt` on the heap. Returns `ValueError` on failure.
-fn parse_int_from_str(value: &str, base: u32, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn parse_int_from_str(value: &str, base: u32, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     // Fast path: plain base-10 literals parse directly (no whitespace,
     // underscores or prefix handling needed).
     if base == 10
@@ -617,7 +617,7 @@ fn parse_int_from_str(value: &str, base: u32, heap: &Heap<impl ResourceTracker>)
 ///
 /// Unlike `str`, bytes must not treat UTF-8 encodings of Unicode whitespace as
 /// separators. Failures repr the input as a bytes literal, matching CPython.
-fn parse_int_from_bytes(bytes: &[u8], base: u32, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn parse_int_from_bytes(bytes: &[u8], base: u32, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     let invalid = || ExcType::value_error_invalid_literal_for_int(base, bytes_repr(bytes));
     match str::from_utf8(bytes.trim_ascii()) {
         Ok(s) => parse_int_digits(s, base, &invalid, heap),
@@ -641,7 +641,7 @@ fn parse_int_digits(
     value: &str,
     base: u32,
     invalid: &impl Fn() -> RunError,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
 ) -> RunResult<Value> {
     let (negative, body) = match value.strip_prefix(['+', '-']) {
         Some(rest) => (value.starts_with('-'), rest),

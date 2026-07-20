@@ -82,7 +82,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
     hash::{HashValue, hash_python_bytes},
-    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, heap_read_ref_as_field},
+    heap::{DropGuard, DropWithContext, HeapData, HeapId, HeapItem, HeapRead, HeapReader, heap_read_ref_as_field},
     intern::{StaticStrings, StringId},
     resource::{ResourceError, ResourceTracker, check_repeat_size, check_replace_size},
     types::{
@@ -1747,7 +1747,7 @@ fn bytes_replace_all(
     bytes: &[u8],
     old: &[u8],
     new: &[u8],
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Vec<u8>, ResourceError> {
     if old.is_empty() {
         // Empty pattern: insert new before each byte and at the end
@@ -1782,7 +1782,7 @@ fn bytes_replace_n(
     old: &[u8],
     new: &[u8],
     n: usize,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Vec<u8>, ResourceError> {
     if old.is_empty() {
         // Empty pattern: insert new before each byte (up to n times)
@@ -2289,7 +2289,7 @@ fn hex_char_to_value(c: char) -> Option<u8> {
 // =============================================================================
 
 /// Allocates bytes on the heap.
-fn allocate_bytes(bytes: Vec<u8>, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn allocate_bytes(bytes: Vec<u8>, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     let heap_id = heap.allocate(HeapData::Bytes(Bytes::new(bytes)))?;
     Ok(Value::Ref(heap_id))
 }

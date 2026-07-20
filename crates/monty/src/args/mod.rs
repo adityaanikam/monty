@@ -16,7 +16,7 @@ use crate::{
     bytecode::VM,
     exception_private::{ExcType, RunError, RunResult},
     expressions::{ExprLoc, Identifier},
-    heap::{ContainsHeap, DropWithContext, Heap},
+    heap::{ContainsHeap, DropWithContext, HeapReader},
     intern::StringId,
     parse::ParseError,
     types::{Dict, dict::DictIntoIter},
@@ -51,7 +51,7 @@ impl ArgValues {
     /// Checks that zero arguments were passed.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
-    pub fn check_zero_args(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<()> {
+    pub fn check_zero_args(self, name: &str, heap: &mut HeapReader<'_, impl ResourceTracker>) -> RunResult<()> {
         match self {
             Self::Empty => Ok(()),
             other => {
@@ -65,7 +65,7 @@ impl ArgValues {
     /// Checks that exactly one positional argument was passed, returning it.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
-    pub fn get_one_arg(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
+    pub fn get_one_arg(self, name: &str, heap: &mut HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
         match self {
             Self::One(a) => Ok(a),
             other => {
@@ -79,7 +79,11 @@ impl ArgValues {
     /// Checks that exactly two positional arguments were passed, returning them as a tuple.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
-    pub fn get_two_args(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<(Value, Value)> {
+    pub fn get_two_args(
+        self,
+        name: &str,
+        heap: &mut HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<(Value, Value)> {
         match self {
             Self::Two(a1, a2) => Ok((a1, a2)),
             other => {
@@ -96,7 +100,7 @@ impl ArgValues {
     pub fn get_one_two_args(
         self,
         name: &str,
-        heap: &mut Heap<impl ResourceTracker>,
+        heap: &mut HeapReader<'_, impl ResourceTracker>,
     ) -> RunResult<(Value, Option<Value>)> {
         match self {
             Self::One(a) => Ok((a, None)),
@@ -116,7 +120,11 @@ impl ArgValues {
     /// Checks that zero or one argument was passed, returning the optional value.
     ///
     /// On error, properly drops all contained values to maintain reference counts.
-    pub fn get_zero_one_arg(self, name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Value>> {
+    pub fn get_zero_one_arg(
+        self,
+        name: &str,
+        heap: &mut HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<Option<Value>> {
         match self {
             Self::Empty => Ok(None),
             Self::One(a) => Ok(Some(a)),
@@ -165,7 +173,11 @@ impl ArgValues {
     }
 
     /// Variant of [`into_parts()`](Self::into_parts) that accepts no kwargs, returning an error if any are present.
-    pub fn into_pos_only(self, method_name: &str, heap: &mut Heap<impl ResourceTracker>) -> RunResult<ArgPosIter> {
+    pub fn into_pos_only(
+        self,
+        method_name: &str,
+        heap: &mut HeapReader<'_, impl ResourceTracker>,
+    ) -> RunResult<ArgPosIter> {
         match self {
             Self::Empty => Ok(ArgPosIter::Empty),
             Self::One(v) => Ok(ArgPosIter::One(v)),
@@ -192,7 +204,7 @@ impl ArgValues {
     fn unexpected_kwargs_error(
         kwargs: KwargsValues,
         method_name: &str,
-        heap: &mut Heap<impl ResourceTracker>,
+        heap: &mut HeapReader<'_, impl ResourceTracker>,
     ) -> RunError {
         kwargs.drop_with(heap);
         ExcType::type_error_no_kwargs(method_name)
@@ -231,7 +243,7 @@ impl ArgValues {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for ArgValues {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for ArgValues {
     fn drop_with(self, heap: &mut C) {
         match self {
             Self::Empty => {}
@@ -315,7 +327,7 @@ impl Iterator for ArgPosIter {
 
 impl ExactSizeIterator for ArgPosIter {}
 
-impl<C: ContainsHeap> DropWithContext<C> for ArgPosIter {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for ArgPosIter {
     fn drop_with(self, heap: &mut C) {
         match self {
             Self::Empty => {}
@@ -385,7 +397,7 @@ impl KwargsValues {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for KwargsValues {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for KwargsValues {
     /// Properly drops all values in the arguments, decrementing reference counts.
     fn drop_with(self, heap: &mut C) {
         match self {
@@ -461,7 +473,7 @@ impl Iterator for KwargsValuesIter {
 
 impl ExactSizeIterator for KwargsValuesIter {}
 
-impl<C: ContainsHeap> DropWithContext<C> for KwargsValuesIter {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for KwargsValuesIter {
     fn drop_with(self, heap: &mut C) {
         match self {
             Self::Empty => {}

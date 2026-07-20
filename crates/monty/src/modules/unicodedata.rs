@@ -32,7 +32,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId},
+    heap::{HeapData, HeapId, HeapReader},
     intern::StaticStrings,
     modules::ModuleFunctions,
     resource::{ResourceError, ResourceTracker},
@@ -276,7 +276,7 @@ impl NormForm {
 /// The output length is not bounded by the input (decomposition can expand a
 /// single code point into several), so the result is built through
 /// [`StringBuilder`] which reserves bytes with the resource tracker as it grows.
-fn normalize_with(form: NormForm, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn normalize_with(form: NormForm, text: &str, heap: &HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     let mut builder = StringBuilder::new(heap.tracker());
     match form {
         NormForm::Nfc => {

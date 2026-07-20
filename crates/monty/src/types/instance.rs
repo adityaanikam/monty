@@ -452,11 +452,7 @@ fn class_member(class_id: HeapId, name: &str, vm: &VM<'_, impl ResourceTracker>)
 /// If `class_id` does not refer to a `Class` heap entry — every producer of a
 /// class id (`Instance.class`, class values) guarantees it does, so this is a
 /// programmer-error tripwire.
-pub(crate) fn class_name<'i>(
-    class_id: HeapId,
-    heap: &Heap<impl ResourceTracker>,
-    interns: &'i Interns,
-) -> Cow<'i, str> {
+pub(crate) fn class_name<'i>(class_id: HeapId, heap: &Heap, interns: &'i Interns) -> Cow<'i, str> {
     match heap.get(class_id) {
         HeapData::Class(class) => match class.name() {
             EitherStr::Interned(id) => Cow::Borrowed(interns.get_str(*id)),

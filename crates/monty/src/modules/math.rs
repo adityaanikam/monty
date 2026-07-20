@@ -32,7 +32,7 @@ use crate::{
     bytecode::VM,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId},
+    heap::{HeapData, HeapId, HeapReader},
     intern::StaticStrings,
     modules::ModuleFunctions,
     resource::{ResourceError, ResourceTracker},
@@ -1321,7 +1321,11 @@ fn math_erfc(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResul
 ///
 /// For finite values outside the i64 range, promotes to `LongInt` to match CPython's
 /// behavior of returning arbitrary-precision integers from `math.floor`/`ceil`/`trunc`.
-fn float_to_int_checked(rounded: f64, original: f64, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn float_to_int_checked(
+    rounded: f64,
+    original: f64,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
+) -> RunResult<Value> {
     if original.is_infinite() {
         Err(SimpleException::new_msg(ExcType::OverflowError, "cannot convert float infinity to integer").into())
     } else if original.is_nan() {
@@ -1407,7 +1411,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 ///
 /// This is needed for operations like `gcd(i64::MIN, 0)` where the unsigned result
 /// (`2^63`) doesn't fit in a signed `i64`.
-fn u64_to_value(n: u64, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn u64_to_value(n: u64, heap: &mut HeapReader<'_, impl ResourceTracker>) -> RunResult<Value> {
     if let Ok(signed) = i64::try_from(n) {
         Ok(Value::Int(signed))
     } else {

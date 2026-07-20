@@ -122,7 +122,7 @@ impl MontyIter {
     }
 
     /// Drops the iterator and its held value properly.
-    pub fn drop_with(self, heap: &mut impl ContainsHeap) {
+    pub fn drop_with<'h>(self, heap: &mut impl ContainsHeap<'h>) {
         self.value.drop_with(heap);
     }
 
@@ -209,7 +209,7 @@ impl MontyIter {
     /// For concrete iterables, returns their exact remaining count.
     ///
     /// Opaque iterators may provide a type-specific hint; otherwise this returns zero.
-    pub fn size_hint(&self, heap: &Heap<impl ResourceTracker>) -> usize {
+    pub fn size_hint(&self, heap: &Heap) -> usize {
         let len = match &self.iter_value {
             IterValue::Range { len, .. } | IterValue::IterStr { len, .. } | IterValue::InternBytes { len, .. } => *len,
             IterValue::HeapRef { len, .. } => *len,
@@ -571,7 +571,7 @@ impl OpaqueError {
 ///
 /// The walk is iterative and bounded because restored snapshot data is untrusted.
 /// Its result is always safe to dispatch without another opaque hop.
-fn flatten_opaque(start: HeapId, heap: &Heap<impl ResourceTracker>) -> Result<HeapId, OpaqueError> {
+fn flatten_opaque(start: HeapId, heap: &Heap) -> Result<HeapId, OpaqueError> {
     let mut current = start;
     for _ in 0..MAX_OPAQUE_DEPTH {
         match heap.get(current) {
@@ -587,7 +587,7 @@ fn flatten_opaque(start: HeapId, heap: &Heap<impl ResourceTracker>) -> Result<He
 }
 
 /// Resolves a direct opaque target, rejecting nested links from malformed snapshots.
-fn opaque_target(heap_id: HeapId, heap: &Heap<impl ResourceTracker>) -> Result<OpaqueTarget, OpaqueError> {
+fn opaque_target(heap_id: HeapId, heap: &Heap) -> Result<OpaqueTarget, OpaqueError> {
     match heap.get(heap_id) {
         HeapData::Iter(inner) if matches!(inner.iter_value, IterValue::Opaque { .. }) => Err(OpaqueError::TooDeep),
         HeapData::Iter(_) => Ok(OpaqueTarget::Iter(heap_id)),
@@ -810,7 +810,7 @@ impl IterValue {
     }
 
     /// Creates an iterator value from heap data.
-    fn from_heap_data(heap_id: HeapId, heap: &Heap<impl ResourceTracker>) -> RunResult<Option<Self>> {
+    fn from_heap_data(heap_id: HeapId, heap: &Heap) -> RunResult<Option<Self>> {
         let iter_value = match heap.get(heap_id) {
             // Tuple/NamedTuple/Bytes/FrozenSet: captured len, no mutation check
             HeapData::Tuple(tuple) => Some(Self::HeapRef {
@@ -873,7 +873,7 @@ impl IterValue {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for MontyIter {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for MontyIter {
     #[inline]
     fn drop_with(self, heap: &mut C) {
         Self::drop_with(self, heap);

@@ -178,13 +178,18 @@ impl MontyRun {
     /// * `inputs` - Values to fill the first N slots of the namespace
     /// * `resource_tracker` - Custom resource tracker implementation
     /// * `print` - print output writer
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API: the tracker is owned by the caller, and giving it up here \
+                  matches the consume-style pattern of the previous `Heap`-owned tracker."
+    )]
     pub fn run(
         &self,
         inputs: Vec<MontyObject>,
         resource_tracker: impl ResourceTracker,
         print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
-        self.executor.run(inputs, resource_tracker, print)
+        self.executor.run(inputs, &resource_tracker, print)
     }
 
     /// Executes the code to completion with no resource limits, printing to stdout/stderr.
@@ -248,10 +253,13 @@ impl MontyRun {
         let executor = self.executor;
 
         // Create heap and VM with empty globals, then populate inputs with VM alive
-        let mut heap = Heap::new(executor.namespace_size(), resource_tracker);
+        let mut heap = Heap::new(executor.namespace_size());
         let globals = executor.empty_globals();
-        let (converted, vm_state) =
-            HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
+        let (converted, vm_state) = HeapReader::with(
+            &mut heap,
+            &resource_tracker,
+            &mut (&executor, print),
+            |reader, (executor, print)| {
                 let mut vm = VM::new(
                     globals,
                     reader,
@@ -268,8 +276,9 @@ impl MontyRun {
                 let converted = convert_frame_exit(vm_result, &mut vm);
                 let vm_state = check_snapshot_from_converted(&converted, vm);
                 Ok((converted, vm_state))
-            })?;
-        build_run_progress(converted, vm_state, executor, heap)
+            },
+        )?;
+        build_run_progress(converted, vm_state, executor, heap, resource_tracker)
     }
 }
 
@@ -439,25 +448,30 @@ impl Executor {
     fn run(
         &self,
         inputs: Vec<MontyObject>,
-        resource_tracker: impl ResourceTracker,
+        resource_tracker: &impl ResourceTracker,
         print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
         let heap_capacity = self.heap_capacity.load(Ordering::Relaxed);
-        let mut heap = Heap::new(heap_capacity, resource_tracker);
+        let mut heap = Heap::new(heap_capacity);
         let globals = self.empty_globals();
 
         // Create VM first, then populate inputs with VM alive
-        let result = HeapReader::with(&mut heap, &mut (self, print), |reader, (executor, print)| {
-            let mut vm = VM::new(
-                globals,
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                executor.assert_repr_max_bytes,
-            );
-            executor.populate_inputs(inputs, &mut vm)?;
-            executor.run_to_completion(&mut vm)
-        });
+        let result = HeapReader::with(
+            &mut heap,
+            resource_tracker,
+            &mut (self, print),
+            |reader, (executor, print)| {
+                let mut vm = VM::new(
+                    globals,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    executor.assert_repr_max_bytes,
+                );
+                executor.populate_inputs(inputs, &mut vm)?;
+                executor.run_to_completion(&mut vm)
+            },
+        );
 
         if heap.size() > heap_capacity {
             self.heap_capacity.store(heap.size(), Ordering::Relaxed);
@@ -533,6 +547,10 @@ impl Executor {
     ///
     /// Only available when the `ref-count-return` feature is enabled.
     #[cfg(feature = "ref-count-return")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "test-only entry point; ownership matches the old `Heap::new(_, tracker)` shape."
+    )]
     fn run_ref_counts_with_tracker(
         &self,
         inputs: Vec<MontyObject>,
@@ -540,10 +558,10 @@ impl Executor {
     ) -> Result<RefCountOutput, MontyException> {
         use std::collections::HashSet;
 
-        let mut heap = Heap::new(self.namespace_size(), resource_tracker);
+        let mut heap = Heap::new(self.namespace_size());
         let globals = self.empty_globals();
 
-        HeapReader::with(&mut heap, &mut &*self, |reader, executor| {
+        HeapReader::with(&mut heap, &resource_tracker, &mut &*self, |reader, executor| {
             // Create VM, populate inputs, and run
             let mut vm = VM::new(
                 globals,

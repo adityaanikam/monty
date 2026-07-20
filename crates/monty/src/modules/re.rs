@@ -548,7 +548,7 @@ impl PatternArg {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for PatternArg {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for PatternArg {
     fn drop_with(self, heap: &mut C) {
         if let Self::Compiled(value) = self {
             value.drop_with(heap);
@@ -608,7 +608,7 @@ enum ResolvedPattern {
 
 impl ResolvedPattern {
     /// Borrows the compiled pattern (from the heap for the `Heap` variant).
-    fn get<'a>(&'a self, heap: &'a Heap<impl ResourceTracker>) -> &'a RePattern {
+    fn get<'a>(&'a self, heap: &'a Heap) -> &'a RePattern {
         match self {
             Self::Cached(pattern) => pattern,
             Self::Heap(value) => {
@@ -624,7 +624,7 @@ impl ResolvedPattern {
     }
 }
 
-impl<C: ContainsHeap> DropWithContext<C> for ResolvedPattern {
+impl<'h, C: ContainsHeap<'h>> DropWithContext<'h, C> for ResolvedPattern {
     fn drop_with(self, heap: &mut C) {
         if let Self::Heap(value) = self {
             value.drop_with(heap);

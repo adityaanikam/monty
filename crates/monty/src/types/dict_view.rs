@@ -25,7 +25,7 @@ pub(crate) trait DictView {
     fn dict_id(&self) -> HeapId;
 
     /// Returns the live dictionary backing this view.
-    fn dict<'a>(&self, heap: &'a Heap<impl ResourceTracker>) -> &'a Dict {
+    fn dict<'a>(&self, heap: &'a Heap) -> &'a Dict {
         let HeapData::Dict(dict) = heap.get(self.dict_id()) else {
             panic!("dict view must always reference a dict");
         };

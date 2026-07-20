@@ -18,7 +18,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::{Interns, StaticStrings},
     os::OsFunctionCall,
     resource::{ResourceError, ResourceTracker},
@@ -140,7 +140,10 @@ struct DateInitArgs {
 ///
 /// Issues a `DateToday` OS call with no arguments. The host should return
 /// `MontyObject::Date` directly.
-pub(crate) fn class_today(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<AttrCallResult> {
+pub(crate) fn class_today(
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
+    args: ArgValues,
+) -> RunResult<AttrCallResult> {
     args.check_zero_args("date.today", heap)?;
     Ok(AttrCallResult::OsCall(OsFunctionCall::DateToday))
 }
@@ -150,7 +153,7 @@ pub(crate) fn class_today(heap: &mut Heap<impl ResourceTracker>, args: ArgValues
 /// Parses ISO 8601 date strings in the formats `YYYY-MM-DD` and `YYYYMMDD`,
 /// matching CPython 3.11+ behavior.
 pub(crate) fn class_fromisoformat(
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
     args: ArgValues,
     interns: &Interns,
 ) -> RunResult<Value> {
@@ -176,7 +179,7 @@ fn parse_iso_date(s: &str) -> Option<Date> {
 pub(crate) fn extract_str_arg(
     value: &Value,
     method_name: &str,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<String> {
     match value {
@@ -315,7 +318,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Date> {
 pub(crate) fn py_sub_date(
     a: Date,
     b: Date,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Option<Value>, ResourceError> {
     let diff_days = i64::from(to_ordinal(a)) - i64::from(to_ordinal(b));
     let Ok(delta) = timedelta::from_total_microseconds(i128::from(diff_days) * MICROSECONDS_PER_DAY) else {
@@ -328,7 +331,7 @@ pub(crate) fn py_sub_date(
 pub(crate) fn py_add(
     date: Date,
     delta: TimeDelta,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Option<Value>, ResourceError> {
     let (days, _, _) = timedelta::components(&delta);
     let new_ordinal = i64::from(to_ordinal(date)).checked_add(i64::from(days));
@@ -348,7 +351,7 @@ pub(crate) fn py_add(
 pub(crate) fn py_sub_timedelta(
     date: Date,
     delta: TimeDelta,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut HeapReader<'_, impl ResourceTracker>,
 ) -> Result<Option<Value>, ResourceError> {
     let (days, _, _) = timedelta::components(&delta);
     let new_ordinal = i64::from(to_ordinal(date)).checked_sub(i64::from(days));

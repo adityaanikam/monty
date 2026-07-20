@@ -13,7 +13,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId},
+    heap::{HeapData, HeapId, HeapReader},
     intern::StaticStrings,
     modules::ModuleFunctions,
     resource::{ResourceError, ResourceTracker},
@@ -73,7 +73,7 @@ pub(super) fn call(
 ///
 /// Returns `CallResult::AwaitValue` so the VM executes `exec_get_awaitable` on
 /// the value, which handles validation that it's actually a coroutine/awaitable.
-fn run(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
+fn run(heap: &mut HeapReader<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
     let coroutine = args.get_one_arg("asyncio.run", heap)?;
     Ok(CallResult::AwaitValue(coroutine))
 }

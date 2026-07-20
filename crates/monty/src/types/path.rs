@@ -21,7 +21,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
     hash::HashValue,
-    heap::{DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{DropWithContext, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::{Interns, StaticStrings},
     os::{MontyPath, build_path_os_call, is_path_os_method},
     resource::ResourceTracker,
@@ -335,7 +335,7 @@ fn fold_joinpath(mut path: Path, parts: &[Value], vm: &VM<'_, impl ResourceTrack
 pub(crate) fn path_div(
     path_id: HeapId,
     other: &Value,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &HeapReader<'_, impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<Option<Value>> {
     // Extract the right-hand side as a string
@@ -419,7 +419,7 @@ impl Path {
     pub(crate) fn getattr_by_static(
         &self,
         ss: StaticStrings,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &HeapReader<'_, impl ResourceTracker>,
     ) -> RunResult<Option<Value>> {
         let v = match ss {
             StaticStrings::Name => allocate_string(self.name(), heap)?,
