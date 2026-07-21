@@ -52,7 +52,7 @@ dev-py-release: ## Install the python package for development with a release bui
 	uv run maturin develop --uv -m crates/monty-python/Cargo.toml --release
 
 .PHONY: build-wasm
-build-wasm: install-js ## Build the lean wasm worker module (requires the wasm32-wasip1 target)
+build-wasm: install-js ## Build the WASI 0.2 worker component (requires the wasm32-wasip1 target)
 	cd crates/monty-js && npm run build:wasm && npm run build:ts
 
 .PHONY: test-browser

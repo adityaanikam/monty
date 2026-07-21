@@ -17,12 +17,11 @@ export interface DispatchRequest {
   frame: Uint8Array
 }
 
-/** A reply from the worker: a turn's framed `ChildEvent`s. */
+/** A reply from the worker containing Rust-decoded event envelopes. */
 export interface DispatchReply {
   id: number
-  reply: Uint8Array
   status: number
-  events?: DecodedChildEvent[]
+  events: DecodedChildEvent[]
 }
 
 /**
@@ -43,7 +42,7 @@ export interface WorkerChannelOptions {
 }
 
 interface Pending {
-  resolve(value: { reply: Uint8Array; status: number; events?: DecodedChildEvent[] }): void
+  resolve(value: { status: number; events: DecodedChildEvent[] }): void
   reject(err: Error): void
   timer: ReturnType<typeof setTimeout> | null
 }
@@ -88,7 +87,7 @@ export class WorkerChannel implements PooledWorker {
     if (!pending) return
     this.pending.delete(reply.id)
     if (pending.timer) clearTimeout(pending.timer)
-    pending.resolve({ reply: reply.reply, status: reply.status })
+    pending.resolve({ status: reply.status, events: reply.events })
   }
 
   private onTimeout(): void {

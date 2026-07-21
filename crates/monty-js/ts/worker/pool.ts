@@ -18,7 +18,7 @@
 // interrupted, exactly as the plan notes.
 
 import { MontySession } from '../session.js'
-import { WasmHost, type Dispatcher, inProcessDispatcher } from './host.js'
+import { type ComponentModules, WasmHost, type Dispatcher, inProcessDispatcher } from './host.js'
 import { WorkerTransport, type WorkerSessionConfig } from './transport.js'
 
 /** `MontySession`'s constructor argument (the structural `NativeSession`). */
@@ -26,7 +26,7 @@ type SessionNative = ConstructorParameters<typeof MontySession>[0]
 
 /** A spawned worker: a dispatch channel plus a hard-kill primitive. */
 export interface PooledWorker {
-  /** Sends one framed request and resolves to the framed reply. */
+  /** Sends one framed request and resolves to decoded event envelopes. */
   readonly dispatch: Dispatcher
   /** Force-terminates the worker (`Worker.terminate()`; a no-op in-process). */
   terminate(): void
@@ -43,9 +43,9 @@ export type WorkerFactory = () => Promise<PooledWorker>
  * (an in-process instance cannot be force-killed); session isolation still
  * holds via `Reset`, but a runaway turn cannot be preempted.
  */
-export function inProcessFactory(module: WebAssembly.Module): WorkerFactory {
+export function inProcessFactory(modules: ComponentModules): WorkerFactory {
   return async () => {
-    const host = await WasmHost.create(module)
+    const host = await WasmHost.create(modules)
     const dispatch = inProcessDispatcher(host)
     let alive = true
     return {

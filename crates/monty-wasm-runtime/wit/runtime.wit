@@ -1,0 +1,36 @@
+package pydantic:monty;
+
+/// Drives one persistent Monty protocol child through typed component calls.
+interface worker {
+    /// Whether the component can accept another request after this turn.
+    enum status {
+        /// The child remains ready for another turn.
+        continue,
+        /// The child reached a fatal error or clean shutdown.
+        shutdown,
+    }
+
+    /// A child-event envelope decoded by Rust, with its typed protobuf payload.
+    record event {
+        /// The `ChildEvent` oneof discriminant.
+        kind: u8,
+        /// The nested event message, retained until value conversion moves to Rust.
+        payload: list<u8>,
+    }
+
+    /// All output produced by one request.
+    record dispatch-result {
+        /// Whether the child remains usable.
+        status: status,
+        /// Buffered prints followed by exactly one turn-ending event.
+        events: list<event>,
+    }
+
+    /// Handles one length-prefixed protobuf request using the retained child.
+    dispatch: func(request: list<u8>) -> dispatch-result;
+}
+
+/// A component instance containing one stateful Monty worker.
+world monty-runtime {
+    export worker;
+}

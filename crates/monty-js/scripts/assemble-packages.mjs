@@ -82,15 +82,19 @@ for (const triple of triples) {
   packAndValidate(platformDirectory, `monty-${triple}.tgz`, ['package.json', `monty.${triple}.node`, binary])
 }
 
-const wasm = join(root, 'dist', 'worker', 'monty_wasm_runtime.wasm')
-if (!existsSync(wasm)) throw new Error(`missing wasm runtime: ${wasm}`)
+const component = join(root, 'dist', 'worker', 'component', 'monty.component.js')
+if (!existsSync(component)) throw new Error(`missing wasm component bindings: ${component}`)
 packAndValidate(root, 'monty-main.tgz', [
   'dist/index.js',
   'dist/node.js',
   'dist/worker/index.js',
   'dist/worker/index.node.js',
   'dist/worker/index.browser.js',
-  'dist/worker/monty_wasm_runtime.wasm',
+  'dist/worker/component/monty.component.js',
+  'dist/worker/component/monty.component.core.wasm',
+  'dist/worker/component/monty.component.core2.wasm',
+  'dist/worker/component/monty.component.core3.wasm',
+  'dist/worker/component/monty.component.core4.wasm',
   'native-addon.js',
   'native-addon.d.ts',
 ])

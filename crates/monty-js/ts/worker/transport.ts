@@ -16,7 +16,7 @@
 import type { NativeException, NativeFrame, NativeFutureResult, NativeTurn, NotMountedTurn } from '../native.js'
 import { type AssertMessageAnnotations, encodeAssertMessageAnnotations } from '../options.js'
 import type { Dispatcher } from './host.js'
-import { Reader, Wire, Writer, deframe, frame } from './proto.js'
+import { Reader, Wire, Writer, frame } from './proto.js'
 import { decodeMontyObject, decodeTimeZone, encodeMontyObject } from './value.js'
 
 type OnPrint = (stream: 'stdout' | 'stderr', text: string) => void
@@ -286,19 +286,17 @@ export class WorkerTransport {
   private async run(field: number, payload: Uint8Array, onPrint: OnPrint | undefined): Promise<ChildEventFrame | null> {
     const request = new Writer()
     request.lengthDelimited(field, payload) // ParentRequest oneof
-    let reply: Uint8Array
-    let decodedEvents: ChildEventFrame[] | undefined
+    let decodedEvents: ChildEventFrame[]
     try {
       const dispatched = await this.dispatcher(frame(request.finish()))
-      reply = dispatched.reply
-      decodedEvents = dispatched.events?.map((event) => ({ kind: event.kind, bytes: Uint8Array.from(event.bytes) }))
+      decodedEvents = dispatched.events.map((event) => ({ kind: event.kind, bytes: Uint8Array.from(event.bytes) }))
     } catch {
       // the dispatcher rejects when the worker died or the channel broke; the
       // caller treats a missing terminating event as a crash
       return null
     }
     let terminating: ChildEventFrame | null = null
-    for (const event of decodedEvents ?? decodeChildEvents(reply)) {
+    for (const event of decodedEvents) {
       if (event.kind === Ev.Print) {
         if (onPrint) {
           const [stream, text] = decodePrint(event.bytes)
@@ -361,22 +359,6 @@ export class WorkerTransport {
 interface ChildEventFrame {
   readonly kind: number
   readonly bytes: Uint8Array
-}
-
-function decodeChildEvents(reply: Uint8Array): ChildEventFrame[] {
-  return [...deframe(reply)].map(readChildEvent)
-}
-
-/** Extracts the single oneof kind (1..=11) from a `ChildEvent`, ignoring timing. */
-function readChildEvent(frameBytes: Uint8Array): ChildEventFrame {
-  const reader = new Reader(frameBytes)
-  let event: ChildEventFrame | null = null
-  while (!reader.done) {
-    const f = reader.next()
-    if (f.field >= 1 && f.field <= 11) event = { kind: f.field, bytes: f.bytes }
-  }
-  if (!event) throw new Error('ChildEvent carried no kind')
-  return event
 }
 
 function decodeComplete(bytes: Uint8Array): unknown {

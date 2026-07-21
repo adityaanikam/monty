@@ -286,7 +286,7 @@ make build-js             Build the JS package (compile TypeScript)
 make lint-js              Lint JS code with oxlint
 make test-js              Test the JS package (builds the monty binary the workers run)
 make dev-py-release       Install the python package for development with a release build
-make build-wasm           Build the lean wasm worker module (requires the wasm32-wasip1 target)
+make build-wasm           Build the WASI 0.2 worker component (requires the wasm32-wasip1 target)
 make test-wasm            Test the wasm worker pool/transport (requires a prior build-wasm)
 make dev-py-pgo           Install the python package for development with profile-guided optimization
 make format-rs            Format Rust code with fmt
@@ -790,19 +790,20 @@ Worker** instead of a subprocess, exposed under the `/wasm` subpath. The same
 pool → checkout → session → `feedRun` model and drive loop are used; only the
 transport differs. The pieces:
 
-- `crates/monty-wasm-runtime` — a lean `wasm32-wasip1` module: a WASI reactor wrapping
-  the transport-agnostic `monty-worker` `Child` state machine, exporting one
-  `monty_dispatch_turn` (read a framed request from stdin, run one turn, write
-  framed events to stdout). No napi, no threads, no `SharedArrayBuffer`.
+- `crates/monty-wasm-runtime` — a WIT-defined WASI 0.2 component wrapping the
+  transport-agnostic `monty-proto` `Child` state machine. Rust builds a
+  `wasm32-wasip1` core module, then Jco applies the Preview 1 reactor adapter
+  and generates JavaScript canonical-ABI bindings. No napi, threads, stdio RPC,
+  or `SharedArrayBuffer`.
 - `crates/monty-js/ts/worker/` — the TS pool/transport that drives it
   (`createWorkerPool`): a browser `Worker` backend (`browserFactory.ts`, whose
   `Worker.terminate()` is the watchdog's hard kill), a Node `worker_threads`
   backend (`nodeFactory.ts`), and an in-process degrade for environments with
-  no `Worker` (same API, but no crash isolation or preemption). Values cross as
-  `monty-proto` frames decoded in TypeScript (`proto.ts`/`value.ts`), not via
-  napi.
+  no `Worker` (same API, but no crash isolation or preemption). Framed requests
+  enter through the component's typed `dispatch` export; Rust decodes the event
+  envelopes and TypeScript converts their protobuf payloads to JS values.
 
-Build the worker module locally with `make build-wasm` (needs the
+Build the worker component locally with `make build-wasm` (needs the
 `wasm32-wasip1` target); it is built and tested in CI.
 
 ## Limitations documentation (`./limitations/`)
