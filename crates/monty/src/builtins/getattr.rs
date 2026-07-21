@@ -7,7 +7,6 @@ use crate::{
     defer_drop,
     exception_private::{RunError, RunResult, SimpleException},
     heap::DropWithContext,
-    resource::ResourceTracker,
     value::Value,
 };
 
@@ -27,7 +26,7 @@ use crate::{
 /// getattr(obj, 'y', None)       # Get obj.y or None if not found
 /// getattr(module, 'function')   # Get module.function
 /// ```
-pub fn builtin_getattr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_getattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let positional = args.into_pos_only("getattr", vm.heap)?;
     defer_drop!(positional, vm);
 

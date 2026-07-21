@@ -99,7 +99,8 @@ class ResourceLimits(TypedDict, total=False):
     Configuration for resource limits during code execution.
 
     All limits are optional. Omit a key — or set it to `None` explicitly —
-    to disable that limit.
+    to retain Monty's finite default for that limit. Defaults are 100 MB,
+    10 million allocations, 60 seconds, and 1,000 frames.
     """
 
     max_allocations: int | None

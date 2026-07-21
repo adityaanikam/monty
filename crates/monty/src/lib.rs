@@ -55,9 +55,7 @@ pub use crate::{
         MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
         ReplResolveFutures, ReplStartError, detect_repl_continuation_mode,
     },
-    resource::{
-        DEFAULT_MAX_RECURSION_DEPTH, LimitedTracker, NoLimitTracker, ResourceError, ResourceLimits, ResourceTracker,
-    },
+    resource::{DEFAULT_MAX_RECURSION_DEPTH, ResourceError, ResourceLimits, ResourceTracker},
     run::{AssertMessageAnnotations, CompileOptions, MontyRun},
     run_progress::{
         ExtFunctionResult, FunctionCall, NameLookup, NameLookupResult, OsCall, ResolveFutures, RunProgress,

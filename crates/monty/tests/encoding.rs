@@ -14,7 +14,7 @@ fn run_err(code: &str) -> String {
 fn run_exc(code: &str) -> MontyException {
     MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
-        .run_no_limits(vec![])
+        .run_default(vec![])
         .unwrap_err()
 }
 
@@ -22,7 +22,7 @@ fn run_exc(code: &str) -> MontyException {
 fn run_str(code: &str) -> String {
     let result = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
-        .run_no_limits(vec![])
+        .run_default(vec![])
         .unwrap();
     result.as_ref().try_into().unwrap()
 }

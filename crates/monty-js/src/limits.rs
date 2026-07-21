@@ -11,7 +11,7 @@ use napi_derive::napi;
 
 /// Resource limits configuration from JavaScript.
 ///
-/// All limits are optional. Omit a key to disable that limit.
+/// All limits are optional. Omitted keys retain Monty's finite defaults.
 /// Numeric limits are received as JS `number`s, so the boundary uses `f64`
 /// and validates them before converting into Rust `usize` values.
 #[napi(object, js_name = "ResourceLimits")]
@@ -42,7 +42,7 @@ pub fn extract_limits(js_limits: JsResourceLimits) -> Result<ResourceLimits> {
         .max_recursion_depth
         .map(|v| js_number_to_usize(v, "maxRecursionDepth"))
         .transpose()?
-        .or(Some(DEFAULT_MAX_RECURSION_DEPTH));
+        .unwrap_or(DEFAULT_MAX_RECURSION_DEPTH);
 
     let mut limits = ResourceLimits::new().max_recursion_depth(max_recursion_depth);
 

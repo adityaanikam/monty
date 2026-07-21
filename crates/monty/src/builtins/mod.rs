@@ -43,7 +43,6 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     exception_private::{ExcType, RunResult},
-    resource::ResourceTracker,
     types::Type,
 };
 
@@ -69,7 +68,7 @@ impl Builtins {
     /// time to perform the open-time effect, so it returns a
     /// [`CallResult::OsCall`] for [`crate::os::OsFunction::Open`] (see
     /// [`crate::builtins::open`]).
-    pub fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
+    pub fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
         match self {
             Self::Function(b) => b.call(vm, args),
             Self::ExcType(exc) => exc.call(vm, args).map(CallResult::Value),
@@ -223,7 +222,7 @@ impl BuiltinsFunctions {
     /// [`CallResult::Value`]. `open()` is the exception: it performs the
     /// open-time file effect via a host filesystem round-trip, so it returns a
     /// [`CallResult::OsCall`] directly.
-    pub(crate) fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
+    pub(crate) fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
         let r = match self {
             Self::Abs => abs::builtin_abs(vm, args),
             Self::All => all::builtin_all(vm, args),

@@ -258,8 +258,8 @@ properties that real CPython does not provide, per the caveat above.
   method raises. Both restore *into* a freshly checked-out worker, so they are
   rejected (`RuntimeError`) after any `feed_run` / `feed_start` / `load_session`
   / `load_snapshot` — restoring would otherwise discard work. The dump restores
-  its own `script_name` / limits / type-check state (the `checkout()` config
-  for those is not applied); the dataclass registry from `checkout()` is reused.
+  its own `script_name` and type-check state, while limits from `checkout()`
+  override serialized policy; the dataclass registry from `checkout()` is reused.
   A *failed* load (wrong dump kind, or a protocol desync) poisons the session
   — its worker is discarded, so every later feed fails too; the load is not
   retryable and the caller must check out a fresh session.

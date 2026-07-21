@@ -29,7 +29,6 @@ use crate::{
     heap::{ContainsHeap, DropWithContext, Heap, HeapData},
     intern::{Interns, StaticStrings},
     object::MontyTimeZone,
-    resource::ResourceTracker,
     types::{file::FileMode, str::StringRepr},
     value::Value,
 };
@@ -457,7 +456,7 @@ pub(crate) fn build_path_os_call(
     method: StaticStrings,
     path: MontyPath,
     args: ArgValues,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_>,
 ) -> RunResult<Option<OsFunctionCall>> {
     // Simple "no extra args" path operations are bundled into one arm to avoid
     // 12 near-identical case lines.
@@ -512,7 +511,7 @@ fn extract_str_data(
     method: &'static str,
     path: MontyPath,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut Heap,
     interns: &Interns,
 ) -> RunResult<PathStringDataArgs> {
     let data = arg_or_missing_data(method, args, heap)?;
@@ -533,7 +532,7 @@ fn extract_bytes_data(
     method: &'static str,
     path: MontyPath,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut Heap,
     interns: &Interns,
 ) -> RunResult<PathBytesDataArgs> {
     let data = arg_or_missing_data(method, args, heap)?;
@@ -574,11 +573,7 @@ struct PathMkdirArgs {
 
 /// Extracts `mode`/`parents`/`exist_ok` for `mkdir`, rejecting unknown or
 /// excessive arguments before the host sees the OS call.
-fn extract_mkdir_args(
-    path: MontyPath,
-    args: ArgValues,
-    vm: &mut VM<'_, impl ResourceTracker>,
-) -> RunResult<MkdirCallArgs> {
+fn extract_mkdir_args(path: MontyPath, args: ArgValues, vm: &mut VM<'_>) -> RunResult<MkdirCallArgs> {
     let PathMkdirArgs {
         mode,
         parents,
@@ -596,7 +591,7 @@ fn extract_mkdir_args(
 fn extract_rename_args(
     src: MontyPath,
     args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
+    heap: &mut Heap,
     interns: &Interns,
 ) -> RunResult<RenameCallArgs> {
     let target = args.get_one_arg("rename", heap)?;
@@ -615,11 +610,7 @@ fn extract_rename_args(
 
 /// Pulls the single `data` arg out of `args`, raising the CPython-style
 /// `missing 1 required positional argument: 'data'` error when absent.
-fn arg_or_missing_data(
-    method: &'static str,
-    args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
-) -> RunResult<Value> {
+fn arg_or_missing_data(method: &'static str, args: ArgValues, heap: &mut Heap) -> RunResult<Value> {
     if matches!(args, ArgValues::Empty) {
         return Err(ExcType::type_error(format!(
             "Path.{method}() missing 1 required positional argument: 'data'"
@@ -630,7 +621,7 @@ fn arg_or_missing_data(
 
 /// Owned `String` if `value` is a `str` or `Path`, else `None`. Caller drops
 /// the source value afterwards.
-fn value_to_owned_string(value: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<String> {
+fn value_to_owned_string(value: &Value, heap: &Heap, interns: &Interns) -> Option<String> {
     match value {
         Value::InternString(id) => Some(interns.get_str(*id).to_owned()),
         Value::Ref(id) => match heap.get(*id) {
@@ -643,7 +634,7 @@ fn value_to_owned_string(value: &Value, heap: &Heap<impl ResourceTracker>, inter
 }
 
 /// Owned `Vec<u8>` if `value` is a `bytes` (interned or heap), else `None`.
-fn value_to_owned_bytes(value: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<Vec<u8>> {
+fn value_to_owned_bytes(value: &Value, heap: &Heap, interns: &Interns) -> Option<Vec<u8>> {
     match value {
         Value::InternBytes(id) => Some(interns.get_bytes(*id).to_owned()),
         Value::Ref(id) => match heap.get(*id) {

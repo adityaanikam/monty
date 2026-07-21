@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use monty::{CompileOptions, ExcType, LimitedTracker, MontyRun, PrintWriter, ResourceLimits};
+use monty::{CompileOptions, ExcType, MontyRun, PrintWriter, ResourceLimits};
 
 #[test]
 fn non_ascii_earlier_line_does_not_shift_column() {
@@ -11,7 +11,7 @@ fn non_ascii_earlier_line_does_not_shift_column() {
     // `undefined_name`; the correct column is 1 (start of line 2).
     let code = "x = 'é'\nundefined_name".to_string();
     let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).expect("should parse");
-    let err = run.run_no_limits(vec![]).expect_err("should raise NameError");
+    let err = run.run_default(vec![]).expect_err("should raise NameError");
     assert_eq!(err.exc_type(), ExcType::NameError);
     let frame = err.traceback().last().expect("traceback has at least one frame");
 
@@ -26,7 +26,7 @@ fn non_ascii_char_column_location() {
     // the nameerror should report on column 7, even though the 'é' is two UTF-8 bytes
     let code = "'é' + undefined_name".to_string();
     let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).expect("should parse");
-    let err = run.run_no_limits(vec![]).expect_err("should raise NameError");
+    let err = run.run_default(vec![]).expect_err("should raise NameError");
     assert_eq!(err.exc_type(), ExcType::NameError);
     let frame = err.traceback().last().expect("traceback has at least one frame");
 
@@ -49,9 +49,9 @@ def recurse(n):
 recurse(50)
 ";
     let run = MontyRun::new(code.to_string(), "test.py", vec![], CompileOptions::default()).expect("should parse");
-    let limits = ResourceLimits::new().max_recursion_depth(Some(10));
+    let limits = ResourceLimits::new().max_recursion_depth(10);
     let err = run
-        .run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout)
+        .run(vec![], limits, PrintWriter::Stdout)
         .expect_err("should exceed recursion depth");
 
     assert_eq!(err.exc_type(), ExcType::RecursionError);

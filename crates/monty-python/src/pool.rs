@@ -297,10 +297,10 @@ impl PyMontySession {
     /// [`load_snapshot`](Self::load_snapshot) for a dump taken mid-execution.
     ///
     /// Valid only on a fresh session, before any feed or load; raises
-    /// `RuntimeError` otherwise. The dump restores its own `script_name` /
-    /// limits / type-check state (the `checkout()` config for those is not
-    /// applied); the dataclass registry from `checkout()` is reused. Raises if
-    /// the dump is actually a suspended snapshot.
+    /// `RuntimeError` otherwise. The dump restores its own `script_name` and
+    /// type-check state; limits from `checkout()` override serialized policy.
+    /// The dataclass registry from `checkout()` is reused. Raises if the dump
+    /// is actually a suspended snapshot.
     fn load_session(&self, py: Python<'_>, state: Vec<u8>) -> PyResult<()> {
         // an idle session has no snapshot, so the restored script name is unused
         if self.restore_turn(py, state, Vec::new())?.0.is_some() {
@@ -320,8 +320,9 @@ impl PyMontySession {
     /// `RuntimeError` otherwise. `mount` re-establishes the suspended feed's
     /// mounts, which are never part of the dump — pass the same mounts the
     /// original feed used, or its filesystem calls degrade into unhandled OS
-    /// calls. The dump restores its own config; the dataclass registry from
-    /// `checkout()` is reused. Raises if the dump is actually an idle session.
+    /// calls. The dump restores its own script and type-check config; limits
+    /// from `checkout()` override serialized policy. The dataclass registry is
+    /// reused. Raises if the dump is actually an idle session.
     ///
     /// `external_lookup` / `os` are captured on the restored snapshot so it
     /// supports `resume_auto()`, just like `feed_start`. One caveat applies to a

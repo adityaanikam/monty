@@ -202,7 +202,7 @@ fn repr_and_cycle_round_trip() {
         CompileOptions::default(),
     )
     .unwrap();
-    let cyclic = run.run_no_limits(vec![]).unwrap();
+    let cyclic = run.run_default(vec![]).unwrap();
     assert_value_round_trip(&cyclic);
     assert!(matches!(&cyclic, MontyObject::List(items) if matches!(items[0], MontyObject::Cycle(_, _))));
 }
@@ -436,11 +436,11 @@ fn bogus_json_payloads_are_dropped_not_trusted() {
 #[test]
 fn resource_limits_round_trip() {
     let limits = ResourceLimits {
-        max_allocations: Some(10_000),
-        max_duration: Some(Duration::from_millis(1500)),
-        max_memory: Some(64 * 1024 * 1024),
-        gc_interval: Some(100),
-        max_recursion_depth: Some(50),
+        max_allocations: 10_000,
+        max_duration: Duration::from_millis(1500),
+        max_memory: 64 * 1024 * 1024,
+        gc_interval: 100,
+        max_recursion_depth: 50,
     };
     let back = ResourceLimits::from(pb::ResourceLimits::from(&limits));
     assert_eq!(back.max_allocations, limits.max_allocations);
@@ -452,15 +452,46 @@ fn resource_limits_round_trip() {
 
 #[test]
 fn empty_resource_limits_default_recursion_depth() {
-    // an all-absent wire message must behave like ResourceLimits::new():
-    // unlimited everything except the standard recursion-depth default
+    // An all-absent wire message uses Monty's finite defaults.
     let back = ResourceLimits::from(pb::ResourceLimits::default());
-    let expected = ResourceLimits::new();
-    assert_eq!(back.max_allocations, expected.max_allocations);
-    assert_eq!(back.max_duration, expected.max_duration);
-    assert_eq!(back.max_memory, expected.max_memory);
-    assert_eq!(back.gc_interval, expected.gc_interval);
-    assert_eq!(back.max_recursion_depth, expected.max_recursion_depth);
+    assert_eq!(back, ResourceLimits::default());
+}
+
+#[test]
+fn partial_resource_limits_only_override_supplied_fields() {
+    let defaults = ResourceLimits::default();
+    let back = ResourceLimits::from(pb::ResourceLimits {
+        max_memory_bytes: Some(123),
+        ..Default::default()
+    });
+
+    assert_eq!(
+        back,
+        ResourceLimits {
+            max_memory: 123,
+            ..defaults
+        }
+    );
+}
+
+#[test]
+fn resource_limit_wire_numeric_policy() {
+    let narrowed = ResourceLimits::from(pb::ResourceLimits {
+        max_allocations: Some(u64::MAX),
+        ..Default::default()
+    });
+    assert_eq!(
+        narrowed.max_allocations,
+        usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+    );
+
+    let limits = ResourceLimits::default().max_duration(Duration::from_nanos(1_999));
+    let wire = pb::ResourceLimits::from(&limits);
+    assert_eq!(wire.max_duration_micros, Some(1));
+    assert_eq!(ResourceLimits::from(wire).max_duration, Duration::from_micros(1));
+
+    let wire = pb::ResourceLimits::from(&ResourceLimits::default().max_duration(Duration::MAX));
+    assert_eq!(wire.max_duration_micros, Some(u64::MAX));
 }
 
 #[test]

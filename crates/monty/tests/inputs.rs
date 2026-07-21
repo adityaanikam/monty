@@ -17,7 +17,7 @@ fn input_int() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Int(42)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(42)]).unwrap();
     assert_eq!(result, MontyObject::Int(42));
 }
 
@@ -30,7 +30,7 @@ fn input_int_arithmetic() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Int(41)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(41)]).unwrap();
     assert_eq!(result, MontyObject::Int(42));
 }
 
@@ -43,7 +43,7 @@ fn input_bool_true() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Bool(true)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Bool(true)]).unwrap();
     assert_eq!(result, MontyObject::Bool(true));
 }
 
@@ -56,7 +56,7 @@ fn input_bool_false() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Bool(false)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Bool(false)]).unwrap();
     assert_eq!(result, MontyObject::Bool(false));
 }
 
@@ -69,7 +69,7 @@ fn input_float() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Float(2.5)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Float(2.5)]).unwrap();
     assert_eq!(result, MontyObject::Float(2.5));
 }
 
@@ -82,7 +82,7 @@ fn input_none() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::None]).unwrap();
+    let result = ex.run_default(vec![MontyObject::None]).unwrap();
     assert_eq!(result, MontyObject::None);
 }
 
@@ -95,7 +95,7 @@ fn input_ellipsis() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Ellipsis]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Ellipsis]).unwrap();
     assert_eq!(result, MontyObject::Ellipsis);
 }
 
@@ -110,9 +110,7 @@ fn input_string() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex
-        .run_no_limits(vec![MontyObject::String("hello".to_string())])
-        .unwrap();
+    let result = ex.run_default(vec![MontyObject::String("hello".to_string())]).unwrap();
     assert_eq!(result, MontyObject::String("hello".to_string()));
 }
 
@@ -125,9 +123,7 @@ fn input_string_concat() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex
-        .run_no_limits(vec![MontyObject::String("hello".to_string())])
-        .unwrap();
+    let result = ex.run_default(vec![MontyObject::String("hello".to_string())]).unwrap();
     assert_eq!(result, MontyObject::String("hello world".to_string()));
 }
 
@@ -140,7 +136,7 @@ fn input_bytes() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Bytes(vec![1, 2, 3])]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Bytes(vec![1, 2, 3])]).unwrap();
     assert_eq!(result, MontyObject::Bytes(vec![1, 2, 3]));
 }
 
@@ -154,7 +150,7 @@ fn input_list() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::List(vec![MontyObject::Int(1), MontyObject::Int(2)])])
+        .run_default(vec![MontyObject::List(vec![MontyObject::Int(1), MontyObject::Int(2)])])
         .unwrap();
     assert_eq!(
         result,
@@ -172,7 +168,7 @@ fn input_list_append() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::List(vec![MontyObject::Int(1), MontyObject::Int(2)])])
+        .run_default(vec![MontyObject::List(vec![MontyObject::Int(1), MontyObject::Int(2)])])
         .unwrap();
     assert_eq!(
         result,
@@ -190,7 +186,7 @@ fn input_tuple() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::Tuple(vec![
+        .run_default(vec![MontyObject::Tuple(vec![
             MontyObject::Int(1),
             MontyObject::String("two".to_string()),
         ])])
@@ -213,7 +209,7 @@ fn input_dict() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::dict(map)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::dict(map)]).unwrap();
 
     // Build expected map for comparison
     let mut expected = IndexMap::new();
@@ -233,7 +229,7 @@ fn input_dict_get() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::dict(map)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::dict(map)]).unwrap();
     assert_eq!(result, MontyObject::Int(42));
 }
 
@@ -249,7 +245,7 @@ fn multiple_inputs_two() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::Int(10), MontyObject::Int(32)])
+        .run_default(vec![MontyObject::Int(10), MontyObject::Int(32)])
         .unwrap();
     assert_eq!(result, MontyObject::Int(42));
 }
@@ -264,7 +260,7 @@ fn multiple_inputs_three() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::Int(10), MontyObject::Int(20), MontyObject::Int(12)])
+        .run_default(vec![MontyObject::Int(10), MontyObject::Int(20), MontyObject::Int(12)])
         .unwrap();
     assert_eq!(result, MontyObject::Int(42));
 }
@@ -280,7 +276,7 @@ fn multiple_inputs_mixed_types() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::Int(1), MontyObject::String("two".to_string())])
+        .run_default(vec![MontyObject::Int(1), MontyObject::String("two".to_string())])
         .unwrap();
     assert_eq!(
         result,
@@ -293,7 +289,7 @@ fn multiple_inputs_mixed_types() {
 #[test]
 fn no_inputs() {
     let ex = MontyRun::new("42".to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let result = ex.run_no_limits(vec![]).unwrap();
+    let result = ex.run_default(vec![]).unwrap();
     assert_eq!(result, MontyObject::Int(42));
 }
 
@@ -307,7 +303,7 @@ fn nested_list() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::List(vec![MontyObject::List(vec![
+        .run_default(vec![MontyObject::List(vec![MontyObject::List(vec![
             MontyObject::Int(1),
             MontyObject::Int(2),
         ])])])
@@ -324,7 +320,7 @@ fn empty_list_input() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::List(vec![])]).unwrap();
+    let result = ex.run_default(vec![MontyObject::List(vec![])]).unwrap();
     assert_eq!(result, MontyObject::Int(0));
 }
 
@@ -337,7 +333,7 @@ fn empty_string_input() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::String(String::new())]).unwrap();
+    let result = ex.run_default(vec![MontyObject::String(String::new())]).unwrap();
     assert_eq!(result, MontyObject::Int(0));
 }
 
@@ -353,7 +349,7 @@ fn input_exception() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::Exception {
+        .run_default(vec![MontyObject::Exception {
             exc_type: ExcType::ValueError,
             arg: Some("test message".to_string()),
         }])
@@ -377,7 +373,7 @@ fn input_exception_no_arg() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::Exception {
+        .run_default(vec![MontyObject::Exception {
             exc_type: ExcType::TypeError,
             arg: None,
         }])
@@ -401,7 +397,7 @@ fn input_exception_in_list() {
     )
     .unwrap();
     let result = ex
-        .run_no_limits(vec![MontyObject::List(vec![MontyObject::Exception {
+        .run_default(vec![MontyObject::List(vec![MontyObject::Exception {
             exc_type: ExcType::KeyError,
             arg: Some("key".to_string()),
         }])])
@@ -425,7 +421,7 @@ fn input_exception_raise() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Exception {
+    let result = ex.run_default(vec![MontyObject::Exception {
         exc_type: ExcType::ValueError,
         arg: Some("input error".to_string()),
     }]);
@@ -445,7 +441,7 @@ fn invalid_input_repr() {
         CompileOptions::default(),
     )
     .unwrap();
-    let result = ex.run_no_limits(vec![MontyObject::Repr("some repr".to_string())]);
+    let result = ex.run_default(vec![MontyObject::Repr("some repr".to_string())]);
     assert!(result.is_err(), "Repr should not be a valid input");
 }
 
@@ -459,7 +455,7 @@ fn invalid_input_repr_nested_in_list() {
     )
     .unwrap();
     // Repr nested inside a list should still be invalid
-    let result = ex.run_no_limits(vec![MontyObject::List(vec![MontyObject::Repr(
+    let result = ex.run_default(vec![MontyObject::List(vec![MontyObject::Repr(
         "nested repr".to_string(),
     )])]);
     assert!(result.is_err(), "Repr nested in list should be invalid");
@@ -485,7 +481,7 @@ foo(x * 2)
     )
     .unwrap();
     // x=5 (input), foo(x * 2) = foo(10), inside foo x=10 (param), returns 11
-    let result = ex.run_no_limits(vec![MontyObject::Int(5)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(5)]).unwrap();
     assert_eq!(result, MontyObject::Int(11));
 }
 
@@ -506,9 +502,7 @@ add(x * 10, y * 100)
     )
     .unwrap();
     // x=2, y=3 (inputs), add(20, 300), inside add x=20, y=300, returns 320
-    let result = ex
-        .run_no_limits(vec![MontyObject::Int(2), MontyObject::Int(3)])
-        .unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(2), MontyObject::Int(3)]).unwrap();
     assert_eq!(result, MontyObject::Int(320));
 }
 
@@ -529,9 +523,7 @@ foo(100)
     )
     .unwrap();
     // x=5, y=3 (inputs), foo(100), inside foo x=100 (param), y=3 (global), returns 103
-    let result = ex
-        .run_no_limits(vec![MontyObject::Int(5), MontyObject::Int(3)])
-        .unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(5), MontyObject::Int(3)]).unwrap();
     assert_eq!(result, MontyObject::Int(103));
 }
 
@@ -552,7 +544,7 @@ double(10) + x
     )
     .unwrap();
     // x=5 (input), double(10) = 20, then 20 + x (global) = 20 + 5 = 25
-    let result = ex.run_no_limits(vec![MontyObject::Int(5)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(5)]).unwrap();
     assert_eq!(result, MontyObject::Int(25));
 }
 
@@ -573,7 +565,7 @@ foo(x * 2)
     )
     .unwrap();
     // x=5 (input), foo(10), inside foo x=10 (param), returns 11
-    let result = ex.run_no_limits(vec![MontyObject::Int(5)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(5)]).unwrap();
     assert_eq!(result, MontyObject::Int(11));
 }
 
@@ -594,7 +586,7 @@ double(x)
     )
     .unwrap();
     // x=7 (input), double(7), inside double x=7 (param from arg), returns 14
-    let result = ex.run_no_limits(vec![MontyObject::Int(7)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(7)]).unwrap();
     assert_eq!(result, MontyObject::Int(14));
 }
 
@@ -614,7 +606,7 @@ double(2)
     )
     .unwrap();
     // x=7 (input), double(7), inside double x=7 (param from arg), returns 14
-    let result = ex.run_no_limits(vec![MontyObject::Int(7)]).unwrap();
+    let result = ex.run_default(vec![MontyObject::Int(7)]).unwrap();
     assert_eq!(result, MontyObject::Int(4));
 }
 

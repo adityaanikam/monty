@@ -432,8 +432,10 @@ fn dump_then_load_into_fresh_child_resumes() {
     assert!(!dump.state.is_empty());
     drop(child); // SIGKILL via Drop
 
-    // a fresh child restores the dump and re-announces the suspension
+    // A configured fresh child restores under host-selected limits and
+    // re-announces the suspension.
     let mut fresh = ChildProc::spawn();
+    fresh.create_repl();
     fresh.send(pb::parent_request::Kind::Load(pb::Load { state: dump.state }));
     let (_, event) = fresh.recv_turn();
     let pb::child_event::Kind::FunctionCall(restored) = event else {
@@ -450,6 +452,56 @@ fn dump_then_load_into_fresh_child_resumes() {
     // session globals survived the round trip through the dump
     assert_eq!(fresh.feed_complete("base + 2"), MontyObject::Int(42));
     fresh.shutdown();
+}
+
+#[test]
+fn load_applies_host_limits_to_restored_live_memory() {
+    let mut child = ChildProc::spawn();
+    child.create_repl();
+    assert_eq!(child.feed_complete("value = 'x' * 10_000"), MontyObject::None);
+    child.send(pb::parent_request::Kind::Dump(pb::Dump {}));
+    let pb::child_event::Kind::DumpResult(dump) = child.recv() else {
+        panic!("expected DumpResult");
+    };
+    drop(child);
+
+    let mut fresh = ChildProc::spawn();
+    fresh.create_repl_with(pb::Configure {
+        script_name: "main.py".to_owned(),
+        limits: Some(pb::ResourceLimits {
+            max_memory_bytes: Some(1_000),
+            ..Default::default()
+        }),
+        type_check: false,
+        type_check_stubs: None,
+        monty_version: env!("CARGO_PKG_VERSION").to_owned(),
+        assert_message_annotations: None,
+    });
+    fresh.send(pb::parent_request::Kind::Load(pb::Load { state: dump.state }));
+    let error = expect_error(fresh.recv());
+    assert_eq!(error.exc_type, "RuntimeError");
+    assert_eq!(
+        error.message.as_deref(),
+        Some("protocol violation: failed to load session: Serde Deserialization Error")
+    );
+    fresh.shutdown();
+}
+
+#[test]
+fn load_rejects_an_old_dump_version_before_decoding() {
+    let mut child = ChildProc::spawn();
+    child.create_repl();
+    child.send(pb::parent_request::Kind::Load(pb::Load {
+        state: 5_u16.to_le_bytes().to_vec(),
+    }));
+
+    let error = expect_error(child.recv());
+    assert_eq!(error.exc_type, "RuntimeError");
+    assert_eq!(
+        error.message.as_deref(),
+        Some("protocol violation: unsupported dump version 5 (expected 6)")
+    );
+    child.shutdown();
 }
 
 #[test]
@@ -472,6 +524,7 @@ fn type_check_state_survives_dump_and_load() {
     drop(child);
 
     let mut fresh = ChildProc::spawn();
+    fresh.create_repl();
     fresh.send(pb::parent_request::Kind::Load(pb::Load { state: dump.state }));
     let pb::child_event::Kind::Ok(_) = fresh.recv() else {
         panic!("expected Ok for Load");
@@ -505,6 +558,7 @@ fn assert_annotation_option_survives_dump_and_load() {
     drop(child);
 
     let mut fresh = ChildProc::spawn();
+    fresh.create_repl();
     fresh.send(pb::parent_request::Kind::Load(pb::Load { state: dump.state }));
     let pb::child_event::Kind::Ok(_) = fresh.recv() else {
         panic!("expected Ok for Load");
@@ -536,6 +590,7 @@ fn assert_annotation_custom_limit_survives_dump_and_load() {
     drop(child);
 
     let mut fresh = ChildProc::spawn();
+    fresh.create_repl();
     fresh.send(pb::parent_request::Kind::Load(pb::Load { state: dump.state }));
     let pb::child_event::Kind::Ok(_) = fresh.recv() else {
         panic!("expected Ok for Load");
@@ -646,7 +701,7 @@ fn garbage_stdin_is_a_fatal_error() {
 fn killed_child_is_detected_as_eof() {
     let mut child = ChildProc::spawn();
     child.create_repl();
-    // run forever (no limits), then kill the child mid-execution
+    // Kill the child well before the default duration limit can fire.
     child.send(pb::parent_request::Kind::Feed(pb::Feed {
         code: "while True:\n    pass".to_owned(),
         inputs: vec![],

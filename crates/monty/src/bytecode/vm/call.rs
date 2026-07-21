@@ -19,7 +19,6 @@ use crate::{
     heap_data::CellValue,
     intern::{FunctionId, StaticStrings, StringId},
     os::OsFunctionCall,
-    resource::ResourceTracker,
     types::{Dict, Instance, PyTrait, Type, bytes::call_bytes_method, instance::class_name, str::call_str_method},
     value::{EitherStr, Value},
 };
@@ -98,7 +97,7 @@ impl<C: ContainsHeap> DropWithContext<C> for CallResult {
     }
 }
 
-impl<T: ResourceTracker> VM<'_, T> {
+impl VM<'_> {
     // ========================================================================
     // Call Opcode Executors
     // ========================================================================
@@ -1079,10 +1078,10 @@ impl<T: ResourceTracker> VM<'_, T> {
 /// Adding a new dunder is just a new arm in the inner `match`; type
 /// implementations only need to override the corresponding `PyTrait`
 /// method, never a `StaticStrings::Foo` arm in their `py_call_attr`.
-fn dispatch_dunder<T: ResourceTracker>(
+fn dispatch_dunder(
     name_id: StringId,
     heap_id: HeapId,
-    vm: &mut VM<'_, T>,
+    vm: &mut VM<'_>,
     args: &mut Option<ArgValues>,
 ) -> Option<Result<CallResult, RunError>> {
     let static_str = StaticStrings::from_string_id(name_id)?;
@@ -1130,11 +1129,7 @@ fn dispatch_dunder<T: ResourceTracker>(
 /// `typ` and `tb` are discarded: every implementation we have re-derives the
 /// type from `val` and Monty has no traceback objects (see
 /// `limitations/with.md`).
-fn dispatch_exit<T: ResourceTracker>(
-    heap_id: HeapId,
-    vm: &mut VM<'_, T>,
-    args: ArgValues,
-) -> Result<CallResult, RunError> {
+fn dispatch_exit(heap_id: HeapId, vm: &mut VM<'_>, args: ArgValues) -> Result<CallResult, RunError> {
     let positional = args.into_pos_only("__exit__", vm.heap)?;
     defer_drop!(positional, vm);
     let [typ, val, tb] = positional.as_slice() else {

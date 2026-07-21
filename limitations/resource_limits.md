@@ -1,9 +1,11 @@
 # Resource limits
 
-Monty enforces hard limits on memory, time, allocations, and recursion to
-keep untrusted code bounded. When a limit is exceeded, execution
-terminates with a `ResourceError` (visible to the *host*, not catchable
-inside the sandbox).
+Unlike CPython, Monty enforces hard limits on memory, time, allocations,
+and recursion to keep untrusted code bounded. Every execution has finite
+defaults: 100 MB of tracked memory, 10 million allocations, 60 seconds of
+cumulative execution, a 100,000-allocation GC interval, and 1,000 frames.
+When a limit is exceeded, execution terminates with a `ResourceError`
+(visible to the *host*, not catchable inside the sandbox).
 
 ## Memory / size limits
 
@@ -39,8 +41,8 @@ inside the sandbox).
 
 ## Recursion
 
-- Python-level call depth is hardcoded at **1000 frames**. The 1001st
-  nested call raises `RecursionError`.
+- Python-level call depth defaults to **1000 frames**. The host may configure
+  a different finite ceiling; the next nested call raises `RecursionError`.
 - Production sandbox code cannot change the recursion limit. Test builds may
   expose `sys.setrecursionlimit()` as a lowering-only fixture hook; it cannot
   raise the host-configured ceiling.
@@ -66,9 +68,9 @@ inside the sandbox).
   paused while execution is suspended waiting on the host (external
   function calls, OS callbacks) and between REPL feeds. It accumulates
   across feeds for the life of the session.
-- The accumulated time is serialized into dumps/snapshots, so a restored
-  session resumes its budget where it left off rather than restarting
-  from zero.
+- Loading a dump starts a fresh execution-time and allocation-count epoch.
+  Live memory and allocation counts are recomputed under host-supplied limits;
+  serialized limits and counters cannot weaken host policy.
 - There is no in-sandbox way to observe the budget or remaining time.
 
 ## JSON

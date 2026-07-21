@@ -16,8 +16,8 @@ use crate::{PoolError, pool::PoolInner, watchdog::DeadlineGuard, worker::Worker}
 pub struct ReplConfig {
     /// Script name used in tracebacks and type-check diagnostics.
     pub script_name: String,
-    /// Sandbox resource limits enforced inside the worker. `None` means
-    /// unlimited (except monty's standard recursion-depth default).
+    /// Sandbox resource-limit overrides enforced inside the worker.
+    /// `None` uses Monty's finite defaults.
     pub limits: Option<ResourceLimits>,
     /// Type-check every fed snippet before executing it.
     pub type_check: bool,
@@ -209,7 +209,7 @@ impl Checkout {
             worker: Some(worker),
             pool,
             pending: None,
-            duration_budget: repl.limits.as_ref().and_then(|limits| limits.max_duration),
+            duration_budget: repl.limits.as_ref().map(|limits| limits.max_duration),
             reported_execution: Duration::ZERO,
             armed_deadline: None,
             restored_script_name: None,

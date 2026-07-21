@@ -23,7 +23,6 @@ use crate::{
     expressions::Identifier,
     heap::{DropGuard, DropWithContext, HeapData},
     intern::{Interns, StringId},
-    resource::ResourceTracker,
     types::{Dict, allocate_tuple},
     value::Value,
 };
@@ -215,7 +214,7 @@ impl Signature {
         &self,
         args: ArgValues,
         defaults: &[Value],
-        vm: &mut VM<'_, impl ResourceTracker>,
+        vm: &mut VM<'_>,
         func_name: Identifier,
         namespace: &mut Vec<Value>,
     ) -> RunResult<()> {

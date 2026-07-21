@@ -12,7 +12,7 @@ use std::{
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use monty::{CompileOptions, LimitedTracker, MontyRun, PrintWriter, ResourceLimits};
+use monty::{CompileOptions, MontyRun, PrintWriter, ResourceLimits};
 
 /// A token representing a piece of Python syntax.
 #[derive(Debug, Clone, Arbitrary)]
@@ -530,13 +530,11 @@ impl Tokens {
 }
 
 /// Resource limits for fuzzing.
-fn fuzz_limits() -> LimitedTracker {
-    LimitedTracker::new(
-        ResourceLimits::new()
-            .max_allocations(10_000)
-            .max_memory(1024 * 1024) // 1 MB
-            .max_duration(Duration::from_millis(100)),
-    )
+fn fuzz_limits() -> ResourceLimits {
+    ResourceLimits::new()
+        .max_allocations(10_000)
+        .max_memory(1024 * 1024) // 1 MB
+        .max_duration(Duration::from_millis(100))
 }
 
 fuzz_target!(|tokens: Tokens| {

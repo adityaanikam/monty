@@ -106,7 +106,7 @@ mod local_variable_limits {
         assert!(result.is_ok(), "255 locals should compile successfully");
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "255 locals should run successfully");
     }
 
@@ -121,7 +121,7 @@ mod local_variable_limits {
         );
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "256 locals should run successfully");
     }
 
@@ -133,7 +133,7 @@ mod local_variable_limits {
         assert!(result.is_ok(), "257 locals should compile (using wide instructions)");
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "257 locals should run correctly with wide instructions");
     }
 
@@ -145,7 +145,7 @@ mod local_variable_limits {
         assert!(result.is_ok(), "300 locals should compile successfully");
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "300 locals should run successfully");
     }
 }
@@ -161,7 +161,7 @@ mod function_argument_limits {
         assert!(result.is_ok(), "255 positional args should compile successfully");
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "255 positional args should run successfully");
     }
 
@@ -193,7 +193,7 @@ mod keyword_argument_limits {
         assert!(result.is_ok(), "255 keyword args should compile successfully");
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "255 keyword args should run successfully");
     }
 
@@ -278,7 +278,7 @@ mod function_parameter_limits {
         assert!(result.is_ok(), "255 parameters should compile successfully");
 
         let run = result.unwrap();
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "255 parameters should run successfully");
     }
 
@@ -340,7 +340,7 @@ mod stack_effect_limits {
         let code = generate_many_class_members(16384);
         let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default())
             .expect("16384 class members should compile");
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "16384 class members should run: {result:?}");
     }
 
@@ -350,7 +350,7 @@ mod stack_effect_limits {
         let code = generate_large_dict_literal(20000);
         let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default())
             .expect("20000-entry dict literal should compile");
-        let result = run.run_no_limits(vec![]);
+        let result = run.run_default(vec![]);
         assert!(result.is_ok(), "20000-entry dict literal should run: {result:?}");
     }
 }

@@ -6,7 +6,6 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{RunResult, SimpleException},
-    resource::ResourceTracker,
     value::Value,
 };
 
@@ -20,7 +19,7 @@ use crate::{
 /// setattr(obj, 'x', 42)      # Set obj.x = 42
 /// setattr(obj, 'name', 'foo') # Set obj.name = 'foo'
 /// ```
-pub fn builtin_setattr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_setattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let positional = args.into_pos_only("setattr", vm.heap)?;
     defer_drop!(positional, vm);
 

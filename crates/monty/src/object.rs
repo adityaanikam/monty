@@ -21,7 +21,7 @@ use crate::{
     fstring::FormatFloat,
     heap::{Heap, HeapData, HeapId, HeapReadOutput},
     intern::Interns,
-    resource::{ResourceError, ResourceTracker},
+    resource::ResourceError,
     types::{
         Dataclass, LongInt, NamedTuple, OpenFile, Path, PyTrait, TimeZone, Type, allocate_tuple,
         bytes::{Bytes, bytes_repr},
@@ -538,7 +538,7 @@ impl MontyType {
 
     /// The total mirror of a runtime [`Type`]: `Instance` resolves its class
     /// name via the heap.
-    pub(crate) fn from_internal(ty: Type, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Self {
+    pub(crate) fn from_internal(ty: Type, heap: &Heap, interns: &Interns) -> Self {
         match ty {
             Type::Instance(class_id) => Self::Instance(class_name(class_id, heap, interns).into_owned()),
             other => Self::from_internal_static(other),
@@ -565,7 +565,7 @@ impl MontyObject {
     /// then properly drops the Value via `drop_with` to maintain reference counting.
     ///
     /// The `interns` parameter is used to look up interned string/bytes content.
-    pub(crate) fn new(value: Value, vm: &mut VM<'_, impl ResourceTracker>) -> Self {
+    pub(crate) fn new(value: Value, vm: &mut VM<'_>) -> Self {
         let py_obj = Self::from_value(&value, vm);
         value.drop_with(vm);
         py_obj
@@ -596,7 +596,7 @@ impl MontyObject {
     /// # Errors
     /// Returns `InvalidInputError` if called on the `Repr` variant,
     /// as it is only valid as an output from code execution, not as an input.
-    pub(crate) fn to_value(self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<Value, InvalidInputError> {
+    pub(crate) fn to_value(self, vm: &mut VM<'_>) -> Result<Value, InvalidInputError> {
         match self {
             Self::Ellipsis => Ok(Value::Ellipsis),
             Self::None => Ok(Value::None),
@@ -809,7 +809,7 @@ impl MontyObject {
 
     /// Top-level entry into [`from_value_inner`], allocating the visited-set used
     /// for cycle detection.
-    fn from_value(object: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> Self {
+    fn from_value(object: &Value, vm: &mut VM<'_>) -> Self {
         let mut visited = AHashSet::new();
         Self::from_value_inner(object, vm, &mut visited)
     }
@@ -824,7 +824,7 @@ impl MontyObject {
     /// `clone_with_heap` the next child before recursing — the `inc_ref` makes
     /// it safe for a future user-defined `__repr__` to mutate the surrounding
     /// container during the recursive call without freeing the value mid-format.
-    fn from_value_inner(object: &Value, vm: &mut VM<'_, impl ResourceTracker>, visited: &mut AHashSet<HeapId>) -> Self {
+    fn from_value_inner(object: &Value, vm: &mut VM<'_>, visited: &mut AHashSet<HeapId>) -> Self {
         // Check depth limit before processing
         let Ok(mut guard) = vm.recursion_guard() else {
             return Self::Repr("<deeply nested>".to_owned());
@@ -1107,7 +1107,7 @@ impl MontyObject {
 
 /// Converts a value to its repr string for `MontyObject`, falling back to a
 /// descriptive error message if `py_repr` fails (e.g. INT_MAX_STR_DIGITS).
-fn repr_or_error(value: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> MontyObject {
+fn repr_or_error(value: &Value, vm: &mut VM<'_>) -> MontyObject {
     match value.py_repr(vm) {
         Ok(s) => {
             // `py_repr` yields a heap `str` `Value`; extract its text and drop it.

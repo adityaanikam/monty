@@ -10,7 +10,7 @@ use monty::{CompileOptions, JsonErrorData, MontyException, MontyRun};
 fn run_exc(code: &str) -> MontyException {
     MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
-        .run_no_limits(vec![])
+        .run_default(vec![])
         .unwrap_err()
 }
 

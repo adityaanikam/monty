@@ -578,7 +578,11 @@ fn oversize_frames_are_rejected_without_killing_the_worker() {
     const OVERSIZE: usize = 257 * 1024 * 1024;
 
     let pool = Pool::new(config()).unwrap();
-    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    let repl_config = ReplConfig {
+        limits: Some(ResourceLimits::default().max_memory(512 * 1024 * 1024)),
+        ..Default::default()
+    };
+    let mut session = pool.checkout(&repl_config).unwrap();
 
     // (1) parent -> child: an input larger than the frame limit cannot be
     // sent. The worker never receives the request, so the session survives.
@@ -1007,21 +1011,25 @@ fn suspension_time_does_not_consume_the_duration_budget() {
 }
 
 #[test]
-fn loaded_session_keeps_its_duration_budget() {
-    // The `max_duration` budget and consumed execution time travel inside the
-    // dump — a session restored via `restore` keeps the original limits even
-    // though the parent never saw the original `ReplConfig`.
+fn loaded_session_uses_checkout_duration_budget() {
+    // Restore always applies the new checkout's limits instead of trusting
+    // policy serialized by the previous worker.
     let pool = Pool::new(config()).unwrap();
     let mut session = pool
         .checkout(&ReplConfig {
-            limits: Some(ResourceLimits::new().max_duration(Duration::from_millis(100))),
+            limits: Some(ResourceLimits::new().max_duration(Duration::from_secs(5))),
             ..ReplConfig::default()
         })
         .unwrap();
     let state = session.dump().unwrap();
     drop(session);
 
-    let mut restored = pool.checkout(&ReplConfig::default()).unwrap();
+    let mut restored = pool
+        .checkout(&ReplConfig {
+            limits: Some(ResourceLimits::new().max_duration(Duration::from_millis(100))),
+            ..ReplConfig::default()
+        })
+        .unwrap();
     let (event, _script_name) = restored.restore(state, vec![], &mut no_print).unwrap();
     assert!(event.is_none(), "idle dump should restore without a suspension");
     let err = restored

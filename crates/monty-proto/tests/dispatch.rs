@@ -5,7 +5,7 @@
 //! `Child` state machine over the message-based transport without any wasm
 //! toolchain.
 
-use monty::{CompileOptions, LimitedTracker, MontyObject, MontyRepl, PrintWriter, ReplProgress, ResourceLimits};
+use monty::{CompileOptions, MontyObject, MontyRepl, PrintWriter, ReplProgress, ResourceLimits};
 use monty_proto::{
     FrameReader, MONTY_VERSION, WireObject, pb,
     worker::{Child, HandleOutcome, dispatch_frame},
@@ -169,11 +169,7 @@ fn load_rejects_dump_with_over_deep_suspension_args() {
     // suspend in-process (no wire depth bound) at `f(x)` with x nested 100
     // lists deep — over the ~48 wire bound, shallow enough that postcard's
     // recursive deserialize doesn't overflow the test stack
-    let repl = MontyRepl::new(
-        "main.py",
-        LimitedTracker::new(ResourceLimits::new()),
-        CompileOptions::default(),
-    );
+    let repl = MontyRepl::new("main.py", ResourceLimits::new(), CompileOptions::default());
     let code = "x = []\nfor _ in range(100):\n    x = [x]\nf(x)";
     let progress = repl
         .feed_start(code, vec![], PrintWriter::Stdout)
@@ -186,7 +182,7 @@ fn load_rejects_dump_with_over_deep_suspension_args() {
 
     // Assemble the dump envelope the way `Dump` does: [version u16 LE]
     // [tag u8 = 1 (suspended)][script_name str][type_check u8 = 0][payload].
-    let mut state = 5u16.to_le_bytes().to_vec();
+    let mut state = 6u16.to_le_bytes().to_vec();
     state.push(1);
     let script_name = b"main.py";
     state.extend_from_slice(&u32::try_from(script_name.len()).unwrap().to_le_bytes());

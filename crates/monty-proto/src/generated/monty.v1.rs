@@ -277,9 +277,8 @@ pub struct StackFrame {
     #[prost(bool, tag = "7")]
     pub hide_frame_name: bool,
 }
-/// Sandbox resource limits, enforced inside the child. Absent fields mean
-/// "unlimited" except recursion depth, which defaults to monty's standard
-/// limit (1000) when absent.
+/// Sandbox resource limits, enforced inside the child. Absent fields retain
+/// Monty's finite defaults.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceLimits {
     #[prost(uint64, optional, tag = "1")]
@@ -487,21 +486,19 @@ pub struct ChildEvent {
     /// Cumulative execution time consumed by the session's sandbox code, in
     /// microseconds. The in-sandbox clock runs only while the interpreter is
     /// executing bytecode — never while suspended waiting on the parent or idle
-    /// between feeds — and survives Dump/Load. Set on every turn-ending event
-    /// while a session exists (zero on Print events and outside a session) so
+    /// between feeds. Loading starts a fresh accounting epoch. Set on every
+    /// turn-ending event while a session exists (zero on Print events and outside a session) so
     /// the parent can mirror the `max_duration` budget, e.g. to arm a watchdog
     /// backstop, without keeping a second clock.
     #[prost(uint64, tag = "12")]
     pub total_execution_micros: u64,
-    /// The session's `max_duration` limit in microseconds, when one is
-    /// configured. Reported alongside `total_execution_micros` so a parent that
-    /// restored a session via `Load` (where the limits travel inside the opaque
-    /// state bytes) still learns the budget.
+    /// The session's `max_duration` limit in microseconds. Reported alongside
+    /// `total_execution_micros` so the parent can backstop the host-selected
+    /// budget, including after `Load`.
     #[prost(uint64, optional, tag = "13")]
     pub max_duration_micros: ::core::option::Option<u64>,
     /// The session's script name, surfaced on a `Load` reply so a parent that
-    /// restored a session (whose script name, like the limits above, travels
-    /// inside the opaque dump bytes) learns it without parsing the dump. Set only
+    /// restored a session learns it without parsing the opaque dump. Set only
     /// on a successful `Load` reply; unset on all other events.
     #[prost(string, optional, tag = "14")]
     pub restored_script_name: ::core::option::Option<::prost::alloc::string::String>,

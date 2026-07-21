@@ -12,10 +12,10 @@ use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 /// - `max_duration_secs`: Maximum execution time in seconds (float)
 /// - `max_memory`: Maximum heap memory in bytes (int)
 /// - `gc_interval`: Run garbage collection every N allocations (int)
-/// - `max_recursion_depth`: Maximum function call stack depth (int, default: 1000)
+/// - `max_recursion_depth`: Maximum function call stack depth (int)
 ///
-/// If a key is missing or set to `None`, that limit is not applied
-/// (except `max_recursion_depth` which defaults to 1000).
+/// If a key is missing or set to `None`, Monty's finite default for that limit
+/// is retained.
 ///
 /// Raises `TypeError` if a value is present but has the wrong type.
 /// Raises `ValueError` if `max_duration_secs` is not a valid duration value.
@@ -25,7 +25,7 @@ pub fn extract_limits(dict: &Bound<'_, PyDict>) -> PyResult<monty::ResourceLimit
     let max_memory = extract_optional_usize(dict, "max_memory")?;
     let gc_interval = extract_optional_usize(dict, "gc_interval")?;
     let max_recursion_depth =
-        extract_optional_usize(dict, "max_recursion_depth")?.or(Some(DEFAULT_MAX_RECURSION_DEPTH));
+        extract_optional_usize(dict, "max_recursion_depth")?.unwrap_or(DEFAULT_MAX_RECURSION_DEPTH);
 
     let mut limits = monty::ResourceLimits::new().max_recursion_depth(max_recursion_depth);
 

@@ -13,7 +13,7 @@ use monty::{CompileOptions, MontyObject, MontyRun};
 /// Runs a snippet and returns its result as a `String`.
 fn run_str(code: &str) -> String {
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let obj: MontyObject = ex.run_no_limits(vec![]).unwrap();
+    let obj: MontyObject = ex.run_default(vec![]).unwrap();
     (&obj).try_into().unwrap()
 }
 
@@ -22,7 +22,7 @@ fn run_str(code: &str) -> String {
 /// so reaching the assert proves "no host panic".
 fn run_err(code: &str) -> String {
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    ex.run_no_limits(vec![]).unwrap_err().to_string()
+    ex.run_default(vec![]).unwrap_err().to_string()
 }
 
 /// An unrecognised directive is emitted verbatim (`%` kept), matching

@@ -76,9 +76,9 @@ use crate::{
 /// for _ in 0..pad { builder.push(fill)?; }
 /// builder.finish(vm.heap)
 /// ```
-pub struct StringBuilder<'t, T: ResourceTracker> {
+pub struct StringBuilder<'t> {
     inner: String,
-    tracker: &'t T,
+    tracker: &'t ResourceTracker,
     /// Bytes currently reserved with `tracker` via `on_grow`. Always released
     /// before the builder ceases to exist — either in `finish` (so the
     /// follow-up `allocate_string` can re-add the final size without
@@ -92,12 +92,12 @@ pub struct StringBuilder<'t, T: ResourceTracker> {
     pending_error: Option<ResourceError>,
 }
 
-impl<'t, T: ResourceTracker> StringBuilder<'t, T> {
+impl<'t> StringBuilder<'t> {
     /// Creates an empty builder with no pre-approved capacity.
     ///
     /// Use when the final size is not bounded up front. The builder will
     /// request additional reservation from the tracker on each 2× growth.
-    pub fn new(tracker: &'t T) -> Self {
+    pub fn new(tracker: &'t ResourceTracker) -> Self {
         Self {
             inner: String::new(),
             tracker,
@@ -111,7 +111,7 @@ impl<'t, T: ResourceTracker> StringBuilder<'t, T> {
     /// Use when the final size is known or bounded (e.g. padding to a given
     /// width). One up-front `on_grow` call covers every subsequent push that
     /// stays within `capacity`.
-    pub fn with_capacity(capacity: usize, tracker: &'t T) -> Result<Self, ResourceError> {
+    pub fn with_capacity(capacity: usize, tracker: &'t ResourceTracker) -> Result<Self, ResourceError> {
         tracker.on_grow(capacity)?;
         Ok(Self {
             inner: String::with_capacity(capacity),
@@ -146,7 +146,7 @@ impl<'t, T: ResourceTracker> StringBuilder<'t, T> {
     /// (or interns the result for empty / single-ASCII strings). If a prior
     /// [`fmt::Write`] call captured a tracker error, that error is returned
     /// here rather than the (now-stale) inner string.
-    pub fn finish(mut self, heap: &Heap<T>) -> RunResult<Value> {
+    pub fn finish(mut self, heap: &Heap) -> RunResult<Value> {
         if let Some(e) = self.pending_error.take() {
             // The reservation is released by Drop when `self` goes out of
             // scope at function return — no need to release here.
@@ -200,7 +200,7 @@ impl<'t, T: ResourceTracker> StringBuilder<'t, T> {
 /// into the payload-free [`fmt::Error`] and stashed in `pending_error`;
 /// short-circuits subsequent writes so a partially-built string doesn't keep
 /// accruing reservations after the limit has been hit.
-impl<T: ResourceTracker> fmt::Write for StringBuilder<'_, T> {
+impl fmt::Write for StringBuilder<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if self.pending_error.is_some() {
             return Err(fmt::Error);
@@ -222,7 +222,7 @@ impl<T: ResourceTracker> fmt::Write for StringBuilder<'_, T> {
     }
 }
 
-impl<T: ResourceTracker> Drop for StringBuilder<'_, T> {
+impl Drop for StringBuilder<'_> {
     fn drop(&mut self) {
         // Release any outstanding reservation if the builder is dropped without
         // finishing (e.g. an early return via `?` during a push, or a stashed

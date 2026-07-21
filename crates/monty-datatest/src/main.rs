@@ -25,9 +25,9 @@ use std::{
 use ahash::AHashMap;
 use chrono::{Datelike, Timelike};
 use monty::{
-    CompileOptions, ExcType, ExtFunctionResult, FileMode, LimitedTracker, MontyDate, MontyDateTime, MontyException,
-    MontyFileHandle, MontyObject, MontyRun, MontyTimeZone, NameLookupResult, OsFunctionCall, PrintWriter,
-    ResourceLimits, RunProgress, dir_stat, file_stat,
+    CompileOptions, ExcType, ExtFunctionResult, FileMode, MontyDate, MontyDateTime, MontyException, MontyFileHandle,
+    MontyObject, MontyRun, MontyTimeZone, NameLookupResult, OsFunctionCall, PrintWriter, ResourceLimits, RunProgress,
+    dir_stat, file_stat,
 };
 use monty_fs::{MountCallOutcome, MountMode, MountTable, OverlayState};
 use pyo3::{prelude::*, types::PyDict};
@@ -64,7 +64,7 @@ const TEST_RECURSION_LIMIT: usize = 50;
 /// 100_000 otherwise — tests that need a larger value to stay within the
 /// timeout opt into it via `# gc-interval=<N>`.
 fn default_test_limits() -> ResourceLimits {
-    ResourceLimits::new().max_recursion_depth(Some(TEST_RECURSION_LIMIT))
+    ResourceLimits::new().max_recursion_depth(TEST_RECURSION_LIMIT)
 }
 
 /// Builds a `MontyRun` with production-default [`CompileOptions`] so fixtures
@@ -233,7 +233,7 @@ fn parse_fixture(content: &str) -> (String, Expectation, TestConfig) {
     // recursion ceiling is tightened from Python instead, via
     // `sys.setrecursionlimit(N)`.
     if let Some(interval) = parse_usize_directive(&comment_lines, "gc-interval=") {
-        config.limits.gc_interval = Some(interval);
+        config.limits.gc_interval = interval;
     }
 
     // Check for TRACEBACK expectation (triple-quoted string at end of file)
@@ -1383,7 +1383,7 @@ fn try_run_test(path: &Path, code: &str, expectation: &Expectation, limits: Reso
 
     match new_monty_run(code, &test_name) {
         Ok(ex) => {
-            let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+            let result = ex.run(vec![], limits, PrintWriter::Stdout);
             match result {
                 Ok(obj) => match expectation {
                     Expectation::ReturnStr(expected) => {
@@ -1749,7 +1749,7 @@ fn run_mount_fs_iter_loop(
     mount_table: &mut MountTable,
     limits: ResourceLimits,
 ) -> Result<MontyObject, MontyException> {
-    let mut progress = exec.start(vec![], LimitedTracker::new(limits), PrintWriter::Stdout)?;
+    let mut progress = exec.start(vec![], limits, PrintWriter::Stdout)?;
 
     loop {
         match progress {
@@ -1791,7 +1791,7 @@ fn run_mount_fs_iter_loop(
 /// - Sync functions: result is passed immediately via `state.run()`
 /// - Async functions: `state.run_pending()` creates a future, resolved via `ResolveFutures`
 fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, MontyException> {
-    let mut progress = exec.start(vec![], LimitedTracker::new(limits), PrintWriter::Stdout)?;
+    let mut progress = exec.start(vec![], limits, PrintWriter::Stdout)?;
 
     // Track pending async calls: (call_id, pre-built ExtFunctionResult).
     // Successful async calls produce `Return(value)`; `async_fail` produces
@@ -1805,7 +1805,7 @@ fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, 
         #[cfg(not(feature = "memory-model-checks"))]
         {
             let bytes = progress.dump().expect("failed to dump RunProgress");
-            progress = RunProgress::load(&bytes).expect("failed to load RunProgress");
+            progress = RunProgress::load(&bytes, ResourceLimits::default()).expect("failed to load RunProgress");
         }
 
         match progress {

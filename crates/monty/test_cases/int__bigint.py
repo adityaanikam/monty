@@ -374,8 +374,7 @@ assert big >> 50 == 2**50
 assert 1 << 100 == big
 assert (big + 0xFF) & 0xFF == 0xFF
 
-# === Large result operations (should succeed with NoLimitTracker) ===
-# These are large but allowed since test runner uses NoLimitTracker
+# === Large result operations within the default finite limits ===
 x = 2**100000  # ~12.5KB - well under any reasonable limit
 assert x > 0
 

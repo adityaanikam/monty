@@ -175,7 +175,7 @@ Type methods are implemented as `impl<'h> HeapRead<'h, T>` blocks. The `PyTrait<
 ```rust
 // Methods on a heap type
 impl<'h> HeapRead<'h, List> {
-    pub fn append(&mut self, vm: &mut VM<'h, impl ResourceTracker>, item: Value) -> RunResult<()> {
+    pub fn append(&mut self, vm: &mut VM<'h>, item: Value) -> RunResult<()> {
         self.get_mut(vm.heap).items.push(item);
         Ok(())
     }
@@ -183,8 +183,8 @@ impl<'h> HeapRead<'h, List> {
 
 // PyTrait implementation
 impl<'h> PyTrait<'h> for HeapRead<'h, List> {
-    fn py_type(&self, vm: &VM<'h, impl ResourceTracker>) -> Type { Type::List }
-    fn py_len(&self, vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
+    fn py_type(&self, vm: &VM<'h>) -> Type { Type::List }
+    fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         Some(self.get(vm.heap).items.len())
     }
     // ...

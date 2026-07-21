@@ -25,7 +25,7 @@ See the [project README](https://github.com/pydantic/monty) for the full feature
 `MontyRun` parses and compiles code once; `run` executes it with input values and returns the value of the final expression as a `MontyObject`:
 
 ```rust
-use monty::{CompileOptions, MontyRun, MontyObject, NoLimitTracker, PrintWriter};
+use monty::{CompileOptions, MontyRun, MontyObject, PrintWriter, ResourceLimits};
 
 let code = r#"
 def fib(n):
@@ -37,7 +37,7 @@ fib(x)
 "#;
 
 let runner = MontyRun::new(code.to_owned(), "fib.py", vec!["x".to_owned()], CompileOptions::default()).unwrap();
-let result = runner.run(vec![MontyObject::Int(10)], NoLimitTracker, PrintWriter::Stdout).unwrap();
+let result = runner.run(vec![MontyObject::Int(10)], ResourceLimits::default(), PrintWriter::Stdout).unwrap();
 assert_eq!(result, MontyObject::Int(55));
 ```
 
@@ -45,36 +45,38 @@ Errors are returned as `MontyException`, with a traceback matching what CPython 
 
 ## Resource limits
 
-Untrusted code shouldn't be able to hog the host. `LimitedTracker` enforces limits on memory, allocation count, execution time, GC interval and recursion depth; exceeding one terminates execution with a `ResourceError`:
+Untrusted code shouldn't be able to hog the host. Every execution has finite limits on memory, allocation count, cumulative execution time, GC interval, and recursion depth. The defaults are 100 MB, 10 million allocations, 60 seconds, a 100,000-allocation GC interval, and 1,000 frames. Exceeding a limit terminates execution with a `ResourceError`:
 
 ```rust
 use std::time::Duration;
-use monty::{CompileOptions, MontyRun, LimitedTracker, PrintWriter, ResourceLimits};
+use monty::{CompileOptions, MontyRun, PrintWriter, ResourceLimits};
 
 let limits = ResourceLimits {
-    max_memory: Some(10 * 1024 * 1024),
-    max_duration: Some(Duration::from_millis(20)),
-    ..ResourceLimits::new()
+    max_memory: 10 * 1024 * 1024,
+    max_duration: Duration::from_millis(20),
+    ..ResourceLimits::default()
 };
 
 let runner = MontyRun::new("while True: pass".to_owned(), "spin.py", vec![], CompileOptions::default()).unwrap();
-let err = runner.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout).unwrap_err();
+let err = runner.run(vec![], limits, PrintWriter::Stdout).unwrap_err();
 assert!(err.to_string().contains("time limit exceeded"));
 ```
+
+Allocation count and execution time accumulate across a REPL session. Time spent suspended on host callbacks or idle between feeds is excluded. Hosts needing effectively unrestricted execution can choose ceilings high enough for their workload, but there is no disabled-limit mode.
 
 ## External functions and snapshotting
 
 The defining feature of the crate: instead of running to completion, `MontyRun::start` returns a `RunProgress` that pauses execution whenever the sandboxed code calls a function provided by the host. The host runs the real function (an API call, a database query, an LLM tool) and resumes with the result:
 
 ```rust
-use monty::{CompileOptions, MontyRun, MontyObject, NoLimitTracker, PrintWriter, RunProgress};
+use monty::{CompileOptions, MontyRun, MontyObject, PrintWriter, ResourceLimits, RunProgress};
 
 let code = "data = get_data(3)\ndata * 2";
 let runner = MontyRun::new(code.to_owned(), "main.py", vec!["get_data".to_owned()], CompileOptions::default()).unwrap();
 
 // pass the external function in as an input
 let get_data = MontyObject::Function { name: "get_data".to_owned(), docstring: None };
-let progress = runner.start(vec![get_data], NoLimitTracker, PrintWriter::Stdout).unwrap();
+let progress = runner.start(vec![get_data], ResourceLimits::default(), PrintWriter::Stdout).unwrap();
 
 // execution pauses at the `get_data(3)` call
 let RunProgress::FunctionCall(call) = progress else { panic!("expected a function call") };
@@ -87,17 +89,17 @@ let RunProgress::Complete(result) = progress else { panic!("expected completion"
 assert_eq!(result, MontyObject::Int(42));
 ```
 
-A paused `RunProgress` is a self-contained snapshot of the interpreter: serialize it with `dump()`, store it in a file or database, and `load()` + resume it later — in a different process or on a different machine. `MontyRun` itself can also be dumped and loaded to cache parsed code:
+A paused `RunProgress` is a self-contained snapshot of the interpreter: serialize it with `dump()`, store it in a file or database, and `load()` with host-selected limits before resuming it. Loading starts a fresh accounting epoch and never trusts serialized resource policy. Raw snapshots are compatible only with the same Monty version. `MontyRun` itself can also be dumped and loaded to cache parsed code:
 
 ```rust
-use monty::{CompileOptions, MontyRun, MontyObject, NoLimitTracker, PrintWriter};
+use monty::{CompileOptions, MontyRun, MontyObject, PrintWriter, ResourceLimits};
 
 let runner = MontyRun::new("x + 1".to_owned(), "main.py", vec!["x".to_owned()], CompileOptions::default()).unwrap();
 let bytes = runner.dump().unwrap();
 
 // later, restore and run
 let runner2 = MontyRun::load(&bytes).unwrap();
-let result = runner2.run(vec![MontyObject::Int(41)], NoLimitTracker, PrintWriter::Stdout).unwrap();
+let result = runner2.run(vec![MontyObject::Int(41)], ResourceLimits::default(), PrintWriter::Stdout).unwrap();
 assert_eq!(result, MontyObject::Int(42));
 ```
 

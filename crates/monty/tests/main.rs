@@ -5,11 +5,11 @@ use monty::{CompileOptions, MontyObject, MontyRun};
 fn repeat_exec() {
     let ex = MontyRun::new("1 + 2".to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
 
-    let r = ex.run_no_limits(vec![]).unwrap();
+    let r = ex.run_default(vec![]).unwrap();
     let int_value: i64 = r.as_ref().try_into().unwrap();
     assert_eq!(int_value, 3);
 
-    let r = ex.run_no_limits(vec![]).unwrap();
+    let r = ex.run_default(vec![]).unwrap();
     let int_value: i64 = r.as_ref().try_into().unwrap();
     assert_eq!(int_value, 3);
 }
@@ -18,11 +18,11 @@ fn repeat_exec() {
 fn test_get_interned_string() {
     let ex = MontyRun::new("'foobar'".to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
 
-    let r = ex.run_no_limits(vec![]).unwrap();
+    let r = ex.run_default(vec![]).unwrap();
     let int_value: String = r.as_ref().try_into().unwrap();
     assert_eq!(int_value, "foobar");
 
-    let r = ex.run_no_limits(vec![]).unwrap();
+    let r = ex.run_default(vec![]).unwrap();
     let int_value: String = r.as_ref().try_into().unwrap();
     assert_eq!(int_value, "foobar");
 }
@@ -52,7 +52,7 @@ fn dataclass_method_call_in_standard_mode_errors() {
     )
     .unwrap();
 
-    let err = ex.run_no_limits(vec![point]).unwrap_err();
+    let err = ex.run_default(vec![point]).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("Method call 'sum' not implemented with standard execution"),
@@ -99,7 +99,7 @@ fn external_function_as_init_raises_not_implemented() {
     )
     .unwrap();
     let err = ex
-        .run_no_limits(vec![MontyObject::Function {
+        .run_default(vec![MontyObject::Function {
             name: "ext_fn".to_owned(),
             docstring: None,
         }])
@@ -118,7 +118,7 @@ fn external_function_as_init_raises_not_implemented() {
 fn dynamic_type_with_bases_raises_type_error() {
     let code = "type('A', (int,), {})";
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let err = ex.run_no_limits(vec![]).unwrap_err();
+    let err = ex.run_default(vec![]).unwrap_err();
     assert_eq!(
         err.to_string(),
         "Traceback (most recent call last):\n  File \"test.py\", line 1, in <module>\n    type('A', (int,), {})\n    ~~~~~~~~~~~~~~~~~~~~~\nTypeError: type() bases are not supported"
@@ -135,7 +135,7 @@ fn dynamic_type_with_bases_raises_type_error() {
 fn dynamic_type_with_non_string_key_raises_type_error() {
     let code = "type('A', (), {1: 'one'})";
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let err = ex.run_no_limits(vec![]).unwrap_err();
+    let err = ex.run_default(vec![]).unwrap_err();
     assert_eq!(
         err.to_string(),
         "Traceback (most recent call last):\n  File \"test.py\", line 1, in <module>\n    type('A', (), {1: 'one'})\n    ~~~~~~~~~~~~~~~~~~~~~~~~~\nTypeError: non-string key (int) in the namespace of class 'A'"

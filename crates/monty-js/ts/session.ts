@@ -245,8 +245,9 @@ export class MontySession {
    * taken mid-execution.
    *
    * Valid only on a fresh session, before any feed or load (it replaces the
-   * whole session); throws otherwise. The dump restores its own resource limits
-   * and type-check state. Throws if the dump is actually a suspended snapshot.
+   * whole session); throws otherwise. The checkout's resource limits override
+   * serialized policy; the dump restores type-check state. Throws if the dump
+   * is actually a suspended snapshot.
    */
   async loadSession(state: Uint8Array): Promise<void> {
     this.claimFresh()

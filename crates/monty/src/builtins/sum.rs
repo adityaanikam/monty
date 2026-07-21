@@ -8,7 +8,6 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
     heap::DropGuard,
-    resource::ResourceTracker,
     types::{PyTrait, Type},
     value::Value,
 };
@@ -31,7 +30,7 @@ struct SumArgs {
 /// Sums the items of an iterable from left to right with an optional start value.
 /// The default start value is 0. Str and bytes start values are explicitly
 /// rejected, pointing at `''.join(seq)` / `b''.join(seq)` instead.
-pub fn builtin_sum(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_sum(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let SumArgs { iterable, start } = SumArgs::from_args(args, vm)?;
     defer_drop_mut!(start, vm);
 

@@ -21,7 +21,7 @@ use crate::{
     object::MontyObject,
     parse::{CodeRange, parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
-    resource::{NoLimitTracker, ResourceTracker},
+    resource::{ResourceLimits, ResourceTracker},
     run_progress::{RunProgress, build_run_progress, check_snapshot_from_converted, convert_frame_exit},
     types::str::StringRepr,
     value::Value,
@@ -100,7 +100,7 @@ impl From<bool> for AssertMessageAnnotations {
 /// Primary interface for running Monty code.
 ///
 /// `MontyRun` supports two execution modes:
-/// - **Simple execution**: Use `run()` or `run_no_limits()` to run code to completion
+/// - **Simple execution**: Use `run()` or `run_default()` to run code to completion
 /// - **Iterative execution**: Use `start()` to start execution which will pause at external function calls and
 ///   can be resumed later
 ///
@@ -115,7 +115,7 @@ impl From<bool> for AssertMessageAnnotations {
 ///     CompileOptions::default(),
 /// )
 /// .unwrap();
-/// let result = runner.run_no_limits(vec![MontyObject::Int(41)]).unwrap();
+/// let result = runner.run_default(vec![MontyObject::Int(41)]).unwrap();
 /// assert_eq!(result, MontyObject::Int(42));
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -159,14 +159,15 @@ impl MontyRun {
         self.executor.run_ref_counts(inputs)
     }
 
-    /// Executes the code and returns reference count data while using a custom tracker, used for testing only.
+    /// Executes the code with custom limits and returns reference count data, used for testing only.
     #[cfg(feature = "ref-count-return")]
-    pub fn run_ref_counts_with_tracker(
+    pub fn run_ref_counts_with_limits(
         &self,
         inputs: Vec<MontyObject>,
-        resource_tracker: impl ResourceTracker,
+        limits: ResourceLimits,
     ) -> Result<RefCountOutput, MontyException> {
-        self.executor.run_ref_counts_with_tracker(inputs, resource_tracker)
+        self.executor
+            .run_ref_counts_with_tracker(inputs, ResourceTracker::new(limits))
     }
 
     /// Executes the code to completion assuming not external functions or snapshotting.
@@ -176,20 +177,20 @@ impl MontyRun {
     ///
     /// # Arguments
     /// * `inputs` - Values to fill the first N slots of the namespace
-    /// * `resource_tracker` - Custom resource tracker implementation
+    /// * `limits` - Finite resource limits for this execution
     /// * `print` - print output writer
     pub fn run(
         &self,
         inputs: Vec<MontyObject>,
-        resource_tracker: impl ResourceTracker,
+        limits: ResourceLimits,
         print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
-        self.executor.run(inputs, resource_tracker, print)
+        self.executor.run(inputs, ResourceTracker::new(limits), print)
     }
 
-    /// Executes the code to completion with no resource limits, printing to stdout/stderr.
-    pub fn run_no_limits(&self, inputs: Vec<MontyObject>) -> Result<MontyObject, MontyException> {
-        self.run(inputs, NoLimitTracker, PrintWriter::Stdout)
+    /// Executes the code with default resource limits, printing to stdout/stderr.
+    pub fn run_default(&self, inputs: Vec<MontyObject>) -> Result<MontyObject, MontyException> {
+        self.run(inputs, ResourceLimits::default(), PrintWriter::Stdout)
     }
 
     /// Serializes the runner to a binary format.
@@ -214,7 +215,7 @@ impl MontyRun {
         postcard::from_bytes(bytes)
     }
 
-    /// Starts execution with the given inputs and resource tracker, consuming self.
+    /// Starts execution with the given inputs and resource limits, consuming self.
     ///
     /// Creates the heap and namespaces, then begins execution.
     ///
@@ -227,7 +228,7 @@ impl MontyRun {
     ///
     /// # Arguments
     /// * `inputs` - Initial input values (must match length of `input_names` from `new()`)
-    /// * `resource_tracker` - Resource tracker for the execution
+    /// * `limits` - Finite resource limits for the execution
     /// * `print` - Writer for print output
     ///
     /// # Errors
@@ -239,16 +240,16 @@ impl MontyRun {
     /// # Panics
     /// This method should not panic under normal operation. Internal assertions
     /// may panic if the VM reaches an inconsistent state (indicating a bug).
-    pub fn start<T: ResourceTracker>(
+    pub fn start(
         self,
         inputs: Vec<MontyObject>,
-        resource_tracker: T,
+        limits: ResourceLimits,
         print: PrintWriter<'_>,
-    ) -> Result<RunProgress<T>, MontyException> {
+    ) -> Result<RunProgress, MontyException> {
         let executor = self.executor;
 
         // Create heap and VM with empty globals, then populate inputs with VM alive
-        let mut heap = Heap::new(executor.namespace_size(), resource_tracker);
+        let mut heap = Heap::new(executor.namespace_size(), ResourceTracker::new(limits));
         let globals = executor.empty_globals();
         let (converted, vm_state) =
             HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
@@ -434,12 +435,12 @@ impl Executor {
     ///
     /// # Arguments
     /// * `inputs` - Values to fill the first N slots of the namespace
-    /// * `resource_tracker` - Custom resource tracker implementation
+    /// * `resource_tracker` - Concrete tracker carrying the configured limits
     /// * `print` - Print output writer
     fn run(
         &self,
         inputs: Vec<MontyObject>,
-        resource_tracker: impl ResourceTracker,
+        resource_tracker: ResourceTracker,
         print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
         let heap_capacity = self.heap_capacity.load(Ordering::Relaxed);
@@ -476,7 +477,7 @@ impl Executor {
     ///
     /// This is the shared non-iterative execution core used by both the standard
     /// `run` path and the REPL's `feed_run` path.
-    pub(crate) fn run_to_completion<'h>(&'h self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<MontyObject> {
+    pub(crate) fn run_to_completion<'h>(&'h self, vm: &mut VM<'h>) -> RunResult<MontyObject> {
         let mut frame_exit_result = vm.run_module(&self.module_code);
 
         // Handle NameLookup and ExternalCall exits by raising NameError through the VM
@@ -515,13 +516,13 @@ impl Executor {
     /// Executes the code and returns both the result and reference count data, used for testing only.
     #[cfg(feature = "ref-count-return")]
     fn run_ref_counts(&self, inputs: Vec<MontyObject>) -> Result<RefCountOutput, MontyException> {
-        self.run_ref_counts_with_tracker(inputs, NoLimitTracker)
+        self.run_ref_counts_with_tracker(inputs, ResourceTracker::default())
     }
 
-    /// Executes the code and returns both the result and reference count data with a custom tracker,
+    /// Executes the code and returns both the result and reference count data with explicit limits,
     /// used for testing only.
     ///
-    /// This is used for testing reference counting behavior with a custom tracker. Returns:
+    /// Returns:
     /// - The execution result (`Exit`)
     /// - Reference count data as a tuple of:
     ///   - A map from variable names to their reference counts (only for heap-allocated values)
@@ -536,7 +537,7 @@ impl Executor {
     fn run_ref_counts_with_tracker(
         &self,
         inputs: Vec<MontyObject>,
-        resource_tracker: impl ResourceTracker,
+        resource_tracker: ResourceTracker,
     ) -> Result<RefCountOutput, MontyException> {
         use std::collections::HashSet;
 
@@ -614,11 +615,7 @@ impl Executor {
     /// This runs with the VM alive so that `to_value` has access to the full VM context.
     /// On error partway through, the VM's `Drop` impl will drain globals and
     /// properly decrement refcounts for any already-converted values.
-    pub(crate) fn populate_inputs(
-        &self,
-        inputs: Vec<MontyObject>,
-        vm: &mut VM<'_, impl ResourceTracker>,
-    ) -> Result<(), MontyException> {
+    pub(crate) fn populate_inputs(&self, inputs: Vec<MontyObject>, vm: &mut VM<'_>) -> Result<(), MontyException> {
         if inputs.len() > self.namespace_size() {
             return Err(MontyException::runtime_error("too many inputs for namespace"));
         }
@@ -636,10 +633,7 @@ impl Executor {
 ///
 /// Used by non-iterative execution paths where suspendable outcomes (external calls,
 /// name lookups) are not supported and should produce errors.
-pub(crate) fn frame_exit_to_object(
-    frame_exit_result: RunResult<FrameExit>,
-    vm: &mut VM<'_, impl ResourceTracker>,
-) -> RunResult<MontyObject> {
+pub(crate) fn frame_exit_to_object(frame_exit_result: RunResult<FrameExit>, vm: &mut VM<'_>) -> RunResult<MontyObject> {
     match frame_exit_result? {
         FrameExit::Return(return_value) => Ok(MontyObject::new(return_value, vm)),
         FrameExit::ExternalCall {
@@ -694,7 +688,7 @@ pub struct RefCountOutput {
     /// the total number of GC-tracked allocations performed. Compare against
     /// the configured `gc_interval` to verify GC fired at the expected
     /// cadence.
-    pub allocations_since_gc: u32,
+    pub allocations_since_gc: usize,
 }
 
 /// Check if input names are valid Python identifiers.

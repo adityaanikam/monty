@@ -66,7 +66,7 @@ export interface CheckoutOptions {
   assertMessageAnnotations?: AssertMessageAnnotations
 }
 
-/** Sandbox resource limits. Omitted fields mean "unlimited". */
+/** Sandbox limits. Omitted fields retain Monty's finite defaults. */
 export interface ResourceLimits {
   maxAllocations?: number
   maxDurationSecs?: number

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    ExcType, MontyException,
+    ExcType,
     exception_private::{ExceptionRaise, RawStackFrame, RunError, SimpleException},
 };
 
@@ -23,7 +23,7 @@ pub const LARGE_RESULT_THRESHOLD: usize = 100_000;
 /// Used for sequence repeats (`'x' * 999_999_999`), padding operations
 /// (`str.ljust`, `str.center`, `str.zfill`, etc.), and any other operation
 /// where the result size is a simple product of two known values.
-pub fn check_repeat_size(item_len: usize, count: usize, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+pub fn check_repeat_size(item_len: usize, count: usize, tracker: &ResourceTracker) -> Result<(), ResourceError> {
     check_estimated_size(item_len.saturating_mul(count), tracker)
 }
 
@@ -37,7 +37,7 @@ pub fn check_repeat_size(item_len: usize, count: usize, tracker: &impl ResourceT
 /// which allocates intermediate values on the Rust heap (not tracked by the resource tracker).
 /// At peak, old/new base and old/new accumulator coexist simultaneously during each
 /// multiplication step, requiring roughly 4× the final result size in memory.
-pub fn check_pow_size(base_bits: u64, exponent: u64, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+pub fn check_pow_size(base_bits: u64, exponent: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
     // 0**n = 0, 1**n = 1, (-1)**n = ±1 — always small
     if base_bits <= 1 {
         return Ok(());
@@ -52,7 +52,7 @@ pub fn check_pow_size(base_bits: u64, exponent: u64, tracker: &impl ResourceTrac
 /// Pre-checks that an integer multiplication won't exceed resource limits.
 ///
 /// The result of multiplying two numbers has at most `a_bits + b_bits` bits.
-pub fn check_mult_size(a_bits: u64, b_bits: u64, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+pub fn check_mult_size(a_bits: u64, b_bits: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
     check_estimated_size(estimate_bits_to_bytes(a_bits.saturating_add(b_bits)), tracker)
 }
 
@@ -60,11 +60,7 @@ pub fn check_mult_size(a_bits: u64, b_bits: u64, tracker: &impl ResourceTracker)
 ///
 /// The result of `value << shift` has approximately `value_bits + shift` bits.
 /// For zero values the result is always zero, so the check is skipped.
-pub fn check_lshift_size(
-    value_bits: u64,
-    shift_amount: u64,
-    tracker: &impl ResourceTracker,
-) -> Result<(), ResourceError> {
+pub fn check_lshift_size(value_bits: u64, shift_amount: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
     if value_bits == 0 {
         return Ok(());
     }
@@ -75,7 +71,7 @@ pub fn check_lshift_size(
 ///
 /// Division results are bounded by the dividend size, but we still check for consistency
 /// with other BigInt promotion paths.
-pub fn check_div_size(dividend_bits: u64, tracker: &impl ResourceTracker) -> Result<(), ResourceError> {
+pub fn check_div_size(dividend_bits: u64, tracker: &ResourceTracker) -> Result<(), ResourceError> {
     check_estimated_size(estimate_bits_to_bytes(dividend_bits), tracker)
 }
 
@@ -93,7 +89,7 @@ pub fn check_replace_size(
     old_len: usize,
     new_len: usize,
     count: i64,
-    tracker: &impl ResourceTracker,
+    tracker: &ResourceTracker,
 ) -> Result<(), ResourceError> {
     // Empty pattern (old_len == 0): inserts before each element + after the last = input_len + 1
     let max_replacements = input_len
@@ -118,10 +114,7 @@ pub fn check_replace_size(
 ///
 /// Only calls the tracker when the estimate exceeds `LARGE_RESULT_THRESHOLD`
 /// to avoid overhead on small operations.
-pub(crate) fn check_estimated_size(
-    estimated_bytes: usize,
-    tracker: &impl ResourceTracker,
-) -> Result<(), ResourceError> {
+pub(crate) fn check_estimated_size(estimated_bytes: usize, tracker: &ResourceTracker) -> Result<(), ResourceError> {
     if estimated_bytes > LARGE_RESULT_THRESHOLD {
         tracker.check_large_result(estimated_bytes)?;
     }
@@ -144,14 +137,20 @@ fn estimate_bits_to_bytes(bits: u64) -> usize {
 pub enum ResourceError {
     /// Maximum number of allocations exceeded.
     Allocation { limit: usize, count: usize },
+    /// The attempted allocation count is not representable.
+    AllocationUnrepresentable { limit: usize },
     /// Maximum execution time exceeded.
     Time { limit: Duration, elapsed: Duration },
+    /// The attempted cumulative execution duration is not representable.
+    TimeUnrepresentable { limit: Duration },
     /// Maximum memory usage exceeded.
     Memory { limit: usize, used: usize },
+    /// The attempted memory usage is not representable.
+    MemoryUnrepresentable { limit: usize },
     /// Maximum recursion depth exceeded.
     Recursion { limit: usize, depth: usize },
-    /// Any other error, e.g. when propagating a python exception
-    Exception(MontyException),
+    /// The attempted recursion depth is not representable.
+    RecursionUnrepresentable { limit: usize },
 }
 
 impl fmt::Display for ResourceError {
@@ -160,17 +159,32 @@ impl fmt::Display for ResourceError {
             Self::Allocation { limit, count } => {
                 write!(f, "allocation limit exceeded: {count} > {limit}")
             }
+            Self::AllocationUnrepresentable { limit } => {
+                write!(
+                    f,
+                    "allocation limit exceeded: attempted count is unrepresentable (limit: {limit})"
+                )
+            }
             Self::Time { limit, elapsed } => {
                 write!(f, "time limit exceeded: {elapsed:?} > {limit:?}")
+            }
+            Self::TimeUnrepresentable { limit } => {
+                write!(
+                    f,
+                    "time limit exceeded: attempted duration is unrepresentable (limit: {limit:?})"
+                )
             }
             Self::Memory { limit, used } => {
                 write!(f, "memory limit exceeded: {used} bytes > {limit} bytes")
             }
-            Self::Recursion { .. } => {
-                write!(f, "maximum recursion depth exceeded")
+            Self::MemoryUnrepresentable { limit } => {
+                write!(
+                    f,
+                    "memory limit exceeded: attempted usage is unrepresentable (limit: {limit} bytes)"
+                )
             }
-            Self::Exception(exc) => {
-                write!(f, "{exc}")
+            Self::Recursion { .. } | Self::RecursionUnrepresentable { .. } => {
+                write!(f, "maximum recursion depth exceeded")
             }
         }
     }
@@ -188,26 +202,13 @@ impl ResourceError {
     /// - `Recursion` → `RecursionError`
     #[must_use]
     pub(crate) fn into_exception(self, frame: Option<RawStackFrame>) -> ExceptionRaise {
-        let (exc_type, msg) = match self {
-            Self::Allocation { limit, count } => (
-                ExcType::MemoryError,
-                Some(format!("allocation limit exceeded: {count} > {limit}")),
-            ),
-            Self::Memory { limit, used } => (
-                ExcType::MemoryError,
-                Some(format!("memory limit exceeded: {used} bytes > {limit} bytes")),
-            ),
-            Self::Time { limit, elapsed } => (
-                ExcType::TimeoutError,
-                Some(format!("time limit exceeded: {elapsed:?} > {limit:?}")),
-            ),
-            Self::Recursion { .. } => (
-                ExcType::RecursionError,
-                Some("maximum recursion depth exceeded".to_string()),
-            ),
-            Self::Exception(exc) => (exc.exc_type(), exc.into_message()),
+        let exc_type = match &self {
+            Self::Allocation { .. } | Self::AllocationUnrepresentable { .. } => ExcType::MemoryError,
+            Self::Memory { .. } | Self::MemoryUnrepresentable { .. } => ExcType::MemoryError,
+            Self::Time { .. } | Self::TimeUnrepresentable { .. } => ExcType::TimeoutError,
+            Self::Recursion { .. } | Self::RecursionUnrepresentable { .. } => ExcType::RecursionError,
         };
-        let exc = SimpleException::new(exc_type, msg);
+        let exc = SimpleException::new(exc_type, Some(self.to_string()));
         match frame {
             Some(f) => exc.with_frame(f),
             None => exc.into(),
@@ -220,7 +221,10 @@ impl From<ResourceError> for RunError {
         // RecursionError is catchable in CPython, so it must be catchable here too.
         // Other resource errors (memory, time, allocation) remain uncatchable to prevent
         // untrusted code from suppressing resource limit violations.
-        if matches!(err, ResourceError::Recursion { .. }) {
+        if matches!(
+            err,
+            ResourceError::Recursion { .. } | ResourceError::RecursionUnrepresentable { .. }
+        ) {
             Self::Exc(err.into_exception(None))
         } else {
             Self::UncatchableExc(err.into_exception(None))
@@ -228,320 +232,128 @@ impl From<ResourceError> for RunError {
     }
 }
 
-/// Trait for tracking resource usage and scheduling garbage collection.
+/// Configuration for finite resource limits.
 ///
-/// Implementations can enforce limits on allocations, time, and memory,
-/// as well as schedule periodic garbage collection.
-///
-/// All implementations should eventually trigger garbage collection to handle
-/// reference cycles. [`gc_interval`](Self::gc_interval) controls *frequency*,
-/// not whether GC runs at all.
-pub trait ResourceTracker: fmt::Debug {
-    /// Called before each heap allocation.
-    ///
-    /// Returns `Ok(())` if the allocation should proceed, or `Err(ResourceError)`
-    /// if a limit would be exceeded.
-    ///
-    /// # Arguments
-    /// * `size` - Approximate size in bytes of the allocation
-    fn on_allocate(&self, get_size: impl FnOnce() -> usize) -> Result<(), ResourceError>;
-
-    /// Called when memory is freed (during dec_ref or garbage collection).
-    ///
-    /// # Arguments
-    /// * `size` - Size in bytes of the freed allocation
-    fn on_free(&self, get_size: impl FnOnce() -> usize);
-
-    /// Called periodically (at statement boundaries) to check time limits.
-    ///
-    /// Returns `Ok(())` if within time limit, or `Err(ResourceError::Time)`
-    /// if the limit is exceeded.
-    ///
-    /// Takes `&self` rather than `&mut self` because checking elapsed time is a
-    /// read-only operation. This allows time checks in contexts that only have
-    /// an immutable heap reference, such as `py_repr_fmt`.
-    fn check_time(&self) -> Result<(), ResourceError>;
-
-    /// Called before pushing a new call frame to check recursion depth.
-    ///
-    /// Returns `Ok(())` if within recursion limit, or `Err(ResourceError::Recursion)`
-    /// if the limit would be exceeded.
-    ///
-    /// # Arguments
-    /// * `current_depth` - Current call stack depth (before the new frame is pushed)
-    fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError>;
-
-    /// Called before operations that may produce large results (>100KB).
-    ///
-    /// This allows pre-emptive rejection of operations like `2 ** 10_000_000`
-    /// before the memory is actually allocated. The check only happens for
-    /// estimated result sizes above `LARGE_RESULT_THRESHOLD` to avoid overhead
-    /// on small operations.
-    ///
-    /// # Arguments
-    /// * `estimated_bytes` - Approximate size of the result in bytes
-    ///
-    /// Returns `Ok(())` to allow the operation, or `Err(ResourceError)` to reject.
-    fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError>;
-
-    /// Called when an existing heap object grows in place (e.g., `list.append`, `dict[k] = v`).
-    ///
-    /// Updates tracked memory and checks limits. Unlike `on_allocate`, this does not
-    /// increment the allocation count — it only tracks memory growth of an already-allocated
-    /// object. The growth is automatically balanced on free because `on_free` reads
-    /// `py_estimate_size()` which includes all grown elements.
-    ///
-    /// # Arguments
-    /// * `additional_bytes` - Approximate additional memory consumed by the growth
-    fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError>;
-
-    /// Returns the configured garbage collection interval, in GC-tracked
-    /// allocations.
-    ///
-    /// The cycle collector runs at most once per `gc_interval` GC-tracked
-    /// allocations, and additionally short-circuits when no cycle candidates
-    /// are pending — so programs that never form cycles pay no collector
-    /// cost regardless of their allocation rate.
-    ///
-    /// Implementations that do not expose a configurable GC interval should
-    /// return `None`, which tells the heap to use its built-in default
-    /// scheduling threshold.
-    fn gc_interval(&self) -> Option<usize>;
-
-    /// Called when the VM enters its execution loop from a host boundary
-    /// (`VM::run_external`), starting one execution window.
-    ///
-    /// Paired with [`on_execution_stop`](Self::on_execution_stop) and never
-    /// nested — VM-internal re-entry (task switches, host-initiated function
-    /// evaluation) uses the raw run loop, so its time falls inside the
-    /// enclosing window. Trackers that measure execution time run their
-    /// clock between the pair; the clock is *not* running while execution is
-    /// suspended waiting on the host (external function calls) or between
-    /// feeds. Default is a no-op.
-    fn on_execution_start(&self) {}
-
-    /// Called when the VM leaves its execution loop — on completion, error,
-    /// or suspension at an external call. See [`on_execution_start`](Self::on_execution_start).
-    fn on_execution_stop(&self) {}
-
-    /// Lowers the active recursion-depth limit to `new_limit`.
-    ///
-    /// Exposed under the `test-hooks` feature so `sys.setrecursionlimit` can
-    /// tighten the depth ceiling from inside fixture code. Implementations
-    /// MUST refuse to *raise* the limit above whatever ceiling the host
-    /// configured at construction time — that would let sandboxed code
-    /// escape the host-imposed safety bound.
-    ///
-    /// Returns `Ok(())` when the requested limit was applied (including the
-    /// no-op case `new_limit == current`). Returns `Err(current)` when the
-    /// request would raise the limit, where `current` is the active limit
-    /// (or `None` if the tracker has no settable limit at all). Callers
-    /// surface this as a `ValueError` in the Python layer.
-    ///
-    /// The default implementation rejects all requests, so wrapper trackers
-    /// that should expose this capability must explicitly delegate to their
-    /// inner tracker.
-    #[cfg(feature = "test-hooks")]
-    fn lower_recursion_limit(&self, _new_limit: usize) -> Result<(), Option<usize>> {
-        Err(None)
-    }
-}
-
-/// A resource tracker that imposes no limits except default recursion limit.
-///
-/// Recursion limit is set to the cpython default of 1000.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NoLimitTracker;
-
-impl ResourceTracker for NoLimitTracker {
-    #[inline]
-    fn on_allocate(&self, _: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    #[inline]
-    fn on_free(&self, _: impl FnOnce() -> usize) {}
-
-    #[inline]
-    fn check_time(&self) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    #[inline]
-    fn on_grow(&self, _: usize) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    /// Set the recursion limit to 1000.
-    ///
-    /// The high limit here may cause stack overflow errors in debug mode, but do not those errors should
-    /// not occur with release builds.
-    #[inline]
-    fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
-        const DEFAULT_RECURSION_LIMIT: usize = 1000;
-        if current_depth >= DEFAULT_RECURSION_LIMIT {
-            Err(ResourceError::Recursion {
-                limit: DEFAULT_RECURSION_LIMIT,
-                depth: current_depth + 1,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    #[inline]
-    fn check_large_result(&self, _estimated_bytes: usize) -> Result<(), ResourceError> {
-        // No limit - always allow operations regardless of result size
-        Ok(())
-    }
-
-    #[inline]
-    fn gc_interval(&self) -> Option<usize> {
-        None
-    }
-}
-
-/// Configuration for resource limits.
-///
-/// All limits are optional - set to `None` to disable a specific limit.
-/// Use `ResourceLimits::default()` for no limits, or build custom limits
-/// with the builder pattern.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// Every execution is bounded. Hosts which need effectively unrestricted execution
+/// can configure ceilings high enough to be irrelevant for their workload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
     /// Maximum number of heap allocations allowed.
-    pub max_allocations: Option<usize>,
-    /// Maximum execution time.
-    pub max_duration: Option<Duration>,
+    pub max_allocations: usize,
+    /// Maximum cumulative execution time.
+    pub max_duration: Duration,
     /// Maximum heap memory in bytes (approximate).
-    pub max_memory: Option<usize>,
+    pub max_memory: usize,
     /// Run garbage collection every N GC-tracked allocations.
-    pub gc_interval: Option<usize>,
-    /// Maximum recursion depth (function call stack depth).
-    pub max_recursion_depth: Option<usize>,
+    pub gc_interval: usize,
+    /// Maximum function-call recursion depth.
+    pub max_recursion_depth: usize,
 }
 
+/// Default maximum heap memory: 100 MB.
+pub const DEFAULT_MAX_MEMORY: usize = 100_000_000;
+/// Default maximum cumulative allocations.
+pub const DEFAULT_MAX_ALLOCATIONS: usize = 10_000_000;
+/// Default maximum cumulative execution duration.
+pub const DEFAULT_MAX_DURATION: Duration = Duration::from_mins(1);
+/// Default cycle-collection scheduling interval.
+///
+/// Memory-model checks collect at every opportunity to stress ownership paths.
+pub const DEFAULT_GC_INTERVAL: usize = if cfg!(feature = "memory-model-checks") {
+    1
+} else {
+    100_000
+};
 /// Recommended maximum recursion depth if not otherwise specified.
 pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 1000;
 
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_allocations: DEFAULT_MAX_ALLOCATIONS,
+            max_duration: DEFAULT_MAX_DURATION,
+            max_memory: DEFAULT_MAX_MEMORY,
+            gc_interval: DEFAULT_GC_INTERVAL,
+            max_recursion_depth: DEFAULT_MAX_RECURSION_DEPTH,
+        }
+    }
+}
+
 impl ResourceLimits {
-    /// Creates a new ResourceLimits with all limits disabled, except max recursion which is set to 1000.
+    /// Creates resource limits using Monty's finite defaults.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            max_recursion_depth: Some(1000),
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Sets the maximum number of allocations.
     #[must_use]
     pub fn max_allocations(mut self, limit: usize) -> Self {
-        self.max_allocations = Some(limit);
+        self.max_allocations = limit;
         self
     }
 
     /// Sets the maximum execution duration.
     #[must_use]
     pub fn max_duration(mut self, limit: Duration) -> Self {
-        self.max_duration = Some(limit);
+        self.max_duration = limit;
         self
     }
 
     /// Sets the maximum memory usage in bytes.
     #[must_use]
     pub fn max_memory(mut self, limit: usize) -> Self {
-        self.max_memory = Some(limit);
+        self.max_memory = limit;
         self
     }
 
-    /// Sets the garbage collection interval (run GC every N GC-tracked allocations).
+    /// Sets the garbage collection interval.
     #[must_use]
     pub fn gc_interval(mut self, interval: usize) -> Self {
-        self.gc_interval = Some(interval);
+        self.gc_interval = interval;
         self
     }
 
-    /// Sets the maximum recursion depth (function call stack depth).
+    /// Sets the maximum recursion depth.
     #[must_use]
-    pub fn max_recursion_depth(mut self, limit: Option<usize>) -> Self {
+    pub fn max_recursion_depth(mut self, limit: usize) -> Self {
         self.max_recursion_depth = limit;
         self
     }
 }
 
-/// How often to actually check `Instant::elapsed()` in `check_time`.
-///
-/// Calling `Instant::elapsed()` on every `check_time` invocation adds measurable
-/// overhead in tight loops (the VM calls `check_time` on every instruction).
-/// By only checking every N calls, we reduce this overhead while still catching
-/// timeouts promptly.
+/// How often to read the monotonic clock while executing bytecode.
 const TIME_CHECK_INTERVAL: u16 = 10;
 
-/// A resource tracker that enforces configurable limits.
+/// Tracks and enforces resources for one execution session.
 ///
-/// Tracks allocation count, memory usage, and execution time, returning
-/// errors when limits are exceeded. Also schedules garbage collection
-/// at configurable intervals.
-///
-/// Uses `Cell` for interior mutability to allow many methods which take
-/// `&self` (enabling `&self` on critical methods such as `Heap::allocate`).
-///
-/// `max_duration` limits *cumulative execution time*: the clock runs only
-/// while the VM is executing bytecode (between the outermost
-/// `on_execution_start`/`on_execution_stop` pair) and is paused while
-/// execution is suspended waiting on the host — external function calls,
-/// OS callbacks — and between REPL feeds. The accumulated time is
-/// serialized, so a deserialized session resumes its budget where it left
-/// off rather than restarting from zero.
+/// Accounting uses interior mutability because heap allocations are permitted through
+/// shared heap references. Allocation count and execution time are cumulative across
+/// feeds, while current memory falls when values are freed.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct LimitedTracker {
+pub struct ResourceTracker {
     limits: ResourceLimits,
-    /// Execution time accumulated by completed `on_execution_start`/`stop`
-    /// windows. Serialized so time budgets survive dump/load. The serde
-    /// default helps self-describing formats; postcard snapshots are
-    /// positional, so older snapshot layouts still fail closed at decode.
     #[serde(default)]
     total_execution_time: Cell<Duration>,
-    /// When the current execution window started; `None` while suspended or
-    /// idle. Never serialized — a snapshot is by definition taken while not
-    /// executing.
+    #[serde(default)]
+    execution_time_overflowed: Cell<bool>,
     #[serde(skip)]
     running_since: Cell<Option<Instant>>,
-    /// Total number of allocations made.
     allocation_count: Cell<usize>,
-    /// Current approximate memory usage in bytes.
     current_memory: Cell<usize>,
-    /// Counter for rate-limiting `Instant::elapsed()` calls in `check_time`.
     check_counter: Cell<u16>,
-    /// Optional override applied on top of `limits.max_recursion_depth`.
-    ///
-    /// `None` (the default — also the value any pre-`test-hooks` snapshot
-    /// deserializes to) means "no override, use the configured ceiling".
-    /// `Some(N)` means "use `N` as the live recursion ceiling instead", and
-    /// is only ever populated by
-    /// [`lower_recursion_limit`](ResourceTracker::lower_recursion_limit)
-    /// under the `test-hooks` feature — `sys.setrecursionlimit` uses it to
-    /// tighten the bound from Python code without escaping the
-    /// host-configured ceiling.
-    ///
-    /// Modeled as an override rather than the live limit so adding this
-    /// field doesn't break deserialization of snapshots produced before it
-    /// existed (`#[serde(default)]` gives back the `None` fallback case).
     #[serde(default)]
     recursion_limit_override: Cell<Option<usize>>,
 }
 
-impl LimitedTracker {
-    /// Creates a new LimitedTracker with the given limits.
-    ///
-    /// The execution-time clock starts at zero and only runs while the VM
-    /// executes, so the tracker can be created any amount of time before
-    /// the first run without consuming the duration budget.
+impl ResourceTracker {
+    /// Creates a tracker with the supplied finite limits.
     #[must_use]
     pub fn new(limits: ResourceLimits) -> Self {
         Self {
             limits,
             total_execution_time: Cell::new(Duration::ZERO),
+            execution_time_overflowed: Cell::new(false),
             running_since: Cell::new(None),
             allocation_count: Cell::new(0),
             current_memory: Cell::new(0),
@@ -550,10 +362,41 @@ impl LimitedTracker {
         }
     }
 
-    /// Returns the live recursion ceiling: the override if one is in effect,
-    /// otherwise the configured `max_recursion_depth`.
-    fn active_recursion_limit(&self) -> Option<usize> {
-        self.recursion_limit_override.get().or(self.limits.max_recursion_depth)
+    /// Creates a tracker with Monty's default limits.
+    #[must_use]
+    pub fn default_limits() -> Self {
+        Self::new(ResourceLimits::default())
+    }
+
+    /// Creates a fresh accounting epoch for a validated restored heap.
+    pub(crate) fn restored(
+        limits: ResourceLimits,
+        allocation_count: usize,
+        current_memory: usize,
+    ) -> Result<Self, ResourceError> {
+        if allocation_count > limits.max_allocations {
+            Err(ResourceError::Allocation {
+                limit: limits.max_allocations,
+                count: allocation_count,
+            })
+        } else if current_memory > limits.max_memory {
+            Err(ResourceError::Memory {
+                limit: limits.max_memory,
+                used: current_memory,
+            })
+        } else {
+            let tracker = Self::new(limits);
+            tracker.allocation_count.set(allocation_count);
+            tracker.current_memory.set(current_memory);
+            Ok(tracker)
+        }
+    }
+
+    /// Returns the live recursion ceiling.
+    fn active_recursion_limit(&self) -> usize {
+        self.recursion_limit_override
+            .get()
+            .unwrap_or(self.limits.max_recursion_depth)
     }
 
     /// Returns the current allocation count.
@@ -568,170 +411,187 @@ impl LimitedTracker {
         self.current_memory.get()
     }
 
-    /// Returns the cumulative execution time: bytecode-execution wall time
-    /// accumulated across runs/feeds, excluding time suspended on the host
-    /// or idle between feeds. Includes the in-progress window if the VM is
-    /// currently executing.
+    /// Returns cumulative bytecode execution time, including an active window.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
-        let running = self.running_since.get().map_or(Duration::ZERO, |t| t.elapsed());
-        self.total_execution_time.get() + running
+        if self.execution_time_overflowed.get() {
+            Duration::MAX
+        } else {
+            let running = self.running_since.get().map_or(Duration::ZERO, |t| t.elapsed());
+            self.total_execution_time.get().saturating_add(running)
+        }
     }
 
-    /// Returns the configured maximum cumulative execution time, if any.
+    /// Returns the configured cumulative execution ceiling.
     #[must_use]
-    pub fn max_duration(&self) -> Option<Duration> {
+    pub fn max_duration(&self) -> Duration {
         self.limits.max_duration
     }
 
-    /// Sets the maximum execution duration as a fresh budget from now,
-    /// resetting the accumulated execution time to zero.
-    ///
-    /// This lets a host enforce a different (typically shorter) time limit
-    /// for a resumed phase — e.g. allowing a long build phase, then giving
-    /// `repr()` of the result only a few milliseconds. Time spent suspended
-    /// in the host never counts toward the budget either way.
+    /// Replaces the execution duration with a fresh budget from now.
     pub fn set_max_duration(&mut self, duration: Duration) {
-        self.limits.max_duration = Some(duration);
+        self.limits.max_duration = duration;
         self.total_execution_time.set(Duration::ZERO);
+        self.execution_time_overflowed.set(false);
+        if self.running_since.get().is_some() {
+            self.running_since.set(Some(Instant::now()));
+        }
     }
-}
 
-impl ResourceTracker for LimitedTracker {
-    fn on_allocate(&self, get_size: impl FnOnce() -> usize) -> Result<(), ResourceError> {
+    /// Returns the configured GC interval.
+    #[must_use]
+    pub(crate) fn gc_interval(&self) -> usize {
+        self.limits.gc_interval
+    }
+
+    /// Charges one heap allocation, rejecting arithmetic overflow as exhaustion.
+    pub(crate) fn on_allocate(&self, get_size: impl FnOnce() -> usize) -> Result<(), ResourceError> {
         let count = self.allocation_count.get();
-        // Check allocation count limit
-        if let Some(max) = self.limits.max_allocations
-            && count >= max
-        {
+        let new_count = count.checked_add(1).ok_or(ResourceError::AllocationUnrepresentable {
+            limit: self.limits.max_allocations,
+        })?;
+        if new_count > self.limits.max_allocations {
             return Err(ResourceError::Allocation {
-                limit: max,
-                count: count + 1,
+                limit: self.limits.max_allocations,
+                count: new_count,
             });
         }
 
-        let size = get_size();
-        // Check memory limit
-        let current_mem = self.current_memory.get();
-        if let Some(max) = self.limits.max_memory {
-            let new_memory = current_mem + size;
-            if new_memory > max {
-                return Err(ResourceError::Memory {
-                    limit: max,
-                    used: new_memory,
-                });
-            }
-        }
-
-        // Update tracking state
-        self.allocation_count.set(count + 1);
-        self.current_memory.set(current_mem + size);
-
-        Ok(())
-    }
-
-    fn on_free(&self, get_size: impl FnOnce() -> usize) {
         let current = self.current_memory.get();
-        self.current_memory.set(current.saturating_sub(get_size()));
-    }
-
-    fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError> {
-        let current_mem = self.current_memory.get();
-        let new_memory = current_mem.saturating_add(additional_bytes);
-        if let Some(max) = self.limits.max_memory
-            && new_memory > max
-        {
+        let new_memory = current
+            .checked_add(get_size())
+            .ok_or(ResourceError::MemoryUnrepresentable {
+                limit: self.limits.max_memory,
+            })?;
+        if new_memory > self.limits.max_memory {
             return Err(ResourceError::Memory {
-                limit: max,
+                limit: self.limits.max_memory,
                 used: new_memory,
             });
         }
-        // Always update current_memory, matching on_allocate's behavior,
-        // so current_memory() remains accurate even without a memory limit.
+        self.allocation_count.set(new_count);
         self.current_memory.set(new_memory);
         Ok(())
     }
 
-    fn check_time(&self) -> Result<(), ResourceError> {
-        if let Some(max) = self.limits.max_duration {
-            self.check_counter.update(|c| c.wrapping_add(1));
-            if self.check_counter.get().is_multiple_of(TIME_CHECK_INTERVAL) {
-                // Only call Instant::elapsed() every TIME_CHECK_INTERVAL calls
-                let elapsed = self.elapsed();
-                if elapsed > max {
-                    // Reset counter so the very next check_time call also triggers
-                    // an elapsed check. This is important because some callers
-                    // (e.g. repr_sequence_fmt) catch the error and return normally,
-                    // and we need the VM loop's next check_time to re-detect timeout.
-                    self.check_counter.set(TIME_CHECK_INTERVAL.wrapping_sub(1));
-                    return Err(ResourceError::Time { limit: max, elapsed });
-                }
-            }
-        }
-        Ok(())
+    /// Removes the estimated memory charge for a freed heap object.
+    pub(crate) fn on_free(&self, get_size: impl FnOnce() -> usize) {
+        self.current_memory
+            .set(self.current_memory.get().saturating_sub(get_size()));
     }
 
-    fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
-        if let Some(max) = self.active_recursion_limit() {
-            // current_depth is before push, so new depth would be current_depth + 1
-            if current_depth >= max {
-                return Err(ResourceError::Recursion {
-                    limit: max,
-                    depth: current_depth + 1,
+    /// Charges growth of an existing heap object.
+    pub(crate) fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError> {
+        let new_memory =
+            self.current_memory
+                .get()
+                .checked_add(additional_bytes)
+                .ok_or(ResourceError::MemoryUnrepresentable {
+                    limit: self.limits.max_memory,
+                })?;
+        if new_memory > self.limits.max_memory {
+            Err(ResourceError::Memory {
+                limit: self.limits.max_memory,
+                used: new_memory,
+            })
+        } else {
+            self.current_memory.set(new_memory);
+            Ok(())
+        }
+    }
+
+    /// Checks the cumulative execution duration.
+    pub(crate) fn check_time(&self) -> Result<(), ResourceError> {
+        self.check_counter.update(|c| c.wrapping_add(1));
+        if self.limits.max_duration.is_zero() || self.check_counter.get().is_multiple_of(TIME_CHECK_INTERVAL) {
+            if self.execution_time_overflowed.get() {
+                return Err(ResourceError::TimeUnrepresentable {
+                    limit: self.limits.max_duration,
+                });
+            }
+            let running = self.running_since.get().map_or(Duration::ZERO, |t| t.elapsed());
+            let elapsed =
+                self.total_execution_time
+                    .get()
+                    .checked_add(running)
+                    .ok_or(ResourceError::TimeUnrepresentable {
+                        limit: self.limits.max_duration,
+                    })?;
+            if elapsed > self.limits.max_duration {
+                self.check_counter.set(TIME_CHECK_INTERVAL.wrapping_sub(1));
+                return Err(ResourceError::Time {
+                    limit: self.limits.max_duration,
+                    elapsed,
                 });
             }
         }
         Ok(())
     }
 
-    fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError> {
-        // Check if this would exceed memory limit
-        if let Some(max) = self.limits.max_memory {
-            let new_memory = self.current_memory.get().saturating_add(estimated_bytes);
-            if new_memory > max {
-                return Err(ResourceError::Memory {
-                    limit: max,
-                    used: new_memory,
-                });
-            }
+    /// Checks whether another call frame may be pushed.
+    pub(crate) fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
+        let max = self.active_recursion_limit();
+        if current_depth >= max {
+            let depth = current_depth
+                .checked_add(1)
+                .ok_or(ResourceError::RecursionUnrepresentable { limit: max })?;
+            Err(ResourceError::Recursion { limit: max, depth })
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
-    fn gc_interval(&self) -> Option<usize> {
-        self.limits.gc_interval
+    /// Checks an estimated large result before constructing it.
+    pub(crate) fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError> {
+        let used =
+            self.current_memory
+                .get()
+                .checked_add(estimated_bytes)
+                .ok_or(ResourceError::MemoryUnrepresentable {
+                    limit: self.limits.max_memory,
+                })?;
+        if used > self.limits.max_memory {
+            Err(ResourceError::Memory {
+                limit: self.limits.max_memory,
+                used,
+            })
+        } else {
+            Ok(())
+        }
     }
 
-    fn on_execution_start(&self) {
-        debug_assert!(
-            self.running_since.get().is_none(),
-            "nested on_execution_start: VM-internal re-entry must use the raw run loop, not run_external"
-        );
+    /// Starts one non-nested bytecode execution window.
+    pub(crate) fn on_execution_start(&self) {
+        debug_assert!(self.running_since.get().is_none(), "nested execution resource window");
         self.running_since.set(Some(Instant::now()));
     }
 
-    fn on_execution_stop(&self) {
+    /// Stops the active execution window and accumulates its duration.
+    pub(crate) fn on_execution_stop(&self) {
         if let Some(started) = self.running_since.take() {
-            self.total_execution_time
-                .set(self.total_execution_time.get() + started.elapsed());
+            if let Some(total) = self.total_execution_time.get().checked_add(started.elapsed()) {
+                self.total_execution_time.set(total);
+            } else {
+                self.execution_time_overflowed.set(true);
+            }
         }
     }
 
-    /// Lowers the live recursion ceiling to `new_limit`, refusing to raise it.
-    ///
-    /// The constructed limit (`limits.max_recursion_depth`) acts as the hard
-    /// upper bound — `sys.setrecursionlimit` may only tighten it, never relax
-    /// it. Crossing from "no limit configured" to a concrete value counts as
-    /// lowering (infinity → finite); going from `Some(N)` to `Some(K)` with
-    /// `K > N` is rejected.
+    /// Lowers the live recursion ceiling without allowing sandbox code to raise it.
     #[cfg(feature = "test-hooks")]
-    fn lower_recursion_limit(&self, new_limit: usize) -> Result<(), Option<usize>> {
-        if let Some(current) = self.active_recursion_limit()
-            && new_limit > current
-        {
-            return Err(Some(current));
+    pub(crate) fn lower_recursion_limit(&self, new_limit: usize) -> Result<(), Option<usize>> {
+        let current = self.active_recursion_limit();
+        if new_limit > current {
+            Err(Some(current))
+        } else {
+            self.recursion_limit_override.set(Some(new_limit));
+            Ok(())
         }
-        self.recursion_limit_override.set(Some(new_limit));
-        Ok(())
+    }
+}
+
+impl Default for ResourceTracker {
+    fn default() -> Self {
+        Self::default_limits()
     }
 }

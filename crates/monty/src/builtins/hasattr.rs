@@ -7,7 +7,6 @@ use crate::{
     defer_drop,
     exception_private::{RunError, RunResult, SimpleException},
     heap::DropWithContext,
-    resource::ResourceTracker,
     value::Value,
 };
 
@@ -27,7 +26,7 @@ use crate::{
 /// hasattr(slice(1, 10), 'start') # True - slice has start attribute
 /// hasattr(42, 'nonexistent')    # False - int has no such attribute
 /// ```
-pub fn builtin_hasattr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_hasattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let positional = args.into_pos_only("hasattr", vm.heap)?;
     defer_drop!(positional, vm);
 

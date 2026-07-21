@@ -19,12 +19,12 @@
 
 use monty::{CompileOptions, DictPairs, ExcType, MontyObject, MontyRun};
 
-/// Runs `code` to completion with no resource limits and returns the value of
+/// Runs `code` to completion with default resource limits and returns the value of
 /// its final expression.
 fn eval(code: &str) -> MontyObject {
     MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
-        .run_no_limits(vec![])
+        .run_default(vec![])
         .unwrap()
 }
 
@@ -56,7 +56,7 @@ fn loader_raises_name_error() {
     // diverge on type — reading it raises `NameError` like any unbound name.
     let err = MontyRun::new("__loader__".to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
-        .run_no_limits(vec![])
+        .run_default(vec![])
         .expect_err("expected NameError");
     assert_eq!(err.exc_type(), ExcType::NameError);
     assert_eq!(err.message().unwrap(), "name '__loader__' is not defined");

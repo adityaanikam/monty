@@ -6,7 +6,6 @@ use crate::{
     exception_private::{ExcType, RunError, SimpleException},
     heap::{DropGuard, HeapData, HeapReadOutput},
     intern::StringId,
-    resource::ResourceTracker,
     types::{
         Dict, List, Set, Slice, allocate_tuple, collect_iterable, collect_iterable_bounded, slice::value_to_option_i64,
         str::allocate_char,
@@ -14,7 +13,7 @@ use crate::{
     value::{VALUE_SIZE, Value},
 };
 
-impl<T: ResourceTracker> VM<'_, T> {
+impl VM<'_> {
     /// Builds a list from the top n stack values.
     pub(super) fn build_list(&mut self, count: usize) -> Result<(), RunError> {
         let items = self.pop_n(count);
@@ -738,7 +737,7 @@ impl<T: ResourceTracker> VM<'_, T> {
 
 /// Resolves the function-name string used by `DictMerge` error wording.
 /// `0xFFFF` is the compiler sentinel for "unknown caller".
-fn func_name_for_dict_merge(func_name_id: u16, vm: &VM<'_, impl ResourceTracker>) -> String {
+fn func_name_for_dict_merge(func_name_id: u16, vm: &VM<'_>) -> String {
     if func_name_id == 0xFFFF {
         "<unknown>".to_string()
     } else {
