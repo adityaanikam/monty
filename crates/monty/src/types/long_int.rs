@@ -16,14 +16,14 @@ use std::{
     sync::OnceLock,
 };
 
+use monty_types::ResourceError;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use crate::{
-    exception_private::{ExcType, RunResult},
+    exception_private::{ExcType, ExcTypeExt, RunResult},
     hash::{HashValue, hash_python_long_int},
     heap::{HeapData, HeapReader},
-    resource::{ResourceError, ResourceTracker},
     value::Value,
 };
 
@@ -61,12 +61,25 @@ impl LongInt {
         Self(bi)
     }
 
+    /// Converts a nonnegative `u128` to its most compact Python integer representation.
+    ///
+    /// The common immediate path avoids constructing a temporary `BigInt`.
+    pub(crate) fn value_from_u128(value: u128, heap: &HeapReader<'_>) -> Result<Value, ResourceError> {
+        if let Ok(value) = i64::try_from(value) {
+            Ok(Value::Int(value))
+        } else {
+            let long_int = Self::new(BigInt::from(value));
+            let heap_id = heap.allocate(HeapData::LongInt(long_int))?;
+            Ok(Value::Ref(heap_id))
+        }
+    }
+
     /// Converts to a `Value`, demoting to i64 if it fits.
     ///
     /// For performance, we want to keep values as `Value::Int(i64)` whenever possible.
     /// This method checks if the value fits in an i64 and returns `Value::Int` if so,
     /// otherwise allocates a `HeapData::LongInt` on the heap.
-    pub fn into_value(self, heap: &HeapReader<'_, impl ResourceTracker>) -> Result<Value, ResourceError> {
+    pub fn into_value(self, heap: &HeapReader<'_>) -> Result<Value, ResourceError> {
         // Try to demote back to i64 for performance
         if let Some(i) = self.0.to_i64() {
             Ok(Value::Int(i))
