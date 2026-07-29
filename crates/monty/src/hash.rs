@@ -3,12 +3,12 @@
 //! Defines:
 //!
 //! * [`HashValue`] — a verified Python hash. Construction goes through
-//!   [`HashValue::from_raw`]; storing or comparing hashes anywhere in the
+//!   [`HashValue::new`]; storing or comparing hashes anywhere in the
 //!   runtime should use this type rather than a bare `u64` so the invariant
 //!   is enforced by the type system.
 //!
 //!   Internally backed by a [`NonZero<u64>`] holding the **bit-inverse** of
-//!   the raw hash. The inversion is invisible to callers (`from_raw` /
+//!   the raw hash. The inversion is invisible to callers (`new` /
 //!   `get` translate at the boundary) but means `Option<HashValue>` is
 //!   niche-packed into 8 bytes — `None` is the bit pattern `0`, the inverse
 //!   of the reserved `u64::MAX` sentinel.
@@ -41,20 +41,22 @@ use crate::{heap::HeapId, intern::StaticStrings};
 ///
 /// Internally a [`NonZero<u64>`] holding the bit-inverse of the raw hash, so
 /// `Option<HashValue>` niche-packs into 8 bytes. Construct via
-/// [`HashValue::from_raw`]; extract via [`HashValue::get`] (both translate
+/// [`HashValue::new`]; extract via [`HashValue::raw`] (both translate
 /// the inversion at the boundary).
 ///
 /// The bit-inversion is purely an implementation detail of the niche
-/// packing — none of the public traits leak it. [`Hash`], [`fmt::Debug`],
-/// [`serde::Serialize`] and [`serde::Deserialize`] all hand-translate to/from
-/// the raw `u64` form, so:
+/// packing — none of the public traits leak it. [`Hash`] and [`fmt::Debug`]
+/// hand-translate to/from the raw `u64` form, so:
 ///
 /// * Composite hashes that fold a `HashValue` see the same bytes `get()`
 ///   returns (independent of storage layout — a future change to e.g.
 ///   `NonMaxU64` would leave tuple/dict hashes invariant).
 /// * Debug output shows the raw hash (`HashValue(5)`, not the inverted bits).
-/// * Snapshots store the raw hash, so the wire format is decoupled from the
-///   niche-packing representation.
+///
+/// Deliberately NOT `Serialize`/`Deserialize`: hashes are hasher- and
+/// build-specific derived data and must never cross the serialization
+/// boundary — dumps stay hash-free and every build recomputes with its own
+/// hasher (dict/set indices rebuild lazily, caches refill on first use).
 ///
 /// Stored in interner hash tables, returned by `Value::py_hash`, and used
 /// wherever a known-good hash needs to be passed around.
@@ -104,23 +106,6 @@ impl fmt::Debug for HashValue {
     /// output matches `get()`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("HashValue").field(&self.raw()).finish()
-    }
-}
-
-impl serde::Serialize for HashValue {
-    /// Emits the raw hash so the wire format is decoupled from the
-    /// niche-packing representation.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.raw().serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for HashValue {
-    /// Reads a raw `u64` and reconstructs via [`HashValue::from_raw`], so
-    /// even a pathological wire value of `u64::MAX` is handled by the same
-    /// sentinel-collision path as fresh hashes.
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::new(u64::deserialize(deserializer)?))
     }
 }
 

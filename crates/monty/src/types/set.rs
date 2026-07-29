@@ -1,4 +1,8 @@
-use std::{cell::Cell, fmt::Write, mem};
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Write,
+    mem,
+};
 
 use hashbrown::HashTable;
 use monty_types::{ResourceError, ResourceTracker};
@@ -24,8 +28,12 @@ use crate::{
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SetEntry {
     pub(crate) value: Value,
-    /// Cached hash for efficient lookup and reinsertion.
-    pub(crate) hash: u64,
+    /// Cached hash for efficient lookup and reinsertion. Skipped on serde —
+    /// hashes are hasher/build-specific so they never cross the wire;
+    /// recomputed together with `indices` by `ensure_indices`. `Cell` so the
+    /// lazy rebuild can run behind `&self` heap handles.
+    #[serde(skip)]
+    pub(crate) hash: Cell<u64>,
 }
 
 /// Internal storage shared between Set and FrozenSet.
@@ -35,8 +43,14 @@ struct SetEntry {
 /// The hash table maps value hashes to indices in the entries vector.
 #[derive(Debug, Default)]
 pub(crate) struct SetStorage {
-    /// Maps hash to index in entries vector.
-    indices: HashTable<usize>,
+    /// Maps hash to index in entries vector. Derived data: never serialized,
+    /// rebuilt lazily (see [`SetStorage::indices_stale`]). `RefCell` so the
+    /// rebuild can run behind `&self` heap handles.
+    indices: RefCell<HashTable<usize>>,
+    /// True when `indices`/entry hashes need a rebuild (set by deserialize
+    /// and `from_entries`). A `Cell<bool>` so the hot-path staleness check
+    /// is a plain byte load instead of a `RefCell` borrow cycle.
+    stale: Cell<bool>,
     /// Dense vector of entries maintaining insertion order.
     entries: Vec<SetEntry>,
 }
@@ -50,31 +64,44 @@ impl SetStorage {
     /// Creates a new set storage with pre-allocated capacity.
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: HashTable::with_capacity(capacity),
+            indices: RefCell::new(HashTable::with_capacity(capacity)),
+            stale: Cell::new(false),
             entries: Vec::with_capacity(capacity),
         }
     }
 
-    /// Creates a SetStorage from a vector of (value, hash) pairs.
-    ///
-    /// This is used to avoid borrow conflicts when we need to copy another set's
-    /// contents and then perform operations requiring mutable heap access.
-    /// The caller is responsible for handling reference counting.
-    fn from_entries(entries: Vec<(Value, u64)>) -> Self {
-        let mut storage = Self::with_capacity(entries.len());
-        for (idx, (value, hash)) in entries.into_iter().enumerate() {
-            storage.entries.push(SetEntry { value, hash });
-            storage.indices.insert_unique(hash, idx, |&i| storage.entries[i].hash);
-        }
-        storage
+    /// True when `indices` (and the per-entry hash cells) must be rebuilt —
+    /// set by deserialization and [`SetStorage::from_entries`].
+    /// Rebuild via `ensure_indices` before consulting `indices`.
+    #[inline]
+    fn indices_stale(&self) -> bool {
+        self.stale.get()
     }
 
-    /// Clones entries with proper reference counting.
-    fn clone_entries(&self, heap: &impl ContainsHeap) -> Vec<(Value, u64)> {
-        self.entries
-            .iter()
-            .map(|e| (e.value.clone_with_heap(heap), e.hash))
-            .collect()
+    /// Creates a SetStorage from a vector of values (assumed already deduplicated,
+    /// e.g. cloned from another set's entries).
+    ///
+    /// The storage is born with stale indices — hashes are recomputed by
+    /// `ensure_indices` on first keyed use. Never carrying hashes between
+    /// storages keeps a single source of truth for them.
+    /// The caller is responsible for handling reference counting.
+    fn from_entries(values: Vec<Value>) -> Self {
+        Self {
+            indices: RefCell::new(HashTable::new()),
+            stale: Cell::new(!values.is_empty()),
+            entries: values
+                .into_iter()
+                .map(|value| SetEntry {
+                    value,
+                    hash: Cell::new(0),
+                })
+                .collect(),
+        }
+    }
+
+    /// Clones the element values with proper reference counting.
+    fn clone_entries(&self, heap: &impl ContainsHeap) -> Vec<Value> {
+        self.entries.iter().map(|e| e.value.clone_with_heap(heap)).collect()
     }
 
     /// Returns the number of elements in the set.
@@ -96,6 +123,9 @@ impl SetStorage {
     /// The caller transfers ownership of `value`. If the value is already in
     /// the set, it will be dropped.
     fn add(&mut self, value: Value, vm: &mut VM<'_>) -> RunResult<bool> {
+        // Detached storages can be stale too (clones of / conversions from a
+        // freshly deserialized set), so rebuild before consulting `indices`.
+        vm.heap.protect(&*self).ensure_indices(vm)?;
         let mut value_guard = DropGuard::new(value, vm);
         let (value, vm) = value_guard.as_parts_mut();
         let hash = set_element_hash(value, vm)?;
@@ -103,15 +133,22 @@ impl SetStorage {
         // Check if value already exists.
         let existing = self
             .indices
-            .find(hash, |&idx| value.py_eq(&self.entries[idx].value, vm).unwrap_or(false));
+            .borrow()
+            .find(hash, |&idx| value.py_eq(&self.entries[idx].value, vm).unwrap_or(false))
+            .copied();
 
         if existing.is_some() {
             Ok(false)
         } else {
             let index = self.entries.len();
             let value = value_guard.into_inner();
-            self.entries.push(SetEntry { value, hash });
-            self.indices.insert_unique(hash, index, |&idx| self.entries[idx].hash);
+            self.entries.push(SetEntry {
+                value,
+                hash: Cell::new(hash),
+            });
+            self.indices
+                .borrow_mut()
+                .insert_unique(hash, index, |&idx| self.entries[idx].hash.get());
             Ok(true)
         }
     }
@@ -123,13 +160,14 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// Returns `Ok(true)` if the element was removed, `Ok(false)` if not found.
     /// Returns `Err` if the key is unhashable.
     fn remove(&mut self, value: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        self.ensure_indices(vm)?;
         let hash = set_element_hash(value, vm)?;
 
         // Collect candidates by hash
         let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
         let storage = &self.get(vm.heap);
-        storage.indices.find(hash, |&idx| {
-            if storage.entries[idx].hash == hash {
+        storage.indices.borrow().find(hash, |&idx| {
+            if storage.entries[idx].hash.get() == hash {
                 candidates.push(idx);
             }
             false
@@ -153,9 +191,12 @@ impl<'h> HeapRead<'h, SetStorage> {
         // Remove via short-lived mutable borrow
         let storage = self.get_mut(vm.heap);
         let removed_entry = storage.entries.remove(index);
-        storage.indices.clear();
-        for (idx, e) in storage.entries.iter().enumerate() {
-            storage.indices.insert_unique(e.hash, idx, |&i| storage.entries[i].hash);
+        {
+            let mut indices = storage.indices.borrow_mut();
+            indices.clear();
+            for (idx, e) in storage.entries.iter().enumerate() {
+                indices.insert_unique(e.hash.get(), idx, |&i| storage.entries[i].hash.get());
+            }
         }
 
         removed_entry.value.drop_with(vm);
@@ -174,6 +215,8 @@ impl<'h> HeapRead<'h, SetStorage> {
     ///
     /// Returns `Err(KeyError)` if the set is empty.
     fn pop(&mut self, vm: &mut VM<'h>) -> RunResult<Value> {
+        // The hash-table removal below reads the entry's hash, so it must be fresh.
+        self.ensure_indices(vm)?;
         if self.get(vm.heap).is_empty() {
             return Err(ExcType::key_error_pop_empty_set());
         }
@@ -185,7 +228,8 @@ impl<'h> HeapRead<'h, SetStorage> {
         // Remove from hash table
         storage
             .indices
-            .find_entry(entry.hash, |&idx| idx == storage.entries.len())
+            .borrow_mut()
+            .find_entry(entry.hash.get(), |&idx| idx == storage.entries.len())
             .expect("entry must exist")
             .remove();
 
@@ -195,22 +239,26 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// Removes all elements from the set.
     fn clear(&mut self, vm: &mut VM<'h>) {
         let entries = mem::take(&mut self.get_mut(vm.heap).entries);
-        self.get_mut(vm.heap).indices.clear();
+        self.get_mut(vm.heap).indices.borrow_mut().clear();
         entries.drop_with(vm);
     }
 }
 
 impl SetStorage {
     /// Creates a deep clone with proper reference counting.
+    ///
+    /// Clones the indices and hash cells as-is, so a stale source produces an
+    /// equally stale clone (rebuilt lazily) and a fresh source a fresh one.
     fn clone_with_heap(&self, heap: &impl ContainsHeap) -> Self {
         Self {
-            indices: self.indices.clone(),
+            indices: RefCell::new(self.indices.borrow().clone()),
+            stale: self.stale.clone(),
             entries: self
                 .entries
                 .iter()
                 .map(|entry| SetEntry {
                     value: entry.value.clone_with_heap(heap),
-                    hash: entry.hash,
+                    hash: entry.hash.clone(),
                 })
                 .collect(),
         }
@@ -220,13 +268,14 @@ impl SetStorage {
 impl<'h> HeapRead<'h, SetStorage> {
     /// Checks if the set contains a value.
     pub fn contains(&self, value: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        self.ensure_indices(vm)?;
         let hash = set_element_hash(value, vm)?;
 
         // Collect candidates by hash
         let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
         let storage = &self.get(vm.heap);
-        storage.indices.find(hash, |&idx| {
-            if storage.entries[idx].hash == hash {
+        storage.indices.borrow().find(hash, |&idx| {
+            if storage.entries[idx].hash.get() == hash {
                 candidates.push(idx);
             }
             false
@@ -242,6 +291,37 @@ impl<'h> HeapRead<'h, SetStorage> {
         }
 
         Ok(false)
+    }
+
+    /// Rebuilds the per-entry hash cells and the `indices` table if they are
+    /// stale — either because this storage was just deserialized or because it
+    /// was built by `from_entries` (hashes never cross storage boundaries or
+    /// the wire; each storage computes its own).
+    ///
+    /// Must be called before consulting `indices`. Works for heap-resident
+    /// and `Heap::protect`-wrapped detached storages alike. No-op when fresh.
+    fn ensure_indices(&self, vm: &mut VM<'h>) -> RunResult<()> {
+        if !self.get(vm.heap).indices_stale() {
+            return Ok(());
+        }
+        // Phase 1: recompute each element's hash. Elements are cloned out (and
+        // defer-dropped) because hashing needs `&mut VM` and may read the heap
+        // (tuples, frozensets), so no storage borrow can be held across it.
+        let len = self.get(vm.heap).entries.len();
+        for i in 0..len {
+            let value = self.get(vm.heap).entries[i].value.clone_with_heap(vm.heap);
+            defer_drop!(value, vm);
+            let hash = set_element_hash(value, vm)?;
+            self.get(vm.heap).entries[i].hash.set(hash);
+        }
+        // Phase 2: rebuild the index table from the fresh hashes.
+        let storage = self.get(vm.heap);
+        let mut indices = storage.indices.borrow_mut();
+        for (idx, e) in storage.entries.iter().enumerate() {
+            indices.insert_unique(e.hash.get(), idx, |&i| storage.entries[i].hash.get());
+        }
+        storage.stale.set(false);
+        Ok(())
     }
 }
 
@@ -702,6 +782,7 @@ impl<'h> HeapRead<'h, Set> {
     /// Uses a two-phase lookup (collect candidates, then compare) to avoid
     /// holding a borrow on the set storage during `py_eq` calls.
     pub fn add(&mut self, value: Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        self.storage().ensure_indices(vm)?;
         let mut value_guard = DropGuard::new(value, vm);
         let (value, vm) = value_guard.as_parts();
         let hash = set_element_hash(value, vm)?;
@@ -709,8 +790,8 @@ impl<'h> HeapRead<'h, Set> {
         // Collect candidate indices to avoid borrow conflict between set storage and py_eq
         let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
         let storage = &self.get(vm.heap).0;
-        storage.indices.find(hash, |&idx| {
-            if storage.entries[idx].hash == hash {
+        storage.indices.borrow().find(hash, |&idx| {
+            if storage.entries[idx].hash.get() == hash {
                 candidates.push(idx);
             }
             false
@@ -728,10 +809,14 @@ impl<'h> HeapRead<'h, Set> {
         let (value, vm) = value_guard.into_parts();
         let storage = &mut self.get_mut(vm.heap).0;
         let index = storage.entries.len();
-        storage.entries.push(SetEntry { value, hash });
+        storage.entries.push(SetEntry {
+            value,
+            hash: Cell::new(hash),
+        });
         storage
             .indices
-            .insert_unique(hash, index, |&idx| storage.entries[idx].hash);
+            .borrow_mut()
+            .insert_unique(hash, index, |&idx| storage.entries[idx].hash.get());
         Ok(true)
     }
 
@@ -755,7 +840,7 @@ impl<'h> HeapRead<'h, Set> {
 
         if let Some(entries) = entries_opt {
             other.drop_with(vm);
-            for (value, _hash) in entries {
+            for value in entries {
                 self.add(value, vm)?;
             }
             return Ok(());
@@ -1472,7 +1557,9 @@ fn get_storage_from_set_operand(value: &Value, vm: &mut VM<'_>) -> RunResult<Opt
 }
 
 // Custom serde implementations for SetStorage, Set, and FrozenSet.
-// Only serialize entries; rebuild the indices hash table on deserialize.
+// Only element values are serialized — hashes and the indices table are
+// hasher/build-specific derived data, rebuilt lazily by `ensure_indices` on
+// first keyed access (so dumps stay stable across platforms and hasher changes).
 
 impl serde::Serialize for SetStorage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1483,12 +1570,13 @@ impl serde::Serialize for SetStorage {
 impl<'de> serde::Deserialize<'de> for SetStorage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let entries: Vec<SetEntry> = serde::Deserialize::deserialize(deserializer)?;
-        // Rebuild the indices hash table from the entries
-        let mut indices = HashTable::with_capacity(entries.len());
-        for (idx, entry) in entries.iter().enumerate() {
-            indices.insert_unique(entry.hash, idx, |&i| entries[i].hash);
-        }
-        Ok(Self { indices, entries })
+        // `stale` marks the empty indices (and zeroed entry hashes) for the
+        // lazy rebuild on first keyed access.
+        Ok(Self {
+            indices: RefCell::new(HashTable::new()),
+            stale: Cell::new(!entries.is_empty()),
+            entries,
+        })
     }
 }
 

@@ -189,10 +189,11 @@ pub(crate) enum HeapData {
 }
 
 // `HeapData` is memcpy'd on every allocate and free, so its inline size is paid on
-// the hottest heap paths. `Dict` — far too hot to box — sets the 72-byte payload
-// ceiling (currently tag-free thanks to niche packing); if this assertion fails a
-// variant has outgrown it and should be boxed (or, for `Dict` itself, slimmed down).
-const _: () = assert!(mem::size_of::<HeapData>() <= 80);
+// the hottest heap paths. `Dict` — far too hot to box — sets the payload ceiling;
+// if this assertion fails a variant has outgrown it and should be boxed (or, for
+// `Dict` itself, slimmed down). `Dict`'s lazy-rebuild `RefCell` currently costs it
+// both the borrow flag and (via `UnsafeCell`) niche packing of the tag: 72 -> 88.
+const _: () = assert!(mem::size_of::<HeapData>() <= 88);
 
 impl HeapData {
     /// Returns whether this heap data type can participate in reference cycles.

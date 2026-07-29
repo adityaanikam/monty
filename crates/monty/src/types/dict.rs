@@ -1,4 +1,8 @@
-use std::{fmt::Write, mem, slice, vec};
+use std::{
+    cell::{Cell, RefCell},
+    fmt::Write,
+    mem, slice, vec,
+};
 
 use hashbrown::HashTable;
 use serde::ser::SerializeStruct;
@@ -63,8 +67,14 @@ use crate::{
 /// improving GC performance for dicts of primitives.
 #[derive(Debug, Default)]
 pub(crate) struct Dict {
-    /// indices mapping from the entry hash to its index.
-    indices: HashTable<usize>,
+    /// Indices mapping from the entry hash to its index. Derived data: never
+    /// serialized, rebuilt lazily after deserialize (see [`Dict::indices_stale`]).
+    /// `RefCell` so the rebuild can run behind `&self` heap handles.
+    indices: RefCell<HashTable<usize>>,
+    /// True when `indices`/entry hashes need a rebuild (set only by
+    /// deserialize). A `Cell<bool>` so the hot-path staleness check is a
+    /// plain byte load instead of a `RefCell` borrow cycle.
+    stale: Cell<bool>,
     /// entries is a dense vec maintaining entry order.
     entries: Vec<DictEntry>,
     /// True if any key or value in the dict is a `Value::Ref`. Used to skip iteration
@@ -138,8 +148,12 @@ impl DictKind {
 struct DictEntry {
     key: Value,
     value: Value,
-    /// the hash is needed here for correct use of insert_unique
-    hash: u64,
+    /// The key's hash, needed for correct use of `insert_unique`. Skipped on
+    /// serde — hashes are hasher/build-specific so they never cross the wire;
+    /// recomputed together with `indices` by `ensure_indices`. `Cell` so the
+    /// lazy rebuild can run behind `&self` heap handles.
+    #[serde(skip)]
+    hash: Cell<u64>,
 }
 
 impl Dict {
@@ -151,7 +165,8 @@ impl Dict {
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: HashTable::with_capacity(capacity),
+            indices: RefCell::new(HashTable::with_capacity(capacity)),
+            stale: Cell::new(false),
             entries: Vec::with_capacity(capacity),
             contains_refs: false,
             kind: DictKind::plain(),
@@ -274,6 +289,16 @@ impl Dict {
         self.contains_refs
     }
 
+    /// True when `indices` (and the per-entry hash cells) must be rebuilt —
+    /// i.e. this dict was just deserialized (hashes never cross the wire).
+    ///
+    /// Rebuild via `ensure_indices` wherever a VM is available; VM-less
+    /// readers must fall back to a linear scan.
+    #[inline]
+    fn indices_stale(&self) -> bool {
+        self.stale.get()
+    }
+
     /// Creates a dict from a vector of (key, value) pairs.
     ///
     /// Assumes the caller is transferring ownership of all keys and values in the pairs.
@@ -305,6 +330,9 @@ impl Dict {
     /// and are released here if the insertion exceeds the memory limit.
     pub fn set_json_string_key(&mut self, key: Value, value: Value, vm: &mut VM<'_>) -> RunResult<Option<Value>> {
         debug_assert!(json_key_string_slice(&key, vm.heap, vm.interns).is_some());
+        // Only called on dicts under construction by the JSON decoder, which
+        // are never deserialized-stale.
+        debug_assert!(!self.indices_stale());
 
         if matches!(key, Value::Ref(_)) || matches!(value, Value::Ref(_)) {
             self.contains_refs = true;
@@ -316,7 +344,11 @@ impl Dict {
             .raw();
         let opt_index = self.find_json_string_key_index(hash, &key, vm.heap, vm.interns);
 
-        let entry = DictEntry { key, value, hash };
+        let entry = DictEntry {
+            key,
+            value,
+            hash: Cell::new(hash),
+        };
         if let Some(index) = opt_index {
             let old_entry = mem::replace(&mut self.entries[index], entry);
             old_entry.key.drop_with(vm);
@@ -324,7 +356,9 @@ impl Dict {
         } else {
             let index = self.entries.len();
             self.entries.push(entry);
-            self.indices.insert_unique(hash, index, |&i| self.entries[i].hash);
+            self.indices
+                .borrow_mut()
+                .insert_unique(hash, index, |&i| self.entries[i].hash.get());
             Ok(None)
         }
     }
@@ -336,9 +370,10 @@ impl Dict {
     fn find_json_string_key_index(&self, hash: u64, key: &Value, heap: &Heap, interns: &Interns) -> Option<usize> {
         let key_str = json_key_string_slice(key, heap, interns).expect("json object keys are always string values");
         self.indices
+            .borrow()
             .find(hash, |&idx| {
                 let entry = &self.entries[idx];
-                entry.hash == hash && json_key_equals_str(&entry.key, key_str, heap, interns)
+                entry.hash.get() == hash && json_key_equals_str(&entry.key, key_str, heap, interns)
             })
             .copied()
     }
@@ -461,28 +496,34 @@ impl Dict {
     ///
     /// This is an O(1) lookup that doesn't require mutable heap access.
     /// Only works for string keys - returns None if the key is not found.
+    ///
+    /// This is the one keyed lookup with no VM in scope, so it cannot rebuild
+    /// stale indices after a deserialize — it degrades to a linear scan until
+    /// some VM-bearing operation rebuilds them.
     pub fn get_by_str(&self, key_str: &str, heap: &Heap, interns: &Interns) -> Option<&Value> {
-        // Use the canonical string hash so the lookup matches stored entry
-        // hashes exactly, including the `u64::MAX` sentinel remapping.
-        let hash = hash_python_str(key_str).raw();
-
-        // Find entry with matching hash and key
-        self.indices
-            .find(hash, |&idx| {
-                let entry_key = &self.entries[idx].key;
-                match entry_key {
-                    Value::InternString(id) => interns.get_str(*id) == key_str,
-                    Value::Ref(id) => {
-                        if let HeapData::Str(s) = heap.get(*id) {
-                            s.as_str() == key_str
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
+        let key_eq = |key: &Value| match key {
+            Value::InternString(id) => interns.get_str(*id) == key_str,
+            Value::Ref(id) => {
+                if let HeapData::Str(s) = heap.get(*id) {
+                    s.as_str() == key_str
+                } else {
+                    false
                 }
-            })
-            .map(|&idx| &self.entries[idx].value)
+            }
+            _ => false,
+        };
+
+        if self.indices_stale() {
+            self.entries.iter().find(|e| key_eq(&e.key)).map(|e| &e.value)
+        } else {
+            // Use the canonical string hash so the lookup matches stored entry
+            // hashes exactly, including the `u64::MAX` sentinel remapping.
+            let hash = hash_python_str(key_str).raw();
+            self.indices
+                .borrow()
+                .find(hash, |&idx| key_eq(&self.entries[idx].key))
+                .map(|&idx| &self.entries[idx].value)
+        }
     }
 
     /// Sets a key-value pair in the dict.
@@ -528,7 +569,11 @@ impl<'h> HeapRead<'h, Dict> {
             }
         };
 
-        let entry = DictEntry { key, value, hash };
+        let entry = DictEntry {
+            key,
+            value,
+            hash: Cell::new(hash),
+        };
         if let Some(index) = opt_index {
             // Key exists, replace in place to preserve insertion order
             let old_entry = mem::replace(&mut self.get_mut(vm.heap).entries[index], entry);
@@ -542,7 +587,8 @@ impl<'h> HeapRead<'h, Dict> {
             let index = this.entries.len();
             this.entries.push(entry);
             this.indices
-                .insert_unique(hash, index, |index| this.entries[*index].hash);
+                .borrow_mut()
+                .insert_unique(hash, index, |index| this.entries[*index].hash.get());
             Ok(None)
         }
     }
@@ -563,9 +609,10 @@ impl<'h> HeapRead<'h, Dict> {
             let entry = self.get_mut(vm.heap).entries.remove(index);
             // Remove from index table and rebuild (same as dict_popitem)
             let this = self.get_mut(vm.heap);
-            this.indices.clear();
+            let mut indices = this.indices.borrow_mut();
+            indices.clear();
             for (idx, e) in this.entries.iter().enumerate() {
-                this.indices.insert_unique(e.hash, idx, |&i| this.entries[i].hash);
+                indices.insert_unique(e.hash.get(), idx, |&i| this.entries[i].hash.get());
             }
             Ok(Some((entry.key, entry.value)))
         } else {
@@ -670,6 +717,7 @@ struct DictInitArgs {
 
 impl<'h> HeapRead<'h, Dict> {
     fn find_index_hash(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<(Option<usize>, u64)> {
+        self.ensure_indices(vm)?;
         let hash = key
             .py_hash(vm)?
             .ok_or_else(|| ExcType::type_error_unhashable_dict_key(&key.py_type_name(vm)))?
@@ -682,8 +730,8 @@ impl<'h> HeapRead<'h, Dict> {
         // Collect candidate indices during the lookup to avoid borrow tracker issues
         let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
         let this = self.get(vm.heap);
-        this.indices.find(hash, |v| {
-            if this.entries[*v].hash == hash {
+        this.indices.borrow().find(hash, |v| {
+            if this.entries[*v].hash.get() == hash {
                 candidates.push(*v);
             }
             false
@@ -698,6 +746,40 @@ impl<'h> HeapRead<'h, Dict> {
         }
 
         Ok((None, hash))
+    }
+
+    /// Rebuilds the per-entry hash cells and the `indices` table if they are
+    /// stale (i.e. this dict was just deserialized — hashes never cross the
+    /// serialization boundary, each build recomputes with its own hasher).
+    ///
+    /// Must be called before consulting `indices` from any VM-bearing path.
+    /// No-op for dicts constructed in this process.
+    fn ensure_indices(&self, vm: &mut VM<'h>) -> RunResult<()> {
+        if !self.get(vm.heap).indices_stale() {
+            return Ok(());
+        }
+        // Phase 1: recompute each key's hash. Keys are cloned out (and
+        // defer-dropped) because `py_hash` needs `&mut VM` and may read the
+        // heap (tuple keys, frozen dataclasses), so no dict borrow can be
+        // held across it.
+        let len = self.get(vm.heap).entries.len();
+        for i in 0..len {
+            let key = self.get(vm.heap).entries[i].key.clone_with_heap(vm.heap);
+            defer_drop!(key, vm);
+            let hash = key
+                .py_hash(vm)?
+                .expect("deserialized dict keys were hashable when inserted")
+                .raw();
+            self.get(vm.heap).entries[i].hash.set(hash);
+        }
+        // Phase 2: rebuild the index table from the fresh hashes.
+        let this = self.get(vm.heap);
+        let mut indices = this.indices.borrow_mut();
+        for (idx, e) in this.entries.iter().enumerate() {
+            indices.insert_unique(e.hash.get(), idx, |&i| this.entries[i].hash.get());
+        }
+        this.stale.set(false);
+        Ok(())
     }
 
     /// Checks whether the dict contains a given key.
@@ -1535,7 +1617,7 @@ impl<C: ContainsHeap> DropWithContext<C> for DictEntry {
 ///
 /// Removes all items from the dict.
 fn dict_clear<'h>(dict: &mut HeapRead<'h, Dict>, vm: &mut VM<'h>) {
-    dict.get_mut(vm.heap).indices.clear();
+    dict.get_mut(vm.heap).indices.borrow_mut().clear();
     mem::take(&mut dict.get_mut(vm.heap).entries).drop_with(vm.heap);
     // Note: contains_refs stays true even if all refs removed, per conservative GC strategy
 }
@@ -1720,6 +1802,8 @@ fn dict_setdefault<'h>(dict: &mut HeapRead<'h, Dict>, args: ArgValues, vm: &mut 
 /// Removes and returns the last inserted key-value pair as a tuple.
 /// Raises KeyError if the dict is empty.
 fn dict_popitem<'h>(dict: &mut HeapRead<'h, Dict>, vm: &mut VM<'h>) -> RunResult<Value> {
+    // The rebuild below reads per-entry hashes, so they must be fresh.
+    dict.ensure_indices(vm)?;
     let this = dict.get_mut(vm.heap);
     if this.is_empty() {
         return Err(ExcType::key_error_popitem_empty_dict());
@@ -1733,9 +1817,12 @@ fn dict_popitem<'h>(dict: &mut HeapRead<'h, Dict>, vm: &mut VM<'h>) -> RunResult
     // (This is simpler than trying to find and remove the specific hash entry)
     // TODO: This O(n) rebuild could be optimized by finding and removing the
     // specific hash entry directly from the hashbrown table.
-    this.indices.clear();
-    for (idx, e) in this.entries.iter().enumerate() {
-        this.indices.insert_unique(e.hash, idx, |&i| this.entries[i].hash);
+    {
+        let mut indices = this.indices.borrow_mut();
+        indices.clear();
+        for (idx, e) in this.entries.iter().enumerate() {
+            indices.insert_unique(e.hash.get(), idx, |&i| this.entries[i].hash.get());
+        }
     }
 
     // Create tuple (key, value)
@@ -1743,7 +1830,9 @@ fn dict_popitem<'h>(dict: &mut HeapRead<'h, Dict>, vm: &mut VM<'h>) -> RunResult
 }
 
 // Custom serde implementation for Dict.
-// Serializes entries, contains_refs, and kind; rebuilds the indices hash table on deserialize.
+// Serializes entries, contains_refs and kind only — hashes and the indices table
+// are hasher/build-specific derived data, rebuilt lazily by `ensure_indices` on
+// first keyed access (so dumps stay stable across platforms and hasher changes).
 impl serde::Serialize for Dict {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("Dict", 3)?;
@@ -1763,13 +1852,11 @@ impl<'de> serde::Deserialize<'de> for Dict {
             kind: DictKind,
         }
         let fields = DictFields::deserialize(deserializer)?;
-        // Rebuild the indices hash table from the entries
-        let mut indices = HashTable::with_capacity(fields.entries.len());
-        for (idx, entry) in fields.entries.iter().enumerate() {
-            indices.insert_unique(entry.hash, idx, |&i| fields.entries[i].hash);
-        }
+        // `stale` marks the empty indices (and zeroed entry hashes) for the
+        // lazy rebuild on first keyed access.
         Ok(Self {
-            indices,
+            indices: RefCell::new(HashTable::new()),
+            stale: Cell::new(!fields.entries.is_empty()),
             entries: fields.entries,
             contains_refs: fields.contains_refs,
             kind: fields.kind,
