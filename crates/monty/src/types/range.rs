@@ -4,11 +4,11 @@
 //! with configurable start, stop, and step values.
 
 use std::{
-    collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
 };
 
+use ahash::AHasher;
 use num_integer::div_ceil;
 
 use crate::{
@@ -297,7 +297,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
         // and `range(0, 2, 2)`.
         let r = self.get(vm.heap);
         let len = r.len();
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         len.hash(&mut hasher);
         if len > 0 {
             r.start.hash(&mut hasher);

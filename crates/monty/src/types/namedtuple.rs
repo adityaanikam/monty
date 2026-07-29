@@ -1,12 +1,13 @@
 use std::{
     cell::Cell,
     cmp::Ordering,
-    collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
     iter::once,
     mem,
 };
+
+use ahash::AHasher;
 
 /// Python named tuple type, combining tuple-like indexing with named attribute access.
 ///
@@ -478,7 +479,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         if let Some(cached) = self.get(vm.heap).cached_hash.get() {
             return Ok(Some(cached));
         }
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         let iter = self.iter(vm)?;
         defer_drop_mut!(iter, vm);
         while let Some(item) = iter.next(vm)? {

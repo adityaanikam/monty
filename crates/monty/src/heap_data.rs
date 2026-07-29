@@ -1,11 +1,11 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
     mem,
     ops::Deref,
 };
 
+use ahash::AHasher;
 use monty_types::ExcType;
 
 use crate::{
@@ -798,12 +798,12 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             else {
                 match self {
                     Self::Closure(c) => {
-                        let mut hasher = DefaultHasher::new();
+                        let mut hasher = AHasher::default();
                         c.get(vm.heap).func_id.hash(&mut hasher);
                         Ok(Some(HashValue::new(hasher.finish())))
                     }
                     Self::FunctionDefaults(fd) => {
-                        let mut hasher = DefaultHasher::new();
+                        let mut hasher = AHasher::default();
                         fd.get(vm.heap).func_id.hash(&mut hasher);
                         Ok(Some(HashValue::new(hasher.finish())))
                     }

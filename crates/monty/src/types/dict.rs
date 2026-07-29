@@ -1,9 +1,4 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    fmt::Write,
-    hash::{Hash, Hasher},
-    mem, slice, vec,
-};
+use std::{fmt::Write, mem, slice, vec};
 
 use hashbrown::HashTable;
 use serde::ser::SerializeStruct;
@@ -16,6 +11,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunResult},
     expressions::CmpOperator,
+    hash::hash_python_str,
     heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     modules::collections::{
@@ -466,10 +462,9 @@ impl Dict {
     /// This is an O(1) lookup that doesn't require mutable heap access.
     /// Only works for string keys - returns None if the key is not found.
     pub fn get_by_str(&self, key_str: &str, heap: &Heap, interns: &Interns) -> Option<&Value> {
-        // Compute hash for the string key
-        let mut hasher = DefaultHasher::new();
-        key_str.hash(&mut hasher);
-        let hash = hasher.finish();
+        // Use the canonical string hash so the lookup matches stored entry
+        // hashes exactly, including the `u64::MAX` sentinel remapping.
+        let hash = hash_python_str(key_str).raw();
 
         // Find entry with matching hash and key
         self.indices

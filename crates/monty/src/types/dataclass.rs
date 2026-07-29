@@ -1,8 +1,9 @@
 use std::{
     fmt::Write,
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
 };
 
+use ahash::AHasher;
 use serde::ser::SerializeStruct;
 
 use super::{Dict, LazyHeapSet, PyTrait, attribute_name_value};
@@ -187,7 +188,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
         }
         let mut guard = vm.recursion_guard()?;
         let vm = &mut *guard;
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         // Hash the class name
         self.get(vm.heap).name.hash(&mut hasher);
         // Hash each declared field (name, value) pair in order

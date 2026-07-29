@@ -1,12 +1,12 @@
 use std::{
     cell::Cell,
     cmp::Ordering,
-    collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
     mem,
 };
 
+use ahash::AHasher;
 /// Python tuple type using `SmallVec` for inline storage of small tuples.
 ///
 /// This type provides Python tuple semantics. Tuples are immutable sequences
@@ -368,7 +368,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
         if let Some(cached) = self.get(vm.heap).cached_hash.get() {
             return Ok(Some(cached));
         }
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         let iter = self.iter(vm)?;
         defer_drop_mut!(iter, vm);
         while let Some(item) = iter.next(vm)? {

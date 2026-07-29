@@ -24,13 +24,13 @@
 //!   time for any non-trivial program).
 
 use std::{
-    collections::hash_map::DefaultHasher,
     fmt,
     hash::{Hash, Hasher},
     num::NonZero,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use ahash::AHasher;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use strum::EnumCount;
@@ -124,14 +124,17 @@ impl<'de> serde::Deserialize<'de> for HashValue {
     }
 }
 
-/// Hashes any `Hash` value with a fresh [`DefaultHasher`].
+/// Hashes any `Hash` value with a fresh [`AHasher`].
 ///
 /// Keeps the hasher boilerplate in one place for the cold `Value::py_hash` arms
 /// (builtins, functions, markers, singletons), so the hot arms (int/str/ref)
 /// never pay for constructing a hasher they don't use.
+///
+/// `AHasher::default()` uses fixed keys, so hashes are deterministic within a
+/// build — required because dict snapshots store raw entry hashes.
 #[inline]
 pub(crate) fn hash_one(value: impl Hash) -> HashValue {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = AHasher::default();
     value.hash(&mut hasher);
     HashValue::new(hasher.finish())
 }
@@ -140,7 +143,7 @@ pub(crate) fn hash_one(value: impl Hash) -> HashValue {
 ///
 /// The canonical hash for objects that compare by identity — user classes,
 /// instances, bound methods, and cells (CPython's default for objects without
-/// a user `__hash__`). Keeps the `DefaultHasher` boilerplate in one place.
+/// a user `__hash__`). Keeps the hasher boilerplate in one place.
 #[inline]
 pub(crate) fn identity_hash(id: HeapId) -> HashValue {
     hash_one(id)
@@ -153,7 +156,7 @@ pub(crate) fn identity_hash(id: HeapId) -> HashValue {
 /// for dict-key consistency.
 #[inline]
 pub(crate) fn hash_python_str(s: &str) -> HashValue {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = AHasher::default();
     s.hash(&mut hasher);
     HashValue::new(hasher.finish())
 }
@@ -164,7 +167,7 @@ pub(crate) fn hash_python_str(s: &str) -> HashValue {
 /// and the interned bytes table.
 #[inline]
 pub(crate) fn hash_python_bytes(b: &[u8]) -> HashValue {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = AHasher::default();
     b.hash(&mut hasher);
     HashValue::new(hasher.finish())
 }
@@ -173,7 +176,7 @@ pub(crate) fn hash_python_bytes(b: &[u8]) -> HashValue {
 ///
 /// For values that fit in `i64`, returns `i.cast_unsigned()` so that
 /// `hash(LongInt(5)) == hash(Value::Int(5))`. For larger values, falls back
-/// to hashing `(sign, little-endian bytes)` via [`DefaultHasher`].
+/// to hashing `(sign, little-endian bytes)` via [`AHasher`].
 ///
 /// Used by heap `LongInt::py_hash` and by `Interns::long_int_hash` so that
 /// interned and heap-allocated long ints with equal value hash identically.
@@ -182,7 +185,7 @@ pub(crate) fn hash_python_long_int(bi: &BigInt) -> HashValue {
     if let Some(i) = bi.to_i64() {
         HashValue::new(i.cast_unsigned())
     } else {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         let (sign, bytes) = bi.to_bytes_le();
         sign.hash(&mut hasher);
         bytes.hash(&mut hasher);
