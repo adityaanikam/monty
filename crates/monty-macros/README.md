@@ -64,9 +64,12 @@ looking at how the function is implemented in CPython:
 
 Style-derived behaviour that used to be separate flags: the C
 "… positional arguments …" overflow pivot turns on automatically for
-`style = c` structs with `kw_only` fields (CPython's `vgetargskeywords`
-behaves the same way), and `unpack` collapses to the exact-arity
-`expected N argument(s)` wording when no positional field has a default.
+`style = c` and `style = c_named` structs with `kw_only` fields (CPython's
+`vgetargskeywords` / `_PyArg_UnpackKeywords` behave the same way; the named
+variant additionally says `takes exactly N positional argument(s)` when every
+positional param is required, e.g. `os.stat`), and `unpack` collapses to the
+exact-arity `expected N argument(s)` wording when no positional field has a
+default.
 
 Since CPython's `def` binding never type-checks, `style = def` structs
 should declare fields as raw `Value` (or `StrArg`-in-body) and coerce in the
@@ -133,6 +136,7 @@ Cross-crate use would need `proc-macro-crate` plus switching to
 ## Monty crates
 
 - [`monty`](https://crates.io/crates/monty) — the core interpreter: Python parser, bytecode VM, and sandbox.
+- [`monty-types`](https://crates.io/crates/monty-types) — the shared boundary data types (values, exceptions, OS calls, resource limits) hosts use without linking the interpreter.
 - [`monty-fs`](https://crates.io/crates/monty-fs) — host-side filesystem mounts: maps virtual sandbox paths to real host directories.
 - [`monty-runtime`](https://crates.io/crates/monty-runtime) — the `monty` binary: REPL, file runner, and subprocess worker mode.
 - [`monty-pool`](https://crates.io/crates/monty-pool) — an elastic pool of crash-isolated `monty` worker subprocesses.

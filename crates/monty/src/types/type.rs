@@ -6,16 +6,16 @@ use crate::{
     args::{ArgValues, FromArgs, is_long_int},
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcType, RunError, RunResult, SimpleException},
+    exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     heap::{DropWithContext, Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings, StringId},
-    resource::ResourceTracker,
+    modules::collections,
     types::{
-        AttrCallResult, Bytes, Dict, FrozenSet, List, LongInt, MontyIter, Path, PyTrait, Range, Set, Slice, Str,
-        TimeZone, Tuple,
+        AttrCallResult, Bytes, Deque, Dict, FrozenSet, List, LongInt, Path, PyTrait, Range, Set, Slice, Str, TimeZone,
+        Tuple,
         bytes::{bytes_fromhex, bytes_repr},
         date, datetime,
-        dict::dict_fromkeys,
+        dict::{DictKind, dict_fromkeys},
         instance::class_name,
         long_int::INT_MAX_STR_DIGITS,
         str::StringRepr,
@@ -68,6 +68,13 @@ pub enum Type {
     Tuple,
     NamedTuple,
     Dict,
+    /// `collections.defaultdict` — a `dict` with a `default_factory` (stored as
+    /// a `DictKind` on the `Dict`, not a separate heap type).
+    #[strum(serialize = "collections.defaultdict")]
+    DefaultDict,
+    /// `collections.Counter` — a `dict` subclass (also a `DictKind`).
+    #[strum(serialize = "Counter")]
+    Counter,
     #[strum(serialize = "dict_keys")]
     DictKeys,
     #[strum(serialize = "dict_items")]
@@ -139,6 +146,41 @@ pub enum Type {
     /// A regex match result from `re.match()` / `re.search()` etc. - displays as "re.Match"
     #[strum(serialize = "re.Match")]
     ReMatch,
+    // Serialized enum variants are append-only to preserve postcard discriminants.
+    #[strum(serialize = "tuple_iterator")]
+    TupleIterator,
+    #[strum(serialize = "str_ascii_iterator")]
+    StrAsciiIterator,
+    #[strum(serialize = "str_iterator")]
+    StrIterator,
+    #[strum(serialize = "bytes_iterator")]
+    BytesIterator,
+    #[strum(serialize = "range_iterator")]
+    RangeIterator,
+    #[strum(serialize = "dict_keyiterator")]
+    DictKeyIterator,
+    #[strum(serialize = "dict_itemiterator")]
+    DictItemIterator,
+    #[strum(serialize = "dict_valueiterator")]
+    DictValueIterator,
+    #[strum(serialize = "set_iterator")]
+    SetIterator,
+    #[strum(serialize = "itertools.count")]
+    ItertoolsCount,
+    #[strum(serialize = "itertools.repeat")]
+    ItertoolsRepeat,
+    /// A `dataclasses.Field` from a class's `__dataclass_fields__` — displays
+    /// as "Field", the name CPython's `Field.__name__` reports.
+    #[strum(serialize = "Field")]
+    DataclassField,
+    /// `collections.deque` — qualified like `datetime.datetime`/`re.Pattern` so
+    /// the name matches CPython's `repr` and error messages; only `__name__`
+    /// diverges from CPython's bare `'deque'`. See `limitations/collections.md`.
+    #[strum(serialize = "collections.deque")]
+    Deque,
+    /// `iter(deque(...))` — CPython's `_collections._deque_iterator`.
+    #[strum(serialize = "_collections._deque_iterator")]
+    DequeIterator,
 }
 
 /// Writes the canonical static name of every non-[`Instance`](Type::Instance)
@@ -175,7 +217,7 @@ impl Type {
     /// class names are cloned into `Cow::Owned`), so it can be captured
     /// before heap-mutating cleanup (`drop_with`) at error sites and
     /// formatted after.
-    pub(crate) fn name<'i>(self, heap: &Heap<impl ResourceTracker>, interns: &'i Interns) -> Cow<'i, str> {
+    pub(crate) fn name<'i>(self, heap: &Heap, interns: &'i Interns) -> Cow<'i, str> {
         match self {
             Self::Instance(class_id) => class_name(class_id, heap, interns),
             Self::Exception(exc_type) => Cow::Borrowed(exc_type.into()),
@@ -189,7 +231,7 @@ impl Type {
     /// `arg == Py_None ? "None" : Py_TYPE(arg)->tp_name`, and since `NoneType`
     /// is a singleton, branching on the type is equivalent to branching on the
     /// value. Use for the "not Y" half of arg-type error messages only.
-    pub(crate) fn cpython_arg_name<'i>(self, heap: &Heap<impl ResourceTracker>, interns: &'i Interns) -> Cow<'i, str> {
+    pub(crate) fn cpython_arg_name<'i>(self, heap: &Heap, interns: &'i Interns) -> Cow<'i, str> {
         match self {
             Self::NoneType => Cow::Borrowed("None"),
             other => other.name(heap, interns),
@@ -253,27 +295,26 @@ impl Type {
         }
     }
 
-    /// The inverse of `Display`: resolves any string it produces back to the
-    /// `Type`, including internal names (`"iterator"`,
-    /// `"_io.TextIOWrapper"`, ...) and exception types.
-    ///
-    /// Unlike [`Type::from_builtin_name`] this is NOT restricted to nameable
-    /// builtins — it exists for boundaries that serialize a type by its
-    /// display name (e.g. the subprocess wire protocol) and must round-trip
-    /// every variant; the round-trip is enforced by a test over all variants.
-    /// [`Instance`](Self::Instance) is intentionally excluded (`"object"`
-    /// returns `None`): its `HeapId` payload cannot be reconstructed from a
-    /// name, and no boundary may carry it.
+    /// Returns whether this is one of Python's concrete iterator types.
     #[must_use]
-    pub(crate) fn from_type_name(name: &str) -> Option<Self> {
-        // `EnumString` parses via the same strum `serialize` attributes that
-        // `IntoStaticStr`/`Display` render with, so the two stay in lockstep
-        // by construction. Exception types display as their exception name
-        // ("ValueError", "json.JSONDecodeError", ...) — fall back to the
-        // ExcType parser.
-        name.parse::<Self>()
-            .ok()
-            .or_else(|| name.parse::<ExcType>().ok().map(Self::Exception))
+    pub(crate) const fn is_iterator(self) -> bool {
+        matches!(
+            self,
+            Self::ListIterator
+                | Self::DequeIterator
+                | Self::TupleIterator
+                | Self::StrAsciiIterator
+                | Self::StrIterator
+                | Self::BytesIterator
+                | Self::RangeIterator
+                | Self::DictKeyIterator
+                | Self::DictItemIterator
+                | Self::DictValueIterator
+                | Self::SetIterator
+                | Self::CallableIterator
+                | Self::ItertoolsCount
+                | Self::ItertoolsRepeat
+        )
     }
 
     /// Checks if a value of type `self` is an instance of `other`.
@@ -290,6 +331,12 @@ impl Type {
             true
         } else if self == Self::DateTime && other == Self::Date {
             // datetime is a subtype of date in Python
+            true
+        } else if (self == Self::DefaultDict || self == Self::Counter) && other == Self::Dict {
+            // collections.defaultdict and collections.Counter subclass dict
+            true
+        } else if self == Self::NamedTuple && other == Self::Tuple {
+            // a namedtuple class is generated as a tuple subclass
             true
         } else {
             false
@@ -352,10 +399,23 @@ impl Type {
         self,
         method_id: StringId,
         args: ArgValues,
-        vm: &mut VM<'_, impl ResourceTracker>,
+        vm: &mut VM<'_>,
     ) -> RunResult<AttrCallResult> {
         match (self, method_id) {
-            (Self::Dict, m) if m == StaticStrings::Fromkeys => dict_fromkeys(args, vm).map(AttrCallResult::Value),
+            // Type-level `dict.fromkeys(...)`, so the result is a plain dict.
+            (Self::Dict, m) if m == StaticStrings::Fromkeys => {
+                dict_fromkeys(args, DictKind::Plain, vm).map(AttrCallResult::Value)
+            }
+            // `defaultdict.fromkeys(...)` builds `cls()`, i.e. a defaultdict with no
+            // factory — matching CPython's inherited `dict.fromkeys` classmethod.
+            (Self::DefaultDict, m) if m == StaticStrings::Fromkeys => {
+                dict_fromkeys(args, DictKind::Default(None), vm).map(AttrCallResult::Value)
+            }
+            // Counter deliberately disables the inherited classmethod.
+            (Self::Counter, m) if m == StaticStrings::Fromkeys => {
+                args.drop_with(vm);
+                Err(ExcType::not_implemented("Counter.fromkeys() is undefined.  Use Counter(iterable) instead.").into())
+            }
             (Self::Bytes, m) if m == StaticStrings::Fromhex => bytes_fromhex(args, vm).map(AttrCallResult::Value),
             (Self::Date, m) if m == StaticStrings::Today => date::class_today(vm.heap, args),
             (Self::Date, m) if m == StaticStrings::Fromisoformat => {
@@ -380,12 +440,15 @@ impl Type {
     ///
     /// Dispatches to the appropriate type's init method for container types,
     /// or handles primitive type conversions inline.
-    pub(crate) fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub(crate) fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         match self {
             // Container types - delegate to init methods
             Self::List => List::init(vm, args),
+            Self::Deque => Deque::init(vm, args),
             Self::Tuple => Tuple::init(vm, args),
             Self::Dict => Dict::init(vm, args),
+            Self::DefaultDict => collections::defaultdict_init(vm, args),
+            Self::Counter => collections::counter_init(vm, args),
             Self::Set => Set::init(vm, args),
             Self::FrozenSet => FrozenSet::init(vm, args),
             Self::Str => Str::init(vm, args),
@@ -396,7 +459,7 @@ impl Type {
             Self::DateTime => datetime::init(vm, args),
             Self::TimeDelta => timedelta::init(vm, args),
             Self::TimeZone => TimeZone::init(vm, args),
-            Self::Iterator => MontyIter::init(vm, args),
+            Self::Iterator => super::iter::init(vm, args),
             Self::Path => Path::init(vm, args),
 
             // Primitive types - inline implementation
@@ -508,7 +571,7 @@ struct IntArgs {
 
 /// Implements the `int()` constructor: numeric coercion, and str/bytes
 /// parsing with an optional base (auto-detected when `base=0`).
-fn int_init(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn int_init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let IntArgs { x, base } = IntArgs::from_args(args, vm)?;
     let Some(x) = x else {
         // `int()` → 0; `int(base=N)` complains about the missing value even
@@ -542,7 +605,7 @@ fn int_init(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult
 }
 
 /// `int(x)` with no base: numeric coercion plus base-10 str/bytes parsing.
-fn int_convert(x: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Value> {
+fn int_convert(x: &Value, vm: &mut VM<'_>) -> RunResult<Value> {
     let interns = vm.interns;
     match x {
         Value::Int(i) => Ok(Value::Int(*i)),
@@ -566,19 +629,15 @@ fn int_convert(x: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Va
 /// which *clamps* out-of-i64 ints instead of raising — so a `LongInt` base
 /// lands in the range error, not `OverflowError`; non-integers raise
 /// `TypeError` before the range is checked.
-fn int_base(base: Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<u32> {
-    let n = match &base {
+fn int_base(base: Value, vm: &mut VM<'_>) -> RunResult<u32> {
+    defer_drop!(base, vm);
+    let n = match base {
         Value::Bool(b) => i64::from(*b),
         Value::Int(i) => *i,
         // Clamped by PyNumber_AsSsize_t: any i64-overflowing int is out of range.
-        _ if is_long_int(&base, vm) => i64::MAX,
-        _ => {
-            let err = ExcType::type_error_not_integer(&base.py_type_name(vm));
-            base.drop_with(vm);
-            return Err(err);
-        }
+        _ if is_long_int(base, vm) => i64::MAX,
+        _ => return Err(ExcType::type_error_not_integer(&base.py_type_name(vm))),
     };
-    base.drop_with(vm);
     match u32::try_from(n) {
         Ok(0) => Ok(0),
         Ok(b @ 2..=36) => Ok(b),
@@ -591,7 +650,7 @@ fn int_base(base: Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<u32
 /// `base` is `0` (auto-detect from a `0x`/`0o`/`0b` prefix) or `2..=36`.
 /// Returns `Value::Int` if the value fits in i64, otherwise allocates a
 /// `LongInt` on the heap. Returns `ValueError` on failure.
-fn parse_int_from_str(value: &str, base: u32, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn parse_int_from_str(value: &str, base: u32, heap: &Heap) -> RunResult<Value> {
     // Fast path: plain base-10 literals parse directly (no whitespace,
     // underscores or prefix handling needed).
     if base == 10
@@ -617,7 +676,7 @@ fn parse_int_from_str(value: &str, base: u32, heap: &Heap<impl ResourceTracker>)
 ///
 /// Unlike `str`, bytes must not treat UTF-8 encodings of Unicode whitespace as
 /// separators. Failures repr the input as a bytes literal, matching CPython.
-fn parse_int_from_bytes(bytes: &[u8], base: u32, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn parse_int_from_bytes(bytes: &[u8], base: u32, heap: &Heap) -> RunResult<Value> {
     let invalid = || ExcType::value_error_invalid_literal_for_int(base, bytes_repr(bytes));
     match str::from_utf8(bytes.trim_ascii()) {
         Ok(s) => parse_int_digits(s, base, &invalid, heap),
@@ -637,12 +696,7 @@ enum IntScanState {
 
 /// Parses a whitespace-trimmed str/bytes int literal: sign, base prefix,
 /// underscore placement, digit limits, and BigInt promotion.
-fn parse_int_digits(
-    value: &str,
-    base: u32,
-    invalid: &impl Fn() -> RunError,
-    heap: &Heap<impl ResourceTracker>,
-) -> RunResult<Value> {
+fn parse_int_digits(value: &str, base: u32, invalid: &impl Fn() -> RunError, heap: &Heap) -> RunResult<Value> {
     let (negative, body) = match value.strip_prefix(['+', '-']) {
         Some(rest) => (value.starts_with('-'), rest),
         None => (false, value),

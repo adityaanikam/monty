@@ -29,7 +29,7 @@ install: .cargo install-py install-js ## Install the package, dependencies, and 
 	uvx prek install --install-hooks
 
 .PHONY: dev-py
-dev-py: ## Install the python package for development
+dev-py: install-py ## Install the python package for development
 	uv run maturin develop --uv -m crates/monty-runtime/Cargo.toml
 	uv run maturin develop --uv -m crates/monty-python/Cargo.toml
 
@@ -204,6 +204,10 @@ update-typeshed: ## Update vendored typeshed from upstream
 	uv run crates/monty-typeshed/update.py
 	uv run ruff format
 	uv run ruff check --fix --fix-only --silent
+
+.PHONY: check-typeshed
+check-typeshed: ## Check vendored typeshed stubs are in sync with upstream
+	uv run crates/monty-typeshed/check.py
 
 .PHONY: bench
 bench: ## Run benchmarks

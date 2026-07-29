@@ -6,21 +6,26 @@
 
 use std::mem;
 
+use monty_types::OsFunctionCall;
+
 use super::{CallFrame, VM, recursion::RunReentryGuard};
 use crate::{
     args::{ArgValues, KwargsValues},
     asyncio::Coroutine,
-    builtins::{Builtins, BuiltinsFunctions},
+    builtins::{Builtins, BuiltinsFunctions, BuiltinsFunctionsExt},
     bytecode::FrameExit,
     defer_drop,
-    exception_private::{ExcType, RunError},
+    exception_private::{ExcType, ExcTypeExt, RunError},
     function::Function,
-    heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId},
+    heap::{ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapReadOutput},
     heap_data::CellValue,
     intern::{FunctionId, StaticStrings, StringId},
-    os::OsFunctionCall,
-    resource::ResourceTracker,
-    types::{Dict, Instance, PyTrait, Type, bytes::call_bytes_method, instance::class_name, str::call_str_method},
+    modules::dataclasses,
+    os_dispatch::PendingOsEffect,
+    types::{
+        Dict, Instance, PyTrait, Type, bytes::call_bytes_method, construct_namedtuple, instance::class_name,
+        str::call_str_method,
+    },
     value::{EitherStr, Value},
 };
 
@@ -59,23 +64,19 @@ pub(crate) enum CallResult {
     /// Used by `asyncio.run()` to execute a coroutine without an explicit `await`.
     /// The VM will push the value onto the stack and execute `exec_get_awaitable`.
     AwaitValue(Value),
-    /// OS call whose result must be stored into a heap [`OpenFile`](crate::types::OpenFile)'s
-    /// buffer rather than pushed onto the operand stack.
+    /// OS call whose result must be post-processed on resume via a
+    /// [`PendingOsEffect`] instead of being pushed onto the operand stack raw.
     ///
-    /// Used by `read(N)` / `readline()` / `readlines()` / `seek()` on the first
-    /// operation that needs the full file content. The host services the OS
-    /// call (always `ReadText` or `ReadBytes` against the file referenced by
-    /// `file_id`); on resume the VM stores the returned content into
-    /// `OpenFile::buffer` and then consumes the file's `pending_read`
-    /// [`ReadSpec`](crate::types::ReadSpec) to compute the slice that becomes
-    /// the call's return value.
-    ///
-    /// The OS-call payload is a [`OsFunctionCall::ReadText`] /
-    /// [`OsFunctionCall::ReadBytes`] (the only legal variants here) carrying
-    /// the file's virtual path; the per-call slice spec lives on the
-    /// `OpenFile` itself (in `pending_read`), so this variant only needs to
-    /// carry the typed call plus the file id used to look up the buffer slot.
-    OsCallStoreBuffer { call: OsFunctionCall, file_id: HeapId },
+    /// Used by buffered file reads (`BufferStore`), buffered writes
+    /// (`WritePosition`), and `os.listdir` (`ListdirNames`). Carrying the
+    /// effect *in* the result — armed on the VM only at dispatch — guarantees
+    /// a call that is rejected and dropped without dispatch (e.g. inside a
+    /// synchronous nested-call context, see `unsupported_call_result`) cannot
+    /// leave a stale effect behind to corrupt the next OS call's resume.
+    OsCallWithEffect {
+        call: OsFunctionCall,
+        effect: PendingOsEffect,
+    },
 }
 
 impl<C: ContainsHeap> DropWithContext<C> for CallResult {
@@ -87,18 +88,20 @@ impl<C: ContainsHeap> DropWithContext<C> for CallResult {
             }
             Self::OsCall(call) => call.drop_with(heap),
             Self::FramePushed => {}
-            Self::OsCallStoreBuffer { call, file_id } => {
+            Self::OsCallWithEffect { call, effect } => {
                 call.drop_with(heap);
-                // Single pin (see `inc_ref_for_pending_oscall`): release one ref
-                // if the call is discarded before dispatch routes it to a
-                // `pending_file_effect`.
-                heap.heap_mut().dec_ref(file_id);
+                // Single pin (see `inc_ref_for_pending_oscall`): release one
+                // ref if the call is discarded before dispatch arms the
+                // effect on `pending_os_effect`.
+                if let Some(file_id) = effect.pinned_file() {
+                    heap.heap_mut().dec_ref(file_id);
+                }
             }
         }
     }
 }
 
-impl<T: ResourceTracker> VM<'_, T> {
+impl VM<'_> {
     // ========================================================================
     // Call Opcode Executors
     // ========================================================================
@@ -426,7 +429,7 @@ impl<T: ResourceTracker> VM<'_, T> {
                 "{ctx}: OS function '{}' is not yet supported in this context",
                 function_call.name()
             )),
-            CallResult::OsCallStoreBuffer { call, .. } => ExcType::not_implemented(format!(
+            CallResult::OsCallWithEffect { call, .. } => ExcType::not_implemented(format!(
                 "{ctx}: OS function '{}' is not yet supported in this context",
                 call.name()
             )),
@@ -474,17 +477,12 @@ impl<T: ResourceTracker> VM<'_, T> {
     /// Dispatches based on the callable type:
     /// - `Value::Builtin`: calls builtin directly, returns `Push`
     /// - `Value::ModuleFunction`: calls module function directly, returns `Push`
-    /// - `Value::ExtFunction`: returns `External` for caller to execute
     /// - `Value::DefFunction`: pushes a new frame, returns `FramePushed`
     /// - `Value::Ref`: checks for closure/function on heap
     pub(crate) fn call_function(&mut self, callable: &Value, args: ArgValues) -> Result<CallResult, RunError> {
         match callable {
             Value::Builtin(builtin) => builtin.call(self, args),
             Value::ModuleFunction(mf) => mf.call(self, args),
-            Value::ExtFunction(name_id) => {
-                // External function - return to caller to execute
-                Ok(CallResult::External(EitherStr::Interned(*name_id), args))
-            }
             Value::DefFunction(func_id) => {
                 // Defined function without defaults or captured variables
                 self.call_def_function(*func_id, &[], &[], args)
@@ -516,6 +514,10 @@ impl<T: ResourceTracker> VM<'_, T> {
 
         let (func_id, cells, defaults) = match self.heap.get(heap_id) {
             HeapData::Class(_) => return self.instantiate_class(heap_id, args),
+            // Calling a namedtuple class constructs a `NamedTuple` instance.
+            HeapData::NamedTupleClass(_) => {
+                return construct_namedtuple(heap_id, self, args).map(CallResult::Value);
+            }
             HeapData::BoundMethod(bm) => {
                 let instance = bm.instance.clone_with_heap(self);
                 let func = bm.func.clone_with_heap(self);
@@ -532,10 +534,9 @@ impl<T: ResourceTracker> VM<'_, T> {
                 let cloned_defaults: Vec<Value> = fd.defaults.iter().map(|v| v.clone_with_heap(self)).collect();
                 (fd.func_id, Vec::new(), cloned_defaults)
             }
-            HeapData::ExtFunction(name) => {
-                // Heap-allocated external function with a non-interned name
-                let name = name.clone();
-                return Ok(CallResult::External(EitherStr::Heap(name), args));
+            HeapData::ExtFunction(function) => {
+                let name = function.clone_name();
+                return Ok(CallResult::External(name, args));
             }
             _ => {
                 // Coupling check: dispatch rejected this Ref, so the heap-side
@@ -870,7 +871,7 @@ impl<T: ResourceTracker> VM<'_, T> {
         // stack (pushed per-comp), not in any frame-level region, so they
         // don't enter this accounting.
         let size = namespace_size * mem::size_of::<Value>();
-        self.heap.tracker_mut().on_allocate(|| size)?;
+        self.heap.tracker_mut().on_grow(|| size)?;
 
         // 1. Build the namespace in the reusable scratch buffer to avoid a
         //    per-call allocation. On error `DropGuard` drops the buffer, so the
@@ -965,15 +966,22 @@ impl<T: ResourceTracker> VM<'_, T> {
         };
 
         match init {
+            // A dataclass with no user-defined `__init__` binds its fields
+            // natively off `__dataclass_fields__`, with no generated bytecode.
+            // The read hands it the class it already knows this is, and the
+            // instance's own reference keeps that class alive throughout.
+            None if dataclasses::is_dataclass_class(class_id, self) => {
+                let HeapReadOutput::Class(class) = self.heap.read(class_id) else {
+                    unreachable!("instantiate_class is only reached with a class")
+                };
+                dataclasses::dataclass_init(self, &class, Value::Ref(instance_id), args)
+            }
+            None if matches!(args, ArgValues::Empty) => Ok(CallResult::Value(Value::Ref(instance_id))),
             None => {
-                if matches!(args, ArgValues::Empty) {
-                    Ok(CallResult::Value(Value::Ref(instance_id)))
-                } else {
-                    args.drop_with(self);
-                    let name = class_name(class_id, self.heap, self.interns);
-                    Value::Ref(instance_id).drop_with(self);
-                    Err(ExcType::type_error(format!("{name}() takes no arguments")))
-                }
+                args.drop_with(self);
+                let name = class_name(class_id, self.heap, self.interns);
+                Value::Ref(instance_id).drop_with(self);
+                Err(ExcType::type_error(format!("{name}() takes no arguments")))
             }
             Some(init_func) => {
                 let this = self;
@@ -1079,10 +1087,10 @@ impl<T: ResourceTracker> VM<'_, T> {
 /// Adding a new dunder is just a new arm in the inner `match`; type
 /// implementations only need to override the corresponding `PyTrait`
 /// method, never a `StaticStrings::Foo` arm in their `py_call_attr`.
-fn dispatch_dunder<T: ResourceTracker>(
+fn dispatch_dunder(
     name_id: StringId,
     heap_id: HeapId,
-    vm: &mut VM<'_, T>,
+    vm: &mut VM<'_>,
     args: &mut Option<ArgValues>,
 ) -> Option<Result<CallResult, RunError>> {
     let static_str = StaticStrings::from_string_id(name_id)?;
@@ -1130,11 +1138,7 @@ fn dispatch_dunder<T: ResourceTracker>(
 /// `typ` and `tb` are discarded: every implementation we have re-derives the
 /// type from `val` and Monty has no traceback objects (see
 /// `limitations/with.md`).
-fn dispatch_exit<T: ResourceTracker>(
-    heap_id: HeapId,
-    vm: &mut VM<'_, T>,
-    args: ArgValues,
-) -> Result<CallResult, RunError> {
+fn dispatch_exit(heap_id: HeapId, vm: &mut VM<'_>, args: ArgValues) -> Result<CallResult, RunError> {
     let positional = args.into_pos_only("__exit__", vm.heap)?;
     defer_drop!(positional, vm);
     let [typ, val, tb] = positional.as_slice() else {

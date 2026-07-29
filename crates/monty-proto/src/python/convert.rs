@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use monty::{
+use monty_types::{
     FileMode, MontyDate, MontyDateTime, MontyException, MontyFileHandle, MontyObject, MontyTimeDelta, MontyTimeZone,
     MontyType, StringRepr,
 };
@@ -225,8 +225,11 @@ fn round_trip_type_table(py: Python<'_>) -> PyResult<&'static Vec<(Py<PyAny>, Mo
             MontyType::Str,
             MontyType::Bytes,
             MontyType::List,
+            MontyType::Deque,
             MontyType::ListIterator,
             MontyType::CallableIterator,
+            MontyType::ItertoolsCount,
+            MontyType::ItertoolsRepeat,
             MontyType::Tuple,
             MontyType::Dict,
             MontyType::Set,
@@ -436,10 +439,13 @@ fn type_object_to_py(py: Python<'_>, t: MontyType) -> PyResult<Py<PyAny>> {
     match t {
         MontyType::Date => cached!("datetime", "date"),
         MontyType::DateTime => cached!("datetime", "datetime"),
+        MontyType::Deque => cached!("collections", "deque"),
         MontyType::TimeDelta => cached!("datetime", "timedelta"),
         MontyType::TimeZone => cached!("datetime", "timezone"),
         MontyType::ListIterator => get_list_iterator_type(py).map(|b| b.clone().unbind()),
         MontyType::CallableIterator => get_callable_iterator_type(py).map(|b| b.clone().unbind()),
+        MontyType::ItertoolsCount => cached!("itertools", "count"),
+        MontyType::ItertoolsRepeat => cached!("itertools", "repeat"),
         // Consistent with the Path *instance* arm, which marshals as PurePosixPath
         // and is instantiable on every host OS (unlike PosixPath on Windows).
         MontyType::Path => get_pure_posix_path(py).map(|b| b.clone().unbind()),
@@ -450,6 +456,7 @@ fn type_object_to_py(py: Python<'_>, t: MontyType) -> PyResult<Py<PyAny>> {
         MontyType::BufferedWriter => cached!("io", "BufferedWriter"),
         MontyType::BufferedRandom => cached!("io", "BufferedRandom"),
         MontyType::SpecialForm => cached!("typing", "_SpecialForm"),
+        MontyType::Field => cached!("dataclasses", "Field"),
         // `NoneType` and `ellipsis` aren't `builtins` attributes; take them from
         // the singletons (`type(None)` / `type(...)`).
         MontyType::NoneType => Ok(py.None().bind(py).get_type().into_any().unbind()),
@@ -475,8 +482,9 @@ fn get_list_iterator_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
 fn get_callable_iterator_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     static TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
     TYPE.get_or_try_init(py, || {
-        // `iter(callable, sentinel)` never calls `callable` until advanced, so a
-        // trivial lambda that is never invoked is enough.
+        // `iter(callable, sentinel)` does not call `callable` until advanced, and
+        // this iterator never is — so any callable serves, and a builtin avoids
+        // compiling a throwaway lambda.
         let callable = import_builtins(py)?.getattr(py, "id")?;
         let iterator = import_builtins(py)?.getattr(py, "iter")?.call1(py, (callable, 0))?;
         Ok(iterator.bind(py).get_type().into_any().unbind())

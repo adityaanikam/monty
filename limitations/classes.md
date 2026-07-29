@@ -34,9 +34,12 @@ divergences below apply to. Working, CPython-matching features: instance
 methods, `__init__` (full parameter shapes), instance and class attribute
 get/set (including `setattr(Foo, ...)` and function-attributes-become-methods),
 bound methods, class variables (arbitrary expressions, evaluated in a real
-suspendable class-body scope), **class decorators** (`@deco class Foo`), `__repr__`/`__str__`/`__enter__`/`__exit__`
-dispatch, `obj.__class__`, `Foo.__name__`, `Foo.__doc__`/`obj.__doc__`,
-`type(obj)`/`isinstance(obj, Foo)`, and the 3-arg `type()` constructor. The
+suspendable class-body scope), **class decorators** (`@deco class Foo`),
+`__repr__`/`__str__`/`__enter__`/`__exit__`/`__eq__`/`__hash__` dispatch,
+`obj.__class__`, `Foo.__name__`, `Foo.__doc__`/`obj.__doc__`,
+`Foo.__annotations__` (ordered; values stringized and provisional — see
+[typing.md](typing.md)), `type(obj)`/`isinstance(obj, Foo)`, and the 3-arg
+`type()` constructor. The
 `__enter__`/`__exit__` divergences are in [with.md](with.md). Everything else
 below is where Monty differs from or does not implement CPython behaviour.
 
@@ -96,9 +99,14 @@ order and error wording, but with these divergences:
   runs to completion synchronously, so it cannot yield to the host, and an
   external-function `__init__` raises `NotImplementedError` rather than
   suspending.
-- **Equality and hashing are identity-only**: a user `__eq__`/`__hash__` is
-  not dispatched. `a == b` is true only when `a is b`; instances hash by
-  identity. Instances are always truthy (no `__bool__`/`__len__` dispatch).
+- **A user `__eq__` cannot decline a comparison.** Monty has no
+  `NotImplemented` value, so whatever `__eq__` returns is taken as a truth
+  value and the reflected `other.__eq__(self)` is never tried.
+- **`__eq__`/`__hash__` cannot suspend**: like `__repr__`/`__str__` they run to
+  completion synchronously, so one that calls an external/OS function raises
+  rather than yielding to the host.
+- **Ordering dunders are still not dispatched** — see the entry above.
+  Instances are always truthy (no `__bool__`/`__len__` dispatch).
 - **Bound methods compare and hash by identity**: each `obj.method` access
   creates a fresh object, so `obj.method == obj.method` is `False` and two
   accesses hash differently. CPython compares/hashes bound methods by
@@ -177,23 +185,52 @@ e.g. return a `dict` of the fields.
   metaclass-driven namespace customization.
 - `__slots__`, descriptors (`__get__` / `__set__` / `__delete__`).
 - Abstract base classes (`abc.ABC`, `@abstractmethod`).
-- Function and method decorators — `@classmethod`, `@staticmethod`, `@property`,
-  and any decorator on a top-level `def` or a method (rejected at parse time).
-  Class decorators are supported.
-- **Classes are barely introspectable**: `__dict__`, `__bases__`,
-  `__annotations__` and `dir()` are all unavailable (`cls.__name__` works).
+- Method decorators — `@classmethod`, `@staticmethod`, `@property`, and any
+  decorator on a `def` inside a class body (rejected at parse time). Decorators
+  on classes and on non-method functions are supported.
+- **Classes are barely introspectable**: `__dict__`, `__bases__` and `dir()`
+  are all unavailable (`cls.__name__` and `cls.__annotations__` work — the
+  latter with stringized values, see [typing.md](typing.md)). A class decorator
+  can therefore discover fields and nothing else.
+- **Tracebacks from decorator application point at the whole `class` statement**
+  (a span from the first decorator through the body, with the body elided as
+  `...<N lines>...`), where CPython pins the individual decorator that raised.
+  Every decorator in a stack reports that same location; only the callee frame
+  identifies which one raised.
 - Dunder protocols other than `__init__`, `__repr__`, `__str__`,
-  `__enter__`, and `__exit__`: `__new__`, `__call__`, `__iter__`,
-  `__next__`, `__getitem__`, `__setitem__`, `__contains__`, `__add__`,
-  `__eq__`, `__hash__`, `__bool__`, etc. are not dispatched for
-  user-defined instances.
+  `__enter__`, `__exit__`, `__iter__`, `__next__`, `__contains__`, `__eq__`,
+  and `__hash__`: `__new__`, `__call__`, `__getitem__`, `__setitem__`,
+  `__add__`, `__ne__`, `__bool__`, etc. are not dispatched for user-defined
+  instances. `__ne__` is always the negation of `__eq__`, as CPython derives it
+  by default, so a custom `__ne__` is ignored.
+- `__iter__` / `__next__` / `__contains__` **are** dispatched, but like
+  `__repr__`/`__str__` they run synchronously, so one that calls an external or
+  OS function cannot suspend and raises `NotImplementedError`. Two related
+  protocols are still not dispatched, so a class relying on either is not
+  iterable:
+  - the legacy `__getitem__`-only fallback — CPython iterates a class defining
+    `__getitem__` but not `__iter__` from index 0 until `IndexError`, while
+    Monty reports it as not iterable. (Note `monty -t` accepts `iter(obj)` for
+    such a class, so this fails only at runtime — see [iter.md](iter.md).)
+  - `__reversed__` — so `reversed(obj)` on any user instance raises
+    `TypeError: '{cls}' object is not reversible`. That matches CPython for a
+    class defining neither `__reversed__` nor `__len__` + `__getitem__`, and
+    diverges for one that does.
+- `__next__` is looked up on the class only, never the instance `__dict__`, and
+  a `StopIteration` raised anywhere inside it ends the iteration — including one
+  that propagates out of a nested call, where CPython's PEP 479 protections
+  apply only to generators, which Monty does not have.
+- **A `__contains__` returning a user instance is always `True`.** The result is
+  coerced by Monty's truthiness, which reports every instance as truthy (see
+  above), where CPython's `PyObject_IsTrue` consults the returned object's
+  `__bool__`/`__len__`. Every other return type coerces as CPython does.
 - Attribute-access hooks are **never** dispatched: `__getattr__`,
   `__getattribute__`, `__setattr__`, `__delattr__`, and `__del__`. A missing
   attribute always raises the default `AttributeError` even when the class
   defines `__getattr__`, and attribute writes always go straight to the
   instance `__dict__`.
-- Introspection attributes other than `__name__`, `__doc__`, and
-  `obj.__class__`: `Foo.__dict__`, `obj.__dict__`, `Foo.__bases__`,
+- Introspection attributes other than `__name__`, `__doc__`, `__annotations__`
+  and `obj.__class__`: `Foo.__dict__`, `obj.__dict__`, `Foo.__bases__`,
   `Foo.__mro__`, `Foo.__qualname__`, `Foo.__module__`, and explicit
   `obj.__repr__()` / `obj.__str__()` calls when the class defines none — all
   raise `AttributeError`.
@@ -210,8 +247,11 @@ e.g. return a `dict` of the fields.
   (`f = lambda: (z := 1)`) binds in the lambda's own scope and works. A walrus
   in a comprehension in the class body is also rejected (CPython rejects that
   too, but as a `SyntaxError` with different wording). A walrus in an
-  *annotation* (`x: (y := int) = 5`) runs in Monty — annotations are ignored
-  generally — where CPython raises `SyntaxError`.
+  *annotation* (`x: (y := int) = 5`) runs in Monty — annotation expressions are
+  captured as source text (stringized) and never evaluated, so the walrus never
+  binds — where CPython raises `SyntaxError`. This one follows from annotations
+  never being evaluated, so it would change if they ever are (see
+  [typing.md](typing.md)).
 - `del obj.attr` (the `del` statement is unsupported generally).
 
 ## `FrozenInstanceError`

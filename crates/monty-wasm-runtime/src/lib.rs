@@ -92,6 +92,7 @@ fn event_from_proto(event: pb::ChildEvent) -> Option<Event> {
         Kind::DumpResult(value) => (9, value.encode_to_vec()),
         Kind::Ok(value) => (10, value.encode_to_vec()),
         Kind::FatalError(value) => (11, value.encode_to_vec()),
+        Kind::Shutdown(value) => (12, value.encode_to_vec()),
     };
     Some(Event { kind, payload })
 }

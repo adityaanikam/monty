@@ -4,14 +4,14 @@
 //! only the newly fed snippet each time.
 
 use insta::assert_snapshot;
-use monty::{
-    CompileOptions, ExtFunctionResult, MontyException, MontyObject, MontyRepl, NoLimitTracker, PrintWriter,
-    ReplContinuationMode, ReplProgress, ReplStartError, ResourceTracker, detect_repl_continuation_mode,
+use monty::{MontyRepl, ReplContinuationMode, ReplProgress, ReplStartError, detect_repl_continuation_mode};
+use monty_types::{
+    CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, PrintWriter, ResourceTracker,
 };
 
 #[test]
 fn repl_executes_only_new_code() {
-    let mut repl = MontyRepl::new("repl.py", NoLimitTracker, CompileOptions::default());
+    let mut repl = MontyRepl::new("repl.py", ResourceTracker::default(), CompileOptions::default());
     let init_output = feed_run_print(&mut repl, "counter = 0").unwrap();
     assert_eq!(init_output, MontyObject::None);
 
@@ -24,12 +24,12 @@ fn repl_executes_only_new_code() {
     assert_eq!(output, MontyObject::Int(1));
 }
 
-fn feed_run_print(repl: &mut MontyRepl<impl ResourceTracker>, code: &str) -> Result<MontyObject, MontyException> {
+fn feed_run_print(repl: &mut MontyRepl, code: &str) -> Result<MontyObject, MontyException> {
     repl.feed_run(code, vec![], PrintWriter::Stdout)
 }
 
-fn init_repl(code: &str) -> (MontyRepl<NoLimitTracker>, MontyObject) {
-    let mut repl = MontyRepl::new("repl.py", NoLimitTracker, CompileOptions::default());
+fn init_repl(code: &str) -> (MontyRepl, MontyObject) {
+    let mut repl = MontyRepl::new("repl.py", ResourceTracker::default(), CompileOptions::default());
     let output = feed_run_print(&mut repl, code).unwrap();
     (repl, output)
 }
@@ -205,7 +205,7 @@ fn repl_dump_load_survives_between_snippets() {
     feed_run_print(&mut repl, "total = total + 1").unwrap();
 
     let bytes = repl.dump().unwrap();
-    let mut loaded: MontyRepl<NoLimitTracker> = MontyRepl::load(&bytes).unwrap();
+    let mut loaded: MontyRepl = MontyRepl::load(&bytes).unwrap();
 
     feed_run_print(&mut loaded, "total = total * 21").unwrap();
     let output = feed_run_print(&mut loaded, "total").unwrap();
@@ -219,7 +219,7 @@ fn repl_dump_load_preserves_heap_aliasing() {
     feed_run_print(&mut repl, "a.append(1)").unwrap();
 
     let bytes = repl.dump().unwrap();
-    let mut loaded: MontyRepl<NoLimitTracker> = MontyRepl::load(&bytes).unwrap();
+    let mut loaded: MontyRepl = MontyRepl::load(&bytes).unwrap();
 
     feed_run_print(&mut loaded, "b.append(2)").unwrap();
     assert_eq!(
@@ -294,7 +294,7 @@ fn repl_progress_dump_load_roundtrip() {
     let progress = repl.feed_start("ext_fn(20) + 22", vec![], PrintWriter::Stdout).unwrap();
 
     let bytes = progress.dump().unwrap();
-    let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).unwrap();
+    let loaded: ReplProgress = ReplProgress::load(&bytes).unwrap();
 
     let call = loaded.into_function_call().expect("expected function call");
     assert_eq!(call.args, vec![MontyObject::Int(20)]);
@@ -326,7 +326,7 @@ async def main():
 
     let progress = call.resume_pending(PrintWriter::Stdout).unwrap();
     let bytes = progress.dump().unwrap();
-    let loaded: ReplProgress<NoLimitTracker> = ReplProgress::load(&bytes).unwrap();
+    let loaded: ReplProgress = ReplProgress::load(&bytes).unwrap();
     let state = loaded.into_resolve_futures().expect("expected resolve futures");
     assert_eq!(state.pending_call_ids(), &[call_id]);
 
@@ -356,7 +356,7 @@ fn repl_start_runtime_error_preserves_repl_state() {
         .feed_start("y = 20\nraise ValueError('boom')", vec![], PrintWriter::Stdout)
         .expect_err("expected ReplStartError");
     let ReplStartError { mut repl, error } = *err;
-    assert_eq!(error.exc_type(), monty::ExcType::ValueError);
+    assert_eq!(error.exc_type(), ExcType::ValueError);
     assert_eq!(error.message(), Some("boom"));
 
     // Variables from BEFORE the error snippet survive.
@@ -377,12 +377,12 @@ fn repl_start_runtime_error_during_external_call_preserves_repl_state() {
     let call = progress.into_function_call().expect("expected function call");
 
     // Resume with an exception from the external function.
-    let exc = monty::MontyException::new(monty::ExcType::RuntimeError, Some("ext failed".to_string()));
+    let exc = MontyException::new(ExcType::RuntimeError, Some("ext failed".to_string()));
     let err = call
         .resume(ExtFunctionResult::Error(exc), PrintWriter::Stdout)
         .expect_err("expected ReplStartError");
     let ReplStartError { mut repl, error } = *err;
-    assert_eq!(error.exc_type(), monty::ExcType::RuntimeError);
+    assert_eq!(error.exc_type(), ExcType::RuntimeError);
 
     // Variable from before the error is still accessible.
     assert_eq!(feed_run_print(&mut repl, "z").unwrap(), MontyObject::Int(99));
@@ -404,7 +404,7 @@ fn repl_dataclass_method_call_yields_function_call_with_method_flag() {
         frozen: true,
     };
 
-    let repl = MontyRepl::new("repl.py", NoLimitTracker, CompileOptions::default());
+    let repl = MontyRepl::new("repl.py", ResourceTracker::default(), CompileOptions::default());
 
     // Calling point.sum() should yield a FunctionCall with method_call=true.
     // Pass the dataclass as an input to feed_start() so it gets a namespace slot.
@@ -455,8 +455,8 @@ fn repl_start_new_external_function_in_later_block() {
 // ===========================================================================
 
 /// Helper to create a REPL session pre-seeded with code for function calling.
-fn repl_with_code(code: &str) -> MontyRepl<NoLimitTracker> {
-    let mut repl = MontyRepl::new("session_test.py", NoLimitTracker, CompileOptions::default());
+fn repl_with_code(code: &str) -> MontyRepl {
+    let mut repl = MontyRepl::new("session_test.py", ResourceTracker::default(), CompileOptions::default());
     repl.feed_run(code, vec![], PrintWriter::Stdout).unwrap();
     repl
 }
@@ -695,6 +695,39 @@ def bar(): pass
 }
 
 #[test]
+fn function_names_excludes_classes_and_methods() {
+    // The helper is deliberately narrower than `is_callable`: plain functions
+    // and lambdas count, but classes, namedtuple classes, and bound methods —
+    // all callable — must not be surfaced as "functions".
+    // Import via the module so the only function-valued global is `foo`/`lam`
+    // (a bare `from collections import namedtuple` would surface `namedtuple`
+    // itself, which is correctly a function).
+    let s = repl_with_code(
+        "\
+import collections
+def foo(): pass
+lam = lambda: 1
+class Cls:
+    def method(self): pass
+Point = collections.namedtuple('Point', ['a'])
+inst = Cls()
+bound = inst.method
+x = 42
+",
+    );
+    let mut names = s.function_names();
+    names.sort_unstable();
+    assert_eq!(names, vec!["foo", "lam"]);
+    assert!(s.has_function("foo"));
+    assert!(s.has_function("lam"));
+    assert!(!s.has_function("Cls")); // a class is callable but not a function
+    assert!(!s.has_function("Point")); // a namedtuple class likewise
+    assert!(!s.has_function("bound")); // a bound method likewise
+    assert!(!s.has_function("inst"));
+    assert!(!s.has_function("x"));
+}
+
+#[test]
 fn has_function() {
     let s = repl_with_code("def my_func(): pass\nx = 10");
     assert!(s.has_function("my_func"));
@@ -710,7 +743,7 @@ fn call_function_captures_print() {
         .call_function(
             "say_hello",
             vec![MontyObject::String("world".to_owned())],
-            PrintWriter::CollectString(&mut output),
+            PrintWriter::collect_string(&mut output),
         )
         .unwrap();
     assert_eq!(result, MontyObject::None);

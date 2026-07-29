@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 
-use monty::MontyObject;
 use monty_proto::{FrameError, FrameReader, WireObject, pb, write_frame};
+use monty_types::MontyObject;
 
 /// A spawned `monty subprocess` child with framed pipes.
 struct ChildProc {
@@ -34,7 +34,14 @@ impl ChildProc {
     }
 
     fn send(&mut self, kind: pb::parent_request::Kind) {
-        write_frame(&mut self.writer, &pb::ParentRequest { kind: Some(kind) }).expect("failed to write request");
+        write_frame(
+            &mut self.writer,
+            &pb::ParentRequest {
+                kind: Some(kind),
+                trace_parent: None,
+            },
+        )
+        .expect("failed to write request");
     }
 
     /// Reads a single event.

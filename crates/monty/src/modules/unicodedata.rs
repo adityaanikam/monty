@@ -24,6 +24,7 @@
 //! they return `Value` directly (wrapped in `CallResult::Value` by the dispatch
 //! in [`super`]).
 
+use monty_types::ResourceError;
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::{UnicodeNormalization, char::canonical_combining_class};
 
@@ -31,11 +32,10 @@ use crate::{
     args::{ArgValues, FromArgs, StrArg},
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcType, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId},
+    exception_private::{ExcType, ExcTypeExt, RunResult, SimpleException},
+    heap::{DropGuard, Heap, HeapData, HeapId},
     intern::StaticStrings,
     modules::ModuleFunctions,
-    resource::{ResourceError, ResourceTracker},
     string_builder::StringBuilder,
     types::{Module, str::allocate_string},
     value::Value,
@@ -75,7 +75,7 @@ const UNICODEDATA_FUNCTIONS: &[(StaticStrings, UnicodedataFunctions)] = &[
 ///
 /// # Panics
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
+pub fn create_module(vm: &mut VM<'_>) -> Result<HeapId, ResourceError> {
     let mut module = Module::new(StaticStrings::Unicodedata);
 
     for (name, func) in UNICODEDATA_FUNCTIONS {
@@ -91,11 +91,7 @@ pub fn create_module(vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, Re
 /// Dispatches a call to a `unicodedata` module function.
 ///
 /// All functions are pure computations and return `Value` directly.
-pub(super) fn call(
-    vm: &mut VM<'_, impl ResourceTracker>,
-    function: UnicodedataFunctions,
-    args: ArgValues,
-) -> RunResult<Value> {
+pub(super) fn call(vm: &mut VM<'_>, function: UnicodedataFunctions, args: ArgValues) -> RunResult<Value> {
     match function {
         UnicodedataFunctions::Category => uni_category(vm, args),
         UnicodedataFunctions::Name => uni_name(vm, args),
@@ -110,7 +106,7 @@ pub(super) fn call(
 ///
 /// Returns e.g. `"Lu"` (uppercase letter), `"Nd"` (decimal digit), or `"Cn"`
 /// for unassigned code points.
-fn uni_category(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn uni_category(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("category", vm.heap)?;
     defer_drop!(value, vm);
     let c = single_char(value, "category", None, vm)?;
@@ -121,34 +117,20 @@ fn uni_category(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunRe
 ///
 /// Raises `ValueError("no such name")` when the character has no name and no
 /// `default` is supplied; otherwise returns `default`.
-fn uni_name(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn uni_name(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let NameArgs {
         chr: chr_val,
         default: default_val,
     } = NameArgs::from_args(args, vm)?;
     defer_drop!(chr_val, vm);
-
-    // `default_val` is not covered by `defer_drop!` (it's an `Option` we may
-    // return by value), so drop it explicitly on every path that doesn't.
-    let c = match single_char(chr_val, "name", Some(1), vm) {
-        Ok(c) => c,
-        Err(e) => {
-            if let Some(d) = default_val {
-                d.drop_with(vm);
-            }
-            return Err(e);
-        }
-    };
+    let mut default_guard = DropGuard::new(default_val, vm);
+    let vm = default_guard.ctx();
+    let c = single_char(chr_val, "name", Some(1), vm)?;
 
     match unicode_names2::name(c) {
-        Some(name) => {
-            if let Some(d) = default_val {
-                d.drop_with(vm);
-            }
-            Ok(allocate_string(name.to_string(), vm.heap)?)
-        }
-        None => match default_val {
-            Some(d) => Ok(d),
+        Some(name) => Ok(allocate_string(name.to_string(), vm.heap)?),
+        None => match default_guard.into_inner() {
+            Some(default) => Ok(default),
             None => Err(SimpleException::new_msg(ExcType::ValueError, "no such name").into()),
         },
     }
@@ -158,7 +140,7 @@ fn uni_name(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult
 ///
 /// Raises `KeyError("undefined character name '<name>'")` when no character has
 /// that name. Unlike CPython, named sequences are not resolved.
-fn uni_lookup(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn uni_lookup(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("lookup", vm.heap)?;
     defer_drop!(value, vm);
     let name = value.to_str(vm)?;
@@ -171,7 +153,7 @@ fn uni_lookup(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResu
 /// `unicodedata.combining(chr)` — the canonical combining class as an int.
 ///
 /// Returns `0` for characters with no combining class (the common case).
-fn uni_combining(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn uni_combining(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("combining", vm.heap)?;
     defer_drop!(value, vm);
     let c = single_char(value, "combining", None, vm)?;
@@ -179,7 +161,7 @@ fn uni_combining(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunR
 }
 
 /// `unicodedata.normalize(form, unistr)` — normalize a string to NFC/NFD/NFKC/NFKD.
-fn uni_normalize(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn uni_normalize(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let NormalizeArgs { form, unistr } = NormalizeArgs::from_args(args, vm)?;
     defer_drop!(form, vm);
     defer_drop!(unistr, vm);
@@ -188,7 +170,7 @@ fn uni_normalize(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunR
 }
 
 /// `unicodedata.is_normalized(form, unistr)` — whether a string is already normalized.
-fn uni_is_normalized(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn uni_is_normalized(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let IsNormalizedArgs { form, unistr } = IsNormalizedArgs::from_args(args, vm)?;
     defer_drop!(form, vm);
     defer_drop!(unistr, vm);
@@ -276,7 +258,7 @@ impl NormForm {
 /// The output length is not bounded by the input (decomposition can expand a
 /// single code point into several), so the result is built through
 /// [`StringBuilder`] which reserves bytes with the resource tracker as it grows.
-fn normalize_with(form: NormForm, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+fn normalize_with(form: NormForm, text: &str, heap: &Heap) -> RunResult<Value> {
     let mut builder = StringBuilder::new(heap.tracker());
     match form {
         NormForm::Nfc => {
@@ -310,12 +292,7 @@ fn normalize_with(form: NormForm, text: &str, heap: &Heap<impl ResourceTracker>)
 /// string of the wrong length yields `"<fn>(): argument[ N] must be a unicode
 /// character, not a string of length <n>"`. `arg_num` supplies the ` N` suffix
 /// (only `name()` numbers its argument).
-fn single_char(
-    value: &Value,
-    fn_name: &str,
-    arg_num: Option<u32>,
-    vm: &VM<'_, impl ResourceTracker>,
-) -> RunResult<char> {
+fn single_char(value: &Value, fn_name: &str, arg_num: Option<u32>, vm: &VM<'_>) -> RunResult<char> {
     let arg_word = match arg_num {
         Some(n) => format!("argument {n}"),
         None => "argument".to_string(),

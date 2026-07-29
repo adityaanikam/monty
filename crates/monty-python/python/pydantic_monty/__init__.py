@@ -22,10 +22,12 @@ from ._monty import (
     MontyComplete,
     MontyConversionError,
     MontyCrashedError,
+    MontyDisconnectError,
     MontyError,
     MontyFileHandle,
     MontyRuntimeError,
     MontySession,
+    MontyShutdown,
     MontySyntaxError,
     MontyTypingError,
     MountDir,
@@ -67,9 +69,11 @@ __all__ = (
     'Monty',
     'MontyConversionError',
     'MontyCrashedError',
+    'MontyDisconnectError',
     'MontyError',
     'MontyFileHandle',
     'MontySession',
+    'MontyShutdown',
     'MontySyntaxError',
     'MontyRuntimeError',
     'MontyTypingError',
@@ -101,9 +105,6 @@ class ResourceLimits(TypedDict, total=False):
     All limits are optional. Omit a key — or set it to `None` explicitly —
     to disable that limit.
     """
-
-    max_allocations: int | None
-    """Maximum number of heap allocations allowed."""
 
     max_duration_secs: float | None
     """Maximum execution time in seconds."""

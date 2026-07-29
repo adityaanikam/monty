@@ -28,11 +28,11 @@ use std::{
     time::Duration,
 };
 
-use monty::{AssertMessageAnnotations, ExcType, MontyException, MontyObject, PrintStream, StackFrame};
 use monty_pool::{
     exceeds_max_value_depth, Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, ReplConfig,
     ResumeValue, TurnEvent,
 };
+use monty_types::{AssertMessageAnnotations, ExcType, MontyException, MontyObject, PrintStream, StackFrame};
 use napi::{
     bindgen_prelude::{
         block_on, spawn_blocking, Array, Buffer, FnArgs, FromNapiValue, Function, JsObjectValue, Object, PromiseRaw,
@@ -601,10 +601,23 @@ impl From<StdResult<TurnEvent, PoolError>> for TurnOutcome {
                 timed_out: true,
                 exit_status: None,
             },
-            Err(PoolError::Crashed { status, context }) => Self::Crashed {
-                message: format!("monty worker crashed while {context}"),
-                timed_out: false,
+            // `status` is `Copy`, so it can be reported *and* handed back to
+            // the error, whose own Display picks between "while <doing X>"
+            // and the worker's stated reason — don't re-derive that here.
+            Err(PoolError::Crashed { status, cause }) => Self::Crashed {
                 exit_status: status.map(|status| status.to_string()),
+                message: PoolError::Crashed { status, cause }.to_string(),
+                timed_out: false,
+            },
+            // WebSocket-only, so both are unreachable here (the napi binding
+            // is subprocess-only). Mapped to their local analogue anyway
+            // rather than falling through to a misleading protocol error: a
+            // dropped connection and a server shutdown both mean the session
+            // is gone, which is what `Crashed` tells the caller.
+            Err(err @ (PoolError::Disconnected { .. } | PoolError::Shutdown { .. })) => Self::Crashed {
+                message: err.to_string(),
+                timed_out: false,
+                exit_status: None,
             },
             Err(other) => Self::Protocol(other.to_string()),
         }
