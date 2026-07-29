@@ -167,15 +167,15 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
         Ok(())
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::Dataclass(other)) = other.read_heap(vm) else {
+    fn py_eq_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let Some(HeapReadOutput::Dataclass(mut other)) = other.read_heap(vm) else {
             return Ok(None);
         };
         // Dataclasses are equal only if they are the same class and have equal attrs.
         if self.get(vm.heap).type_id() != other.get(vm.heap).type_id() {
             return Ok(Some(false));
         }
-        Ok(Some(self.attrs().eq_dict(&other.attrs(), vm)?))
+        Ok(Some(self.attrs().eq_dict(&mut other.attrs_mut(), vm)?))
     }
 
     /// Hashes a frozen dataclass by its class name and the values of declared fields.

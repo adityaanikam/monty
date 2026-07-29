@@ -760,7 +760,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DateTime> {
         None
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+    fn py_eq_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         let Some(HeapReadOutput::DateTime(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
@@ -852,7 +852,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DateTime> {
         Ok(py_add(&value, &other, vm.heap))
     }
 
-    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
+    fn py_sub_impl(&mut self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
         match other.read_heap(vm) {
             Some(HeapReadOutput::DateTime(other)) => {
                 let value = self.get(vm.heap).clone();

@@ -440,7 +440,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
         None
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+    fn py_eq_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         let Some(HeapReadOutput::Path(other)) = other.read_heap(vm) else {
             return Ok(None);
         };

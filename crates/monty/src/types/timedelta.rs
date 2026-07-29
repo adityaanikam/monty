@@ -300,7 +300,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
         None
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+    fn py_eq_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         let Some(HeapReadOutput::TimeDelta(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
@@ -385,7 +385,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
         }
     }
 
-    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
+    fn py_sub_impl(&mut self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
         let Some(HeapReadOutput::TimeDelta(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
