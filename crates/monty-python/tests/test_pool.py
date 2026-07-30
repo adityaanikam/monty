@@ -122,6 +122,28 @@ def test_request_timeout_kills_hung_worker():
             assert session.feed_run('2 + 2') == snapshot(4)
 
 
+def test_worker_address_space_limit_leaves_normal_work_alone():
+    # a ceiling generous enough for the interpreter is invisible; it backstops
+    # the sandbox `limits`, it is not a second budget. Runs everywhere — only
+    # Linux enforces it, elsewhere the worker warns on stderr and runs on
+    with Monty(worker_address_space_limit=2 * 1024**3) as pool:
+        with pool.checkout() as session:
+            assert session.feed_run('1 + 1') == snapshot(2)
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='RLIMIT_AS is only settable on Linux')
+def test_worker_address_space_breach_crashes_the_worker():
+    # no `max_memory`, so the sandbox tracker allows this allocation outright —
+    # the kernel refuses it and the worker dies, which is the whole point
+    with Monty(worker_address_space_limit=1024**3) as pool:
+        with pool.checkout() as session:
+            with pytest.raises(MontyCrashedError) as exc_info:
+                session.feed_run("x = ' ' * (4 * 1024 * 1024 * 1024)")
+            assert exc_info.value.timed_out is False
+        with pool.checkout() as session:
+            assert session.feed_run('1 + 1') == snapshot(2)
+
+
 def test_concurrent_sessions_run_in_parallel(pool: Monty):
     results: list[object] = []
 

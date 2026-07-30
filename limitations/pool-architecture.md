@@ -106,6 +106,14 @@ properties that real CPython does not provide, per the caveat above.
   bounded, and `request_timeout` applies independently. Both deadlines fire
   between the turn's polls, so decoding one maximal reply frame (~1s worst
   case) can delay enforcement by that long.
+- **`max_memory` can be backstopped by a hard, Linux-only address-space
+  ceiling.** `worker_address_space_limit` / `workerAddressSpaceLimit` at pool
+  creation caps each worker's `RLIMIT_AS` — a breach aborts the worker and
+  surfaces as `MontyCrashedError`, never as `MemoryError`, losing the session
+  (the in-sandbox limit, by contrast, leaves the worker usable). Off by default;
+  ignored with a stderr warning on macOS and Windows, and by the WebSocket
+  transport. It is the only worker configuration the parent passes outside the
+  protocol, as a `subprocess` CLI flag. See `limitations/resource_limits.md`.
 - **Workers are spawned with an empty environment** (on Windows only
   `SystemRoot` is kept, which CRT/WinAPI lookups need): host secrets are
   never in a worker's memory, where a sandbox escape or memory disclosure

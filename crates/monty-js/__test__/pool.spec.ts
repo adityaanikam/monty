@@ -61,6 +61,35 @@ test('maxCheckoutsPerWorker recycles the worker', async (ctx) => {
   await second.close()
 })
 
+test('workerAddressSpaceLimit leaves normal work alone', async (ctx) => {
+  skipIfBrowser(ctx)
+  // a ceiling generous enough for the interpreter is invisible; it backstops
+  // the in-sandbox limits rather than acting as a second budget. Only Linux
+  // enforces it — elsewhere the worker warns on stderr and runs unbounded.
+  await using pool = await Monty.create({ workerAddressSpaceLimit: 2 * 1024 ** 3 })
+  const session = await pool.checkout()
+  t.is(await session.feedRun('1 + 1'), 2)
+  await session.close()
+})
+
+test('workerAddressSpaceLimit breach crashes the worker', async (ctx) => {
+  skipIfBrowser(ctx)
+  // RLIMIT_AS is only settable on Linux
+  if (process.platform !== 'linux') {
+    ctx.skip()
+  }
+  await using pool = await Monty.create({ workerAddressSpaceLimit: 1024 ** 3 })
+  const session = await pool.checkout()
+  // no maxMemory, so the sandbox tracker allows this allocation outright
+  const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (4 * 1024 * 1024 * 1024)"), {
+    instanceOf: MontyCrashedError,
+  })
+  t.false(error.timedOut)
+  const next = await pool.checkout()
+  t.is(await next.feedRun('1 + 1'), 2)
+  await next.close()
+})
+
 test('concurrent sessions run in distinct workers', async (ctx) => {
   skipIfBrowser(ctx)
   await using pool = await Monty.create()

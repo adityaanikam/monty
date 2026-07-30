@@ -3,6 +3,8 @@
 //! point of the subprocess mode is that a dead child is a recoverable event
 //! for the parent.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::ExitStatusExt;
 use std::{
     io::Write,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -22,8 +24,14 @@ struct ChildProc {
 
 impl ChildProc {
     fn spawn() -> Self {
+        Self::spawn_with_args(&[])
+    }
+
+    /// Spawns the child with extra `subprocess` flags appended.
+    fn spawn_with_args(args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_monty"))
             .arg("subprocess")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -354,6 +362,46 @@ fn child_enforces_time_limit() {
     child.create_repl();
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
+}
+
+/// A ceiling generous enough for the interpreter must be invisible: it is a
+/// backstop, not a second sandbox budget. Runs everywhere — on non-Linux the
+/// child warns on stderr and serves the session unbounded.
+#[test]
+fn address_space_limit_leaves_normal_work_alone() {
+    let mut child = ChildProc::spawn_with_args(&["--address-space-limit", "2147483648"]); // 2 GiB
+    child.create_repl();
+    assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
+    child.shutdown();
+}
+
+/// The point of the ceiling: an allocation the sandbox's `ResourceTracker`
+/// waves through (no `max_memory` here, and `str.repeat` allocates through
+/// infallible `String` growth) must kill the process instead of growing host
+/// memory without bound. The kernel fails the allocation, Rust's
+/// allocation-error handler aborts, and the parent sees a child that died
+/// without a turn-ending event.
+#[cfg(target_os = "linux")]
+#[test]
+fn address_space_breach_aborts_the_child() {
+    let mut child = ChildProc::spawn_with_args(&["--address-space-limit", "1073741824"]); // 1 GiB
+    child.create_repl();
+    child.send(pb::parent_request::Kind::Feed(pb::Feed {
+        code: "x = ' ' * (4 * 1024 * 1024 * 1024)".to_owned(),
+        inputs: vec![],
+        skip_type_check: false,
+    }));
+    // EOF (the usual case) or a truncated frame — never a turn-ending event
+    match child.reader.read::<pb::ChildEvent>() {
+        Ok(None) | Err(_) => {}
+        Ok(Some(event)) => panic!("expected the child to die, got {:?}", event.kind),
+    }
+    let status = child.child.wait().expect("failed to wait for child");
+    assert_eq!(
+        status.signal(),
+        Some(6), // SIGABRT
+        "expected SIGABRT from the allocation-error handler, got {status:?}"
+    );
 }
 
 #[test]

@@ -115,7 +115,9 @@ impl PyMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
+        worker_address_space_limit = None,
     ))]
+    #[expect(clippy::too_many_arguments, reason = "pyo3 constructors take a flat argument list")]
     fn new(
         py: Python<'_>,
         binary_path: Option<PathBuf>,
@@ -124,6 +126,7 @@ impl PyMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
+        worker_address_space_limit: Option<u64>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -134,6 +137,7 @@ impl PyMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
+                worker_address_space_limit,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -474,7 +478,9 @@ impl PyAsyncMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
+        worker_address_space_limit = None,
     ))]
+    #[expect(clippy::too_many_arguments, reason = "pyo3 constructors take a flat argument list")]
     fn new(
         py: Python<'_>,
         binary_path: Option<PathBuf>,
@@ -483,6 +489,7 @@ impl PyAsyncMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
+        worker_address_space_limit: Option<u64>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -493,6 +500,7 @@ impl PyAsyncMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
+                worker_address_space_limit,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -912,6 +920,7 @@ impl PyAsyncMontySession {
 /// Builds the subprocess-transport `monty-pool` config from the (shared)
 /// `Monty`/`AsyncMonty` constructor arguments, resolving the binary via
 /// `pydantic_monty._binary` when not given explicitly.
+#[expect(clippy::too_many_arguments, reason = "mirrors the flat pyo3 constructor arguments")]
 fn parse_pool_config(
     py: Python<'_>,
     binary_path: Option<PathBuf>,
@@ -920,6 +929,7 @@ fn parse_pool_config(
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
     max_checkouts_per_worker: Option<u32>,
+    worker_address_space_limit: Option<u64>,
 ) -> PyResult<PoolConfig> {
     let binary_path = match binary_path {
         Some(path) => path,
@@ -937,6 +947,7 @@ fn parse_pool_config(
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
     config.max_checkouts_per_worker = max_checkouts_per_worker;
+    config.worker_address_space_limit = worker_address_space_limit;
     Ok(config)
 }
 

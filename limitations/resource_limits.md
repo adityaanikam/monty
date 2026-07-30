@@ -38,6 +38,39 @@ subprocess and WebAssembly runtimes do.
 - `bigint.pow(base, exp)` estimates result size as `bits(base) * exp` with
   a 4× safety multiplier to cover repeated-squaring intermediate values.
 
+## Hard address-space ceiling (worker pools, Linux only)
+
+`max_memory` is enforced by the interpreter's own tracker, so it only bounds
+allocations the interpreter remembers to account for. Hosts that spawn worker
+subprocesses can set a second, independent ceiling below the interpreter —
+`PoolConfig::worker_address_space_limit` in Rust,
+`Monty(worker_address_space_limit=...)` in Python, `workerAddressSpaceLimit` in
+JavaScript — which the worker applies to itself as `RLIMIT_AS` before serving
+any request. Divergences from every other limit documented here:
+
+- **It is not a Python-visible error.** A breach fails an allocation the
+  interpreter cannot handle, so the worker aborts (`SIGABRT`) mid-turn. The host
+  sees a crash (`PoolError::Crashed` / `MontyCrashedError`), *not* a
+  `MemoryError`, and the session is lost — unlike `max_memory`, where the worker
+  survives and stays usable. Sandboxed code cannot observe or catch it.
+- **Linux only.** Darwin refuses to set `RLIMIT_AS` (aliased onto `RLIMIT_RSS`)
+  or `RLIMIT_DATA` at all, and Windows has no rlimits. On those platforms the
+  worker prints a warning to stderr and runs unbounded, so the ceiling is a
+  production backstop, not a portable guarantee.
+- **It bounds virtual address space, not live heap.** Thread stacks, allocator
+  arena reservations and file mappings all count against it, so the value must
+  sit well above the `max_memory` budget it backstops — a few hundred MiB of
+  headroom at minimum. Too tight a ceiling kills healthy workers, most likely on
+  the first type-checked feed (typeshed and salsa caches load then).
+- **Per process, not per session.** The ceiling is fixed at pool creation and
+  never re-derived, so a recycled worker's ceiling still covers whatever residue
+  earlier sessions left behind.
+- **Never raised.** The requested value is clamped down to any lower limit
+  already inherited (container, `ulimit -v`), and both the soft and hard limits
+  are set, so nothing in the process can lift it afterwards.
+- Only the subprocess transport applies it: WebSocket workers are remote
+  processes this pool does not spawn, and the wasm worker has no rlimits.
+
 ## Integer-specific caps
 
 - `pow(base, exp)` / `base ** exp` with an exponent larger than `u32::MAX`

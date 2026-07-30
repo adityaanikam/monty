@@ -1093,6 +1093,57 @@ async fn child_resource_limits_do_not_kill_the_worker() {
     assert_eq!(pool.idle_workers(), 1);
 }
 
+/// A ceiling generous enough for the interpreter must not disturb ordinary
+/// sessions. Runs on every platform, so the flag plumbing is covered even where
+/// the kernel cannot enforce it (the worker warns on stderr instead).
+#[tokio::test]
+async fn worker_address_space_limit_leaves_normal_work_alone() {
+    let mut config = config();
+    config.worker_address_space_limit = Some(2 * 1024 * 1024 * 1024); // 2 GiB
+    let pool = Pool::new(config).await.unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    assert_eq!(
+        expect_complete(
+            session
+                .feed("1 + 1", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap()
+        ),
+        MontyObject::Int(2)
+    );
+    session.finish().await.unwrap();
+}
+
+/// The hard ceiling is a crash, not an exception: unlike the in-sandbox
+/// `max_memory` limit (see `child_resource_limits_do_not_kill_the_worker`) a
+/// breach takes the worker down mid-turn. The session is lost; the pool is not.
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_address_space_breach_kills_the_worker_and_the_pool_recovers() {
+    let mut config = config();
+    config.worker_address_space_limit = Some(1024 * 1024 * 1024); // 1 GiB
+    let pool = Pool::new(config).unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    // no `max_memory`, so the sandbox tracker allows this outright
+    let err = session
+        .feed(
+            "x = ' ' * (4 * 1024 * 1024 * 1024)",
+            vec![],
+            vec![],
+            false,
+            &mut no_print,
+        )
+        .unwrap_err();
+    assert!(matches!(err, PoolError::Crashed { .. }), "got {err:?}");
+
+    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    assert_eq!(
+        expect_complete(session.feed("3 + 3", vec![], vec![], false, &mut no_print).unwrap()),
+        MontyObject::Int(6)
+    );
+    session.finish().unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn special_files_in_mounts_are_rejected_without_blocking() {

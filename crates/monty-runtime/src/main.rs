@@ -19,6 +19,7 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 #[rustfmt::skip]
 use monty_type_checking::{SourceFile, type_check};
 
+mod address_space;
 mod subprocess;
 
 /// ANSI escape code for dim/gray text.
@@ -91,7 +92,14 @@ enum Command {
     /// Run as a protocol child: read framed protobuf requests on stdin and
     /// write framed events on stdout (see the monty-proto crate). Intended to
     /// be driven by a parent process such as monty-pool, not by hand.
-    Subprocess,
+    Subprocess {
+        /// Hard ceiling in bytes on this process's address space, applied
+        /// before serving any request. A breach kills the worker, backstopping
+        /// the sandbox's own `max_memory` limit. Linux only — elsewhere it
+        /// warns and runs unbounded. See limitations/resource_limits.md.
+        #[arg(long)]
+        address_space_limit: Option<u64>,
+    },
 }
 
 impl Cli {
@@ -159,10 +167,27 @@ const EXT_FUNCTIONS: bool = false;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Some(Command::Subprocess) = cli.subcommand {
+    if let Some(Command::Subprocess { address_space_limit }) = cli.subcommand {
         if let Some(flag) = cli.subprocess_conflict() {
             eprintln!("{BOLD_RED}error{RESET}: `subprocess` cannot be combined with {flag}");
             return ExitCode::FAILURE;
+        }
+        if let Some(bytes) = address_space_limit {
+            match address_space::apply(bytes) {
+                Ok(Some(_)) => {}
+                // the caller asked for a bound this platform cannot give: say so
+                // loudly (stderr reaches the host) but still serve the session
+                Ok(None) => eprintln!(
+                    "{DIM}warning{RESET}: --address-space-limit is only enforced on Linux; \
+                     this worker runs without a hard memory ceiling"
+                ),
+                // the bound was available and still could not be set — refuse to
+                // run rather than pretend the worker is capped
+                Err(err) => {
+                    eprintln!("{BOLD_RED}error{RESET}: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         return subprocess::run();
     }

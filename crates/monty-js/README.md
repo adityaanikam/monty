@@ -317,9 +317,15 @@ const pool = await Monty.create({
   requestTimeout: 30, // hard per-turn deadline (seconds)
   durationLimitGrace: 1, // maxDurationSecs backstop grace (seconds, null disables)
   maxCheckoutsPerWorker: 100, // recycle workers after this many sessions
+  workerAddressSpaceLimit: 2 * 1024 ** 3, // hard per-worker memory ceiling (Linux only)
   binaryPath: '/path/to/monty', // explicit binary (default: auto-resolved)
 })
 ```
+
+`workerAddressSpaceLimit` backstops the in-sandbox `maxMemory` limit: a breach
+kills the worker with `MontyCrashedError` instead of growing the host without
+bound. It caps _virtual_ address space, so leave generous headroom, and it is
+enforced on Linux only (elsewhere the worker warns on stderr).
 
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo

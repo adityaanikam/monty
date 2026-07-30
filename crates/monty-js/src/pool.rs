@@ -44,7 +44,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     convert::{js_to_monty, monty_to_js},
-    limits::{extract_limits, JsResourceLimits},
+    limits::{extract_limits, js_number_to_u64, JsResourceLimits},
 };
 
 /// Deepest *list-like* value nesting the wire protocol accepts (dicts and
@@ -98,6 +98,9 @@ pub struct NativePoolOptions {
     pub duration_limit_grace_ms: Option<f64>,
     /// Recycle a worker after serving this many checkouts.
     pub max_checkouts_per_worker: Option<u32>,
+    /// Linux-only hard ceiling in bytes on each worker's address space,
+    /// backstopping the sandbox limits. A breach kills the worker.
+    pub worker_address_space_limit: Option<f64>,
 }
 
 /// Session options for `checkout()`.
@@ -155,6 +158,10 @@ impl NativePool {
         config.request_timeout = options.request_timeout_ms.map(duration_from_ms).transpose()?;
         config.duration_limit_grace = options.duration_limit_grace_ms.map(duration_from_ms).transpose()?;
         config.max_checkouts_per_worker = options.max_checkouts_per_worker;
+        config.worker_address_space_limit = options
+            .worker_address_space_limit
+            .map(|bytes| js_number_to_u64(bytes, "workerAddressSpaceLimit"))
+            .transpose()?;
         if config.max_processes < 1 {
             return Err(invalid("maxProcesses must be at least 1"));
         }
