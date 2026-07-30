@@ -9,15 +9,12 @@ use std::{
 use clap::{Parser, Subcommand};
 use monty::{MontyRepl, MontyRun, ReplContinuationMode, ReplProgress, RunProgress, detect_repl_continuation_mode};
 use monty_fs::{MountCallOutcome, MountMode, MountTable, OverlayState};
+use monty_type_checking::{SourceFile, type_check};
 use monty_types::{
     CompileOptions, ExtFunctionResult, MontyObject, NameLookupResult, OsFunctionCall, PrintWriter, ResourceLimits,
     ResourceTracker,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
-// disabled due to format failing on https://github.com/pydantic/monty/pull/75 where CI and local wanted imports ordered differently
-// TODO re-enabled soon!
-#[rustfmt::skip]
-use monty_type_checking::{SourceFile, type_check};
 
 mod address_space;
 mod oom_exit;
