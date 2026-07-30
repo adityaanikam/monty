@@ -1543,8 +1543,9 @@ fn assert_timeout_in_builtin(code: &str, label: &str) {
         ExcType::TimeoutError,
         "{label}: expected TimeoutError, got: {exc}"
     );
+    // 100ms budget + 400ms slack; worst measured overrun is ~110ms, spent tearing down the partial result.
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_millis(500),
         "{label}: should terminate promptly, took {elapsed:?}"
     );
 }
