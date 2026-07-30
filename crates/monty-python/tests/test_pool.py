@@ -138,7 +138,7 @@ def test_refused_allocation_raises_memory_error():
     with Monty() as pool:
         with pool.checkout() as session:
             with pytest.raises(MontyRuntimeError) as exc_info:
-                session.feed_run("x = ' ' * (1 << 46)")
+                session.feed_run("x = ' ' * (1 << 60)")
             assert str(exc_info.value) == snapshot(
                 'MemoryError: the worker exceeded its memory ceiling and was terminated'
             )

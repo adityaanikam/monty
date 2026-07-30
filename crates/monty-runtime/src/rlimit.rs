@@ -21,16 +21,18 @@ use rlimit::Resource;
 /// that this platform has no usable knob and the process stays unbounded. `Err`
 /// is a real failure: the caller asked for a guarantee that cannot be honoured.
 ///
-/// Never *raises* the limit — an outer sandbox (container, `ulimit -v`) may
-/// already impose something stricter, and asking for more than the inherited
-/// hard limit would fail outright. Both soft and hard limits are set, so
-/// nothing later in the process can lift the ceiling again.
+/// Never *raises* the limit: an outer sandbox (container, `ulimit -v`) may
+/// already impose something stricter, so the request is clamped to *both*
+/// inherited limits — asking for more than the hard limit fails outright, and
+/// exceeding the inherited soft limit would loosen the very constraint this is
+/// meant to tighten. Both soft and hard are then set, so nothing later in the
+/// process can lift the ceiling again.
 #[cfg(target_os = "linux")]
 pub(crate) fn apply(bytes: u64) -> Result<Option<u64>, String> {
-    let (_, hard) = Resource::AS
+    let (soft, hard) = Resource::AS
         .get()
         .map_err(|err| format!("cannot read RLIMIT_AS: {err}"))?;
-    let limit = bytes.min(hard);
+    let limit = bytes.min(soft).min(hard);
     Resource::AS
         .set(limit, limit)
         .map(|()| Some(limit))

@@ -118,9 +118,10 @@ properties that real CPython does not provide, per the caveat above.
   (`SIGABRT`, which a stack overflow also produces and which would be
   unclassifiable), so the host gets `MontyRuntimeError`/`MemoryError` with a
   distinct message instead of `MontyCrashedError` — but the worker is already
-  dead and later calls on that checkout report `Finished`. Every other
-  `MontyRuntimeError` leaves the session usable. Applies on all platforms, with
-  or without a ceiling configured.
+  dead and later calls on that checkout report `Finished`. An ordinary in-sandbox
+  exception leaves the session usable; a failed `load_session` / `load_snapshot`
+  is the other `MontyRuntimeError` that does not (see below). Applies on all
+  platforms, with or without a ceiling configured.
 - **Workers are spawned with an empty environment** (on Windows only
   `SystemRoot` is kept, which CRT/WinAPI lookups need): host secrets are
   never in a worker's memory, where a sandbox escape or memory disclosure

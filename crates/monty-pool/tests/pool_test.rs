@@ -1125,14 +1125,15 @@ async fn worker_hard_memory_limit_leaves_normal_work_alone() {
 /// A refused allocation is the one `Runtime` error whose worker is already
 /// dead: it reports `MemoryError` (the worker's dedicated exit code, not an
 /// unclassifiable `SIGABRT`), the checkout is finished, and the pool recovers.
-/// Needs no ceiling — this request exceeds the address space on any platform.
+/// Needs no ceiling: 1 EiB dwarfs the usable address space on any 64-bit host,
+/// so the allocator refuses it regardless of overcommit policy.
 #[tokio::test]
 async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
     let pool = Pool::new(config()).await.unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     // no `max_memory`, so the sandbox tracker allows this outright
     let err = session
-        .feed("x = ' ' * (1 << 46)", vec![], vec![], false, &mut no_print)
+        .feed("x = ' ' * (1 << 60)", vec![], vec![], false, &mut no_print)
         .await
         .unwrap_err();
     let PoolError::Runtime(exc) = err else {

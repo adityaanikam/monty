@@ -416,17 +416,22 @@ fn hard_memory_limit_leaves_normal_work_alone() {
 
 /// A refused allocation must leave the parent something it can classify: the
 /// dedicated exit code, not the `SIGABRT` Rust's allocation-error handler would
-/// raise (which a stack overflow also produces). Needs no ceiling — a request
-/// this large exceeds the usable address space on every platform.
+/// raise (which a stack overflow also produces). Needs no ceiling: 1 EiB is
+/// thousands of times the usable address space on any 64-bit host, so `mmap`
+/// fails on the address-space check before overcommit policy is consulted —
+/// deterministic, and no page is ever touched.
 #[test]
 fn refused_allocation_exits_with_the_oom_code() {
     let mut child = ChildProc::spawn_stderr_piped(&[]);
     child.create_repl();
     // no `max_memory`, so the sandbox tracker permits this outright
-    child.feed_expecting_death("x = ' ' * (1 << 46)");
+    child.feed_expecting_death("x = ' ' * (1 << 60)");
     let (status, stderr) = child.reap_with_stderr();
     assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
-    assert!(stderr.contains("allocation of 70368744177664 bytes failed"), "{stderr}");
+    assert!(
+        stderr.contains("allocation of 1152921504606846976 bytes failed"),
+        "{stderr}"
+    );
 }
 
 /// The point of the ceiling: an allocation the sandbox's `ResourceTracker`

@@ -79,7 +79,7 @@ test('a refused allocation raises MemoryError and the pool recovers', async (ctx
   // no maxMemory, so the sandbox tracker allows this outright: the allocation is
   // refused below the interpreter, killing the worker but still reporting
   // MemoryError rather than an unclassifiable crash
-  const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (1 << 46)"), {
+  const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (1 << 60)"), {
     instanceOf: MontyRuntimeError,
   })
   t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')

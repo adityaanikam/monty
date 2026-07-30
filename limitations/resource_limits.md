@@ -76,7 +76,7 @@ any request. Divergences from every other limit documented here:
 
 Independently of any ceiling, **any** allocation a worker's allocator refuses —
 plain host OOM, or a request beyond the usable address space such as
-`' ' * (1 << 46)` — takes this same path on every platform: the worker exits and
+`' ' * (1 << 60)` — takes this same path on every platform: the worker exits and
 the host sees that `MemoryError` with its session gone. CPython raises a
 catchable `MemoryError` in-process and carries on. Monty cannot: the failure
 happens below the interpreter, where no Python-level exception can be raised, so
