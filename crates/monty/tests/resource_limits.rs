@@ -1609,7 +1609,7 @@ fn timeout_in_bytes_contains() {
     let exc = result.expect_err("bytes membership must hit the time limit");
     assert_eq!(exc.exc_type(), ExcType::TimeoutError);
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_millis(200),
         "should terminate promptly, took {elapsed:?}"
     );
 }
