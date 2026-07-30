@@ -106,8 +106,8 @@ properties that real CPython does not provide, per the caveat above.
   bounded, and `request_timeout` applies independently. Both deadlines fire
   between the turn's polls, so decoding one maximal reply frame (~1s worst
   case) can delay enforcement by that long.
-- **`max_memory` can be backstopped by a hard, Linux-only address-space
-  ceiling.** `worker_address_space_limit` / `workerAddressSpaceLimit` at pool
+- **`max_memory` can be backstopped by a hard, Linux-only memory ceiling.**
+  `worker_hard_memory_limit` / `workerHardMemoryLimit` at pool
   creation caps each worker's `RLIMIT_AS`. Off by default; ignored with a stderr
   warning on macOS and Windows, and by the WebSocket transport (whose exit codes
   do not travel, so a remote breach degrades to `Disconnected`). It is the only

@@ -81,7 +81,7 @@ struct WebSocketWorker {
 impl Worker {
     pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
         match &config.transport {
-            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, config.worker_address_space_limit),
+            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, config.worker_hard_memory_limit),
             // Bound the dial by `request_timeout` (see `websocket`); a missing
             // one falls back to a generous fixed budget.
             MontyTransport::Websocket(url) => {
@@ -95,8 +95,8 @@ impl Worker {
     /// There is no spawn-time handshake: a wrong or broken binary surfaces as
     /// an error on the first request the worker serves (typically the
     /// `Configure` of its first checkout). That includes a child that refuses to
-    /// start because it could not apply `address_space_limit`.
-    fn subprocess(binary_path: &PathBuf, address_space_limit: Option<u64>) -> Result<Self, PoolError> {
+    /// start because it could not apply `hard_memory_limit`.
+    fn subprocess(binary_path: &PathBuf, hard_memory_limit: Option<u64>) -> Result<Self, PoolError> {
         let mut command = Command::new(binary_path);
         command
             .arg("subprocess")
@@ -109,8 +109,8 @@ impl Worker {
             .kill_on_drop(true);
         // The child applies the ceiling to itself: `setrlimit` is inherited
         // across exec, so a pre-exec hook would need unsafe code for no gain.
-        if let Some(bytes) = address_space_limit {
-            command.arg("--address-space-limit").arg(bytes.to_string());
+        if let Some(bytes) = hard_memory_limit {
+            command.arg("--hard-memory-limit").arg(bytes.to_string());
         }
         // Windows processes misbehave without SystemRoot (CRT and WinAPI
         // lookups); it names the OS install directory and is not sensitive.

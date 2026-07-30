@@ -38,13 +38,13 @@ subprocess and WebAssembly runtimes do.
 - `bigint.pow(base, exp)` estimates result size as `bits(base) * exp` with
   a 4× safety multiplier to cover repeated-squaring intermediate values.
 
-## Hard address-space ceiling (worker pools, Linux only)
+## Hard memory ceiling (worker pools, Linux only)
 
 `max_memory` is enforced by the interpreter's own tracker, so it only bounds
 allocations the interpreter remembers to account for. Hosts that spawn worker
 subprocesses can set a second, independent ceiling below the interpreter —
-`PoolConfig::worker_address_space_limit` in Rust,
-`Monty(worker_address_space_limit=...)` in Python, `workerAddressSpaceLimit` in
+`PoolConfig::worker_hard_memory_limit` in Rust,
+`Monty(worker_hard_memory_limit=...)` in Python, `workerHardMemoryLimit` in
 JavaScript — which the worker applies to itself as `RLIMIT_AS` before serving
 any request. Divergences from every other limit documented here:
 

@@ -407,8 +407,8 @@ fn child_enforces_time_limit() {
 /// backstop, not a second sandbox budget. Runs everywhere — on non-Linux the
 /// child warns on stderr and serves the session unbounded.
 #[test]
-fn address_space_limit_leaves_normal_work_alone() {
-    let mut child = ChildProc::spawn_with_args(&["--address-space-limit", "2147483648"]); // 2 GiB
+fn hard_memory_limit_leaves_normal_work_alone() {
+    let mut child = ChildProc::spawn_with_args(&["--hard-memory-limit", "2147483648"]); // 2 GiB
     child.create_repl();
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
@@ -436,8 +436,8 @@ fn refused_allocation_exits_with_the_oom_code() {
 /// allocator starts refusing.
 #[cfg(target_os = "linux")]
 #[test]
-fn address_space_breach_exits_with_the_oom_code() {
-    let mut child = ChildProc::spawn_stderr_piped(&["--address-space-limit", "1073741824"]); // 1 GiB
+fn hard_memory_breach_exits_with_the_oom_code() {
+    let mut child = ChildProc::spawn_stderr_piped(&["--hard-memory-limit", "1073741824"]); // 1 GiB
     child.create_repl();
     child.feed_expecting_death("x = ' ' * (4 * 1024 * 1024 * 1024)");
     let (status, stderr) = child.reap_with_stderr();

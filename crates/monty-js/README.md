@@ -317,12 +317,12 @@ const pool = await Monty.create({
   requestTimeout: 30, // hard per-turn deadline (seconds)
   durationLimitGrace: 1, // maxDurationSecs backstop grace (seconds, null disables)
   maxCheckoutsPerWorker: 100, // recycle workers after this many sessions
-  workerAddressSpaceLimit: 2 * 1024 ** 3, // hard per-worker memory ceiling (Linux only)
+  workerHardMemoryLimit: 2 * 1024 ** 3, // hard per-worker memory ceiling (Linux only)
   binaryPath: '/path/to/monty', // explicit binary (default: auto-resolved)
 })
 ```
 
-`workerAddressSpaceLimit` backstops the in-sandbox `maxMemory` limit instead of
+`workerHardMemoryLimit` backstops the in-sandbox `maxMemory` limit instead of
 letting the worker grow the host without bound. It caps _virtual_ address space,
 so leave generous headroom, and it is enforced on Linux only (elsewhere the
 worker warns on stderr). A breach raises `MontyRuntimeError` wrapping

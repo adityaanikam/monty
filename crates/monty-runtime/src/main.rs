@@ -16,8 +16,8 @@ use monty_types::{
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-mod address_space;
 mod oom_exit;
+mod rlimit;
 mod subprocess;
 
 /// Classifies allocation failure as an exit code rather than an abort, so the
@@ -97,12 +97,13 @@ enum Command {
     /// write framed events on stdout (see the monty-proto crate). Intended to
     /// be driven by a parent process such as monty-pool, not by hand.
     Subprocess {
-        /// Hard ceiling in bytes on this process's address space, applied
-        /// before serving any request. A breach kills the worker, backstopping
-        /// the sandbox's own `max_memory` limit. Linux only — elsewhere it
-        /// warns and runs unbounded. See limitations/resource_limits.md.
+        /// Hard memory ceiling in bytes for this process, set as `RLIMIT_AS`
+        /// before any request is served; a breach kills the worker, backstopping
+        /// the sandbox's own `max_memory`. `RLIMIT_AS` bounds virtual address
+        /// space, so leave headroom. Linux only — elsewhere it warns and runs
+        /// unbounded.
         #[arg(long)]
-        address_space_limit: Option<u64>,
+        hard_memory_limit: Option<u64>,
     },
 }
 
@@ -171,18 +172,18 @@ const EXT_FUNCTIONS: bool = false;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Some(Command::Subprocess { address_space_limit }) = cli.subcommand {
+    if let Some(Command::Subprocess { hard_memory_limit }) = cli.subcommand {
         if let Some(flag) = cli.subprocess_conflict() {
             eprintln!("{BOLD_RED}error{RESET}: `subprocess` cannot be combined with {flag}");
             return ExitCode::FAILURE;
         }
-        if let Some(bytes) = address_space_limit {
-            match address_space::apply(bytes) {
+        if let Some(bytes) = hard_memory_limit {
+            match rlimit::apply(bytes) {
                 Ok(Some(_)) => {}
                 // the caller asked for a bound this platform cannot give: say so
                 // loudly (stderr reaches the host) but still serve the session
                 Ok(None) => eprintln!(
-                    "{DIM}warning{RESET}: --address-space-limit is only enforced on Linux; \
+                    "{DIM}warning{RESET}: --hard-memory-limit is only enforced on Linux; \
                      this worker runs without a hard memory ceiling"
                 ),
                 // the bound was available and still could not be set — refuse to

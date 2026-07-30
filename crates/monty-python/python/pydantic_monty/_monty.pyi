@@ -376,7 +376,7 @@ class Monty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
-        worker_address_space_limit: int | None = None,
+        worker_hard_memory_limit: int | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `with`.
@@ -395,12 +395,12 @@ class Monty:
                 exceeds it is killed and the call raises `MontyCrashedError`
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
-            worker_address_space_limit: Hard ceiling in bytes on each worker
-                process's address space, backstopping the sandbox `limits`.
-                A breach raises `MontyRuntimeError` wrapping `MemoryError`, but
-                takes the worker (and so the session) with it — see
-                `limitations/resource_limits.md`. Linux only; ignored with a
-                warning on stderr elsewhere.
+            worker_hard_memory_limit: Hard memory ceiling in bytes for each
+                worker process, set as `RLIMIT_AS`. A breach raises
+                `MontyRuntimeError` wrapping `MemoryError`, but takes the worker
+                (and so the session) with it. `RLIMIT_AS` bounds *virtual*
+                address space, so leave headroom above `limits['max_memory']`.
+                Linux only; ignored with a warning on stderr elsewhere.
         """
 
     def __enter__(self) -> Self: ...
@@ -664,7 +664,7 @@ class AsyncMonty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
-        worker_address_space_limit: int | None = None,
+        worker_hard_memory_limit: int | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `async with`.

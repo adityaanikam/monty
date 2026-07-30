@@ -115,7 +115,7 @@ impl PyMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
-        worker_address_space_limit = None,
+        worker_hard_memory_limit = None,
     ))]
     #[expect(clippy::too_many_arguments, reason = "pyo3 constructors take a flat argument list")]
     fn new(
@@ -126,7 +126,7 @@ impl PyMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
-        worker_address_space_limit: Option<u64>,
+        worker_hard_memory_limit: Option<u64>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -137,7 +137,7 @@ impl PyMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
-                worker_address_space_limit,
+                worker_hard_memory_limit,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -478,7 +478,7 @@ impl PyAsyncMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
-        worker_address_space_limit = None,
+        worker_hard_memory_limit = None,
     ))]
     #[expect(clippy::too_many_arguments, reason = "pyo3 constructors take a flat argument list")]
     fn new(
@@ -489,7 +489,7 @@ impl PyAsyncMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
-        worker_address_space_limit: Option<u64>,
+        worker_hard_memory_limit: Option<u64>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -500,7 +500,7 @@ impl PyAsyncMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
-                worker_address_space_limit,
+                worker_hard_memory_limit,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -929,7 +929,7 @@ fn parse_pool_config(
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
     max_checkouts_per_worker: Option<u32>,
-    worker_address_space_limit: Option<u64>,
+    worker_hard_memory_limit: Option<u64>,
 ) -> PyResult<PoolConfig> {
     let binary_path = match binary_path {
         Some(path) => path,
@@ -947,7 +947,7 @@ fn parse_pool_config(
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
     config.max_checkouts_per_worker = max_checkouts_per_worker;
-    config.worker_address_space_limit = worker_address_space_limit;
+    config.worker_hard_memory_limit = worker_hard_memory_limit;
     Ok(config)
 }
 

@@ -45,15 +45,15 @@ export interface MontyOptions {
   /** Recycle a worker (kill and replace) after serving this many sessions. */
   maxCheckoutsPerWorker?: number
   /**
-   * Hard ceiling in bytes on each worker process's address space, backstopping
-   * the in-sandbox `maxMemory` limit: an allocation the sandbox's tracker never
-   * saw fails, killing the worker with `MontyCrashedError` instead of growing
-   * the host until the OS OOM killer intervenes. Because it bounds virtual
-   * address space (thread stacks and allocator arenas included), leave generous
-   * headroom above `maxMemory`. **Linux only** — elsewhere the worker warns on
-   * stderr and runs unbounded. See limitations/resource_limits.md.
+   * Hard memory ceiling in bytes for each worker process, set as `RLIMIT_AS`,
+   * backstopping the in-sandbox `maxMemory`: an allocation its tracker never saw
+   * is refused, raising `MontyRuntimeError`/`MemoryError` and taking the worker
+   * (and its session) with it, instead of growing the host until the OS OOM
+   * killer intervenes. `RLIMIT_AS` bounds virtual address space, so leave
+   * headroom. **Linux only** — elsewhere the worker warns on stderr and runs
+   * unbounded.
    */
-  workerAddressSpaceLimit?: number
+  workerHardMemoryLimit?: number
 }
 
 /** Options for [`Monty.checkout`], mirroring `pydantic_monty`. */
@@ -116,9 +116,7 @@ export class Monty {
         ? { durationLimitGraceMs: (options.durationLimitGrace ?? 1) * 1000 }
         : {}),
       ...(options.maxCheckoutsPerWorker !== undefined ? { maxCheckoutsPerWorker: options.maxCheckoutsPerWorker } : {}),
-      ...(options.workerAddressSpaceLimit !== undefined
-        ? { workerAddressSpaceLimit: options.workerAddressSpaceLimit }
-        : {}),
+      ...(options.workerHardMemoryLimit !== undefined ? { workerHardMemoryLimit: options.workerHardMemoryLimit } : {}),
     })
     await native.start()
     return new Monty(native)

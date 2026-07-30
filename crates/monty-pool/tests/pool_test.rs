@@ -1105,9 +1105,9 @@ async fn child_resource_limits_do_not_kill_the_worker() {
 /// sessions. Runs on every platform, so the flag plumbing is covered even where
 /// the kernel cannot enforce it (the worker warns on stderr instead).
 #[tokio::test]
-async fn worker_address_space_limit_leaves_normal_work_alone() {
+async fn worker_hard_memory_limit_leaves_normal_work_alone() {
     let mut config = config();
-    config.worker_address_space_limit = Some(2 * 1024 * 1024 * 1024); // 2 GiB
+    config.worker_hard_memory_limit = Some(2 * 1024 * 1024 * 1024); // 2 GiB
     let pool = Pool::new(config).await.unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     assert_eq!(
@@ -1165,9 +1165,9 @@ async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
 /// `child_resource_limits_do_not_kill_the_worker`).
 #[cfg(target_os = "linux")]
 #[test]
-fn worker_address_space_breach_is_a_memory_error() {
+fn worker_hard_memory_breach_is_a_memory_error() {
     let mut config = config();
-    config.worker_address_space_limit = Some(1024 * 1024 * 1024); // 1 GiB
+    config.worker_hard_memory_limit = Some(1024 * 1024 * 1024); // 1 GiB
     let pool = Pool::new(config).unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).unwrap();
     let err = session

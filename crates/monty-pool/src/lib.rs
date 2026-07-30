@@ -71,18 +71,18 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
-    /// Linux-only hard ceiling in bytes on each spawned worker's address space
-    /// (`RLIMIT_AS`), backstopping the sandbox's `max_memory`: a breach aborts
-    /// the worker ([`PoolError::Crashed`]) instead of growing the host without
-    /// bound. Ignored elsewhere, and by the WebSocket transport (whose children
-    /// this pool does not spawn). See `limitations/resource_limits.md`.
-    pub worker_address_space_limit: Option<u64>,
+    /// Linux-only hard memory ceiling in bytes for each spawned worker, set as
+    /// `RLIMIT_AS`: a breach kills the worker and reports `MemoryError`
+    /// ([`PoolError::Runtime`]) instead of growing the host without bound. Leave
+    /// headroom above the sandbox's `max_memory` — `RLIMIT_AS` bounds *virtual*
+    /// address space. Ignored elsewhere, and by the WebSocket transport.
+    pub worker_hard_memory_limit: Option<u64>,
 }
 
 impl PoolConfig {
     /// Creates a subprocess-transport config with defaults: `min_processes = 1`,
     /// `max_processes =` available parallelism, no timeouts, a 1s
-    /// `duration_limit_grace`, no recycling, no address-space ceiling.
+    /// `duration_limit_grace`, no recycling, no hard memory ceiling.
     pub fn subprocess(binary_path: impl Into<PathBuf>) -> Self {
         Self::with_transport(MontyTransport::Subprocess(binary_path.into()))
     }
@@ -105,7 +105,7 @@ impl PoolConfig {
             request_timeout: None,
             duration_limit_grace: Some(Duration::from_secs(1)),
             max_checkouts_per_worker: None,
-            worker_address_space_limit: None,
+            worker_hard_memory_limit: None,
         }
     }
 }
@@ -136,7 +136,7 @@ pub enum PoolError {
     Protocol(Cow<'static, str>),
     /// The sandboxed code raised a Python exception. The worker and its
     /// session remain alive and usable — except for the one `MemoryError` a
-    /// breached `worker_address_space_limit` produces, where the worker is
+    /// breached `worker_hard_memory_limit` produces, where the worker is
     /// already dead and the checkout finished (its distinct message
     /// distinguishes it from an in-sandbox `MemoryError`).
     Runtime(MontyException),

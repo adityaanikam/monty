@@ -5,7 +5,7 @@
 //! produces — the parent could not tell them apart. `set_alloc_error_hook` is
 //! the API for this and is still unstable, hence an allocator. It does no
 //! accounting: what makes allocations fail is `RLIMIT_AS`
-//! (see [`crate::address_space`]) or plain host OOM.
+//! (see [`crate::rlimit`]) or plain host OOM.
 //!
 //! Only binaries may declare a `#[global_allocator]` — in a library or cdylib it
 //! would hijack the allocator of the embedding host process.
