@@ -2293,7 +2293,16 @@ pub(crate) fn bytes_contains(container: &[u8], item: &Value, vm: &VM<'_>) -> Run
         // A bytes-like probe is a substring test.
         Value::InternBytes(_) | Value::Ref(_) => {
             let needle = extract_bytes_only(item, vm)?;
-            return Ok(container.windows(needle.len().max(1)).any(|w| w == needle) || needle.is_empty());
+            if needle.is_empty() {
+                return Ok(true);
+            }
+            for window in container.windows(needle.len()) {
+                vm.heap.check_time()?;
+                if window == needle {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
         other => {
             return Err(ExcType::type_error(format!(

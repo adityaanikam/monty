@@ -1577,6 +1577,30 @@ fn timeout_in_bounded_deque_repeat() {
         "deque(maxlen=10**9) * 10**9",
     );
 }
+/// Test that bytes substring membership checks the time limit during its native search loop.
+#[test]
+fn timeout_in_bytes_contains() {
+    let run = MontyRun::new(
+        "needle in haystack".to_owned(),
+        "test.py",
+        vec!["haystack".to_owned(), "needle".to_owned()],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let haystack = MontyObject::Bytes(vec![b'a'; 1_000_000]);
+    let mut needle = vec![b'a'; 50_000];
+    needle[49_999] = b'b';
+    let limits = ResourceLimits::default().max_duration(Duration::from_millis(1));
+
+    let result = run.run(
+        vec![haystack, MontyObject::Bytes(needle)],
+        ResourceTracker::new(limits),
+        PrintWriter::Stdout,
+    );
+
+    let exc = result.expect_err("bytes membership must hit the time limit");
+    assert_eq!(exc.exc_type(), ExcType::TimeoutError);
+}
 
 /// Test that `sorted(range(huge))` respects the time limit.
 ///
