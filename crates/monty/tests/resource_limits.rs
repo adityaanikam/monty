@@ -1577,7 +1577,13 @@ fn timeout_in_bounded_deque_repeat() {
         "deque(maxlen=10**9) * 10**9",
     );
 }
+
 /// Test that bytes substring membership checks the time limit during its native search loop.
+///
+/// The needle only mismatches on its last byte, so every window costs a full 50KB
+/// compare — without the in-loop `check_time()` the search runs to completion and
+/// returns `False`, since nothing else polls the clock between the `in` and the end
+/// of the program.
 #[test]
 fn timeout_in_bytes_contains() {
     let run = MontyRun::new(
@@ -1592,14 +1598,20 @@ fn timeout_in_bytes_contains() {
     needle[49_999] = b'b';
     let limits = ResourceLimits::default().max_duration(Duration::from_millis(1));
 
+    let start = Instant::now();
     let result = run.run(
         vec![haystack, MontyObject::Bytes(needle)],
         ResourceTracker::new(limits),
         PrintWriter::Stdout,
     );
+    let elapsed = start.elapsed();
 
     let exc = result.expect_err("bytes membership must hit the time limit");
     assert_eq!(exc.exc_type(), ExcType::TimeoutError);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "should terminate promptly, took {elapsed:?}"
+    );
 }
 
 /// Test that `sorted(range(huge))` respects the time limit.
