@@ -20,7 +20,14 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use monty_type_checking::{SourceFile, type_check};
 
 mod address_space;
+mod oom_exit;
 mod subprocess;
+
+/// Classifies allocation failure as an exit code rather than an abort, so the
+/// pool can report `MemoryError`. Declared here because only a binary may:
+/// see [`oom_exit`]. Applies to every mode, `subprocess` and CLI alike.
+#[global_allocator]
+static ALLOC: oom_exit::OomExitAlloc = oom_exit::OomExitAlloc;
 
 /// ANSI escape code for dim/gray text.
 const DIM: &str = "\x1b[2m";

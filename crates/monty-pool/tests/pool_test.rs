@@ -1020,6 +1020,14 @@ async fn hard_child_crash_does_not_harm_the_pool() {
         matches!(err, PoolError::Crashed { .. } | PoolError::Runtime(_)),
         "got {err:?}"
     );
+    // a stack overflow aborts with SIGABRT, which must never be mistaken for the
+    // allocator's dedicated out-of-memory exit — the reason that exit exists
+    if let PoolError::Runtime(exc) = &err {
+        assert_ne!(
+            exc.message(),
+            Some("the worker exceeded its memory ceiling and was terminated")
+        );
+    }
 
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     assert_eq!(
@@ -1114,17 +1122,54 @@ async fn worker_address_space_limit_leaves_normal_work_alone() {
     session.finish().await.unwrap();
 }
 
-/// The hard ceiling is a crash, not an exception: unlike the in-sandbox
-/// `max_memory` limit (see `child_resource_limits_do_not_kill_the_worker`) a
-/// breach takes the worker down mid-turn. The session is lost; the pool is not.
+/// A refused allocation is the one `Runtime` error whose worker is already
+/// dead: it reports `MemoryError` (the worker's dedicated exit code, not an
+/// unclassifiable `SIGABRT`), the checkout is finished, and the pool recovers.
+/// Needs no ceiling — this request exceeds the address space on any platform.
+#[tokio::test]
+async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
+    let pool = Pool::new(config()).await.unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    // no `max_memory`, so the sandbox tracker allows this outright
+    let err = session
+        .feed("x = ' ' * (1 << 46)", vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap_err();
+    let PoolError::Runtime(exc) = err else {
+        panic!("expected Runtime, got {err:?}");
+    };
+    assert_eq!(exc.exc_type().to_string(), "MemoryError");
+    assert_eq!(
+        exc.message(),
+        Some("the worker exceeded its memory ceiling and was terminated")
+    );
+    // unlike an in-sandbox exception, the worker is gone with it
+    assert!(matches!(session.finish().await, Err(PoolError::Finished)));
+
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    assert_eq!(
+        expect_complete(
+            session
+                .feed("3 + 3", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap()
+        ),
+        MontyObject::Int(6)
+    );
+    session.finish().await.unwrap();
+}
+
+/// The ceiling only changes *where* allocations start being refused, so a breach
+/// reports the same `MemoryError` — the divergence that matters is from the
+/// in-sandbox `max_memory` limit, which leaves the worker alive (see
+/// `child_resource_limits_do_not_kill_the_worker`).
 #[cfg(target_os = "linux")]
 #[test]
-fn worker_address_space_breach_kills_the_worker_and_the_pool_recovers() {
+fn worker_address_space_breach_is_a_memory_error() {
     let mut config = config();
     config.worker_address_space_limit = Some(1024 * 1024 * 1024); // 1 GiB
     let pool = Pool::new(config).unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).unwrap();
-    // no `max_memory`, so the sandbox tracker allows this outright
     let err = session
         .feed(
             "x = ' ' * (4 * 1024 * 1024 * 1024)",
@@ -1134,7 +1179,10 @@ fn worker_address_space_breach_kills_the_worker_and_the_pool_recovers() {
             &mut no_print,
         )
         .unwrap_err();
-    assert!(matches!(err, PoolError::Crashed { .. }), "got {err:?}");
+    let PoolError::Runtime(exc) = err else {
+        panic!("expected Runtime, got {err:?}");
+    };
+    assert_eq!(exc.exc_type().to_string(), "MemoryError");
 
     let mut session = pool.checkout(&ReplConfig::default()).unwrap();
     assert_eq!(

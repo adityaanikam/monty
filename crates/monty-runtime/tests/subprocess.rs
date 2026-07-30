@@ -3,11 +3,9 @@
 //! point of the subprocess mode is that a dead child is a recoverable event
 //! for the parent.
 
-#[cfg(target_os = "linux")]
-use std::os::unix::process::ExitStatusExt;
 use std::{
-    io::Write,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    io::{Read, Write},
+    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::Duration,
 };
@@ -27,13 +25,25 @@ impl ChildProc {
         Self::spawn_with_args(&[])
     }
 
-    /// Spawns the child with extra `subprocess` flags appended.
+    /// Spawns the child with extra `subprocess` flags appended, leaving its
+    /// stderr inherited so diagnostics show up in the test output.
     fn spawn_with_args(args: &[&str]) -> Self {
+        Self::spawn_with(args, Stdio::inherit())
+    }
+
+    /// Spawns the child with its stderr captured, for tests asserting on the
+    /// diagnostics it prints before dying (see [`Self::reap_with_stderr`]).
+    fn spawn_stderr_piped(args: &[&str]) -> Self {
+        Self::spawn_with(args, Stdio::piped())
+    }
+
+    fn spawn_with(args: &[&str], stderr: Stdio) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_monty"))
             .arg("subprocess")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(stderr)
             .spawn()
             .expect("failed to spawn monty subprocess");
         let writer = child.stdin.take().expect("child stdin");
@@ -123,6 +133,35 @@ impl ChildProc {
             result: Some(pb::ExtFunctionResult { kind: Some(result) }),
         }));
         self.recv_turn()
+    }
+
+    /// Feeds a snippet expected to kill the child, asserting no turn-ending
+    /// event arrives — EOF (the usual case) or a truncated frame instead.
+    #[track_caller]
+    fn feed_expecting_death(&mut self, code: &str) {
+        self.send(pb::parent_request::Kind::Feed(pb::Feed {
+            code: code.to_owned(),
+            inputs: vec![],
+            skip_type_check: false,
+        }));
+        match self.reader.read::<pb::ChildEvent>() {
+            Ok(None) | Err(_) => {}
+            Ok(Some(event)) => panic!("expected the child to die, got {:?}", event.kind),
+        }
+    }
+
+    /// Waits for the child and returns its status with everything it wrote to
+    /// stderr. Only valid for a child spawned by [`Self::spawn_stderr_piped`].
+    fn reap_with_stderr(&mut self) -> (ExitStatus, String) {
+        let mut stderr = String::new();
+        self.child
+            .stderr
+            .take()
+            .expect("child stderr must be piped")
+            .read_to_string(&mut stderr)
+            .expect("failed to read child stderr");
+        let status = self.child.wait().expect("failed to wait for child");
+        (status, stderr)
     }
 
     /// Tells the child to shut down and asserts a clean exit.
@@ -375,33 +414,35 @@ fn address_space_limit_leaves_normal_work_alone() {
     child.shutdown();
 }
 
+/// A refused allocation must leave the parent something it can classify: the
+/// dedicated exit code, not the `SIGABRT` Rust's allocation-error handler would
+/// raise (which a stack overflow also produces). Needs no ceiling — a request
+/// this large exceeds the usable address space on every platform.
+#[test]
+fn refused_allocation_exits_with_the_oom_code() {
+    let mut child = ChildProc::spawn_stderr_piped(&[]);
+    child.create_repl();
+    // no `max_memory`, so the sandbox tracker permits this outright
+    child.feed_expecting_death("x = ' ' * (1 << 46)");
+    let (status, stderr) = child.reap_with_stderr();
+    assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
+    assert!(stderr.contains("allocation of 70368744177664 bytes failed"), "{stderr}");
+}
+
 /// The point of the ceiling: an allocation the sandbox's `ResourceTracker`
 /// waves through (no `max_memory` here, and `str.repeat` allocates through
 /// infallible `String` growth) must kill the process instead of growing host
-/// memory without bound. The kernel fails the allocation, Rust's
-/// allocation-error handler aborts, and the parent sees a child that died
-/// without a turn-ending event.
+/// memory without bound. Same exit code — the ceiling only changes *where* the
+/// allocator starts refusing.
 #[cfg(target_os = "linux")]
 #[test]
-fn address_space_breach_aborts_the_child() {
-    let mut child = ChildProc::spawn_with_args(&["--address-space-limit", "1073741824"]); // 1 GiB
+fn address_space_breach_exits_with_the_oom_code() {
+    let mut child = ChildProc::spawn_stderr_piped(&["--address-space-limit", "1073741824"]); // 1 GiB
     child.create_repl();
-    child.send(pb::parent_request::Kind::Feed(pb::Feed {
-        code: "x = ' ' * (4 * 1024 * 1024 * 1024)".to_owned(),
-        inputs: vec![],
-        skip_type_check: false,
-    }));
-    // EOF (the usual case) or a truncated frame — never a turn-ending event
-    match child.reader.read::<pb::ChildEvent>() {
-        Ok(None) | Err(_) => {}
-        Ok(Some(event)) => panic!("expected the child to die, got {:?}", event.kind),
-    }
-    let status = child.child.wait().expect("failed to wait for child");
-    assert_eq!(
-        status.signal(),
-        Some(6), // SIGABRT
-        "expected SIGABRT from the allocation-error handler, got {status:?}"
-    );
+    child.feed_expecting_death("x = ' ' * (4 * 1024 * 1024 * 1024)");
+    let (status, stderr) = child.reap_with_stderr();
+    assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
+    assert!(stderr.contains("allocation of 4294967296 bytes failed"), "{stderr}");
 }
 
 #[test]

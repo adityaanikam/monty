@@ -396,10 +396,11 @@ class Monty:
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
             worker_address_space_limit: Hard ceiling in bytes on each worker
-                process's address space, backstopping the sandbox `limits`:
-                a breach kills the worker and raises `MontyCrashedError`
-                (see `limitations/resource_limits.md`). Linux only — ignored
-                with a warning on stderr elsewhere.
+                process's address space, backstopping the sandbox `limits`.
+                A breach raises `MontyRuntimeError` wrapping `MemoryError`, but
+                takes the worker (and so the session) with it — see
+                `limitations/resource_limits.md`. Linux only; ignored with a
+                warning on stderr elsewhere.
         """
 
     def __enter__(self) -> Self: ...

@@ -72,7 +72,23 @@ test('workerAddressSpaceLimit leaves normal work alone', async (ctx) => {
   await session.close()
 })
 
-test('workerAddressSpaceLimit breach crashes the worker', async (ctx) => {
+test('a refused allocation raises MemoryError and the pool recovers', async (ctx) => {
+  skipIfBrowser(ctx)
+  await using pool = await Monty.create()
+  const session = await pool.checkout()
+  // no maxMemory, so the sandbox tracker allows this outright: the allocation is
+  // refused below the interpreter, killing the worker but still reporting
+  // MemoryError rather than an unclassifiable crash
+  const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (1 << 46)"), {
+    instanceOf: MontyRuntimeError,
+  })
+  t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')
+  const next = await pool.checkout()
+  t.is(await next.feedRun('1 + 1'), 2)
+  await next.close()
+})
+
+test('workerAddressSpaceLimit breach raises MemoryError', async (ctx) => {
   skipIfBrowser(ctx)
   // RLIMIT_AS is only settable on Linux
   if (process.platform !== 'linux') {
@@ -80,11 +96,10 @@ test('workerAddressSpaceLimit breach crashes the worker', async (ctx) => {
   }
   await using pool = await Monty.create({ workerAddressSpaceLimit: 1024 ** 3 })
   const session = await pool.checkout()
-  // no maxMemory, so the sandbox tracker allows this allocation outright
   const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (4 * 1024 * 1024 * 1024)"), {
-    instanceOf: MontyCrashedError,
+    instanceOf: MontyRuntimeError,
   })
-  t.false(error.timedOut)
+  t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')
   const next = await pool.checkout()
   t.is(await next.feedRun('1 + 1'), 2)
   await next.close()

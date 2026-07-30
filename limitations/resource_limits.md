@@ -48,15 +48,18 @@ subprocesses can set a second, independent ceiling below the interpreter —
 JavaScript — which the worker applies to itself as `RLIMIT_AS` before serving
 any request. Divergences from every other limit documented here:
 
-- **It is not a Python-visible error.** A breach fails an allocation the
-  interpreter cannot handle, so the worker aborts (`SIGABRT`) mid-turn. The host
-  sees a crash (`PoolError::Crashed` / `MontyCrashedError`), *not* a
-  `MemoryError`, and the session is lost — unlike `max_memory`, where the worker
-  survives and stays usable. Sandboxed code cannot observe or catch it.
-- **Linux only.** Darwin refuses to set `RLIMIT_AS` (aliased onto `RLIMIT_RSS`)
-  or `RLIMIT_DATA` at all, and Windows has no rlimits. On those platforms the
-  worker prints a warning to stderr and runs unbounded, so the ceiling is a
-  production backstop, not a portable guarantee.
+- **It kills the worker, though it still reports `MemoryError`.** A breach fails
+  an allocation the interpreter cannot handle, so the worker exits mid-turn. The
+  host gets `PoolError::Runtime` / `MontyRuntimeError` wrapping a `MemoryError`
+  whose message names the ceiling — but unlike every other runtime error, and
+  unlike an in-sandbox `max_memory` breach, the session is gone with the worker
+  (later calls on that checkout report `Finished`; the pool itself recovers).
+  Sandboxed code cannot observe or catch it.
+- **The ceiling is Linux only.** Darwin refuses to set `RLIMIT_AS` (aliased onto
+  `RLIMIT_RSS`) or `RLIMIT_DATA` at all, and Windows has no rlimits. On those
+  platforms the worker prints a warning to stderr and runs unbounded, so the
+  ceiling is a production backstop, not a portable guarantee. Only the
+  *reporting* below is cross-platform.
 - **It bounds virtual address space, not live heap.** Thread stacks, allocator
   arena reservations and file mappings all count against it, so the value must
   sit well above the `max_memory` budget it backstops — a few hundred MiB of
@@ -70,6 +73,16 @@ any request. Divergences from every other limit documented here:
   are set, so nothing in the process can lift it afterwards.
 - Only the subprocess transport applies it: WebSocket workers are remote
   processes this pool does not spawn, and the wasm worker has no rlimits.
+
+Independently of any ceiling, **any** allocation a worker's allocator refuses —
+plain host OOM, or a request beyond the usable address space such as
+`' ' * (1 << 46)` — takes this same path on every platform: the worker exits and
+the host sees that `MemoryError` with its session gone. CPython raises a
+catchable `MemoryError` in-process and carries on. Monty cannot: the failure
+happens below the interpreter, where no Python-level exception can be raised, so
+the worker classifies the failure into a dedicated exit code and dies. (Without
+that, the process would abort with `SIGABRT` — indistinguishable from a stack
+overflow, which is why the sandbox exits deliberately instead.)
 
 ## Integer-specific caps
 

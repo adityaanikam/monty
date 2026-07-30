@@ -131,15 +131,32 @@ def test_worker_address_space_limit_leaves_normal_work_alone():
             assert session.feed_run('1 + 1') == snapshot(2)
 
 
+def test_refused_allocation_raises_memory_error():
+    # no `max_memory`, so the sandbox tracker allows this outright: the
+    # allocation is refused below the interpreter, which kills the worker but
+    # still reports MemoryError rather than an unclassifiable crash
+    with Monty() as pool:
+        with pool.checkout() as session:
+            with pytest.raises(MontyRuntimeError) as exc_info:
+                session.feed_run("x = ' ' * (1 << 46)")
+            assert str(exc_info.value) == snapshot(
+                'MemoryError: the worker exceeded its memory ceiling and was terminated'
+            )
+            assert isinstance(exc_info.value.exception(), MemoryError)
+        # unlike an in-sandbox exception this took the worker with it, but the
+        # pool replaces it for the next checkout
+        with pool.checkout() as session:
+            assert session.feed_run('1 + 1') == snapshot(2)
+
+
 @pytest.mark.skipif(sys.platform != 'linux', reason='RLIMIT_AS is only settable on Linux')
-def test_worker_address_space_breach_crashes_the_worker():
-    # no `max_memory`, so the sandbox tracker allows this allocation outright —
-    # the kernel refuses it and the worker dies, which is the whole point
+def test_worker_address_space_breach_raises_memory_error():
+    # the ceiling only changes where allocations start being refused
     with Monty(worker_address_space_limit=1024**3) as pool:
         with pool.checkout() as session:
-            with pytest.raises(MontyCrashedError) as exc_info:
+            with pytest.raises(MontyRuntimeError) as exc_info:
                 session.feed_run("x = ' ' * (4 * 1024 * 1024 * 1024)")
-            assert exc_info.value.timed_out is False
+            assert isinstance(exc_info.value.exception(), MemoryError)
         with pool.checkout() as session:
             assert session.feed_run('1 + 1') == snapshot(2)
 

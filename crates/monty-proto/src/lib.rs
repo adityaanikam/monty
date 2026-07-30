@@ -20,6 +20,16 @@ pub mod worker;
 /// independently. Equals the workspace version, since every crate shares it.
 pub const MONTY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Exit code a worker uses when the allocator refused an allocation, so the
+/// parent can report `MemoryError` instead of an unclassifiable `SIGABRT`.
+///
+/// Part of the parent↔child contract, hence here rather than in either binary:
+/// the child exits with it (see `monty-runtime`'s `oom_exit` module) and the
+/// pool matches on it. Deliberately clear of every other code a worker exits
+/// with (0 clean, 1 CLI misuse, 2 frame desync/oversize, 3 stdout gone,
+/// 4 announced `FatalError`, 101 panic) and of the shell's reserved 126+ range.
+pub const OOM_EXIT_CODE: i32 = 42;
+
 pub use convert::{MAX_VALUE_DEPTH, ProtoConvertError, exceeds_max_value_depth, future_results_from_proto};
 pub use frame::{
     DEFAULT_MAX_DECODE_BYTES, FrameError, FrameReader, MAX_FRAME_LEN, decode_frame, encode_framed_into,

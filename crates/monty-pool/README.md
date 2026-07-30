@@ -81,11 +81,14 @@ and restored later — including on a different worker or machine — with `Chec
   the impact of any slow leak.
 - **Hard memory ceiling (Linux)** — `worker_address_space_limit` caps each spawned worker's
   address space (`RLIMIT_AS`), backstopping the sandbox's own `max_memory` for allocations
-  its tracker never sees. A breach aborts the worker (`PoolError::Crashed`) rather than
-  growing the host until the OOM killer intervenes.
+  its tracker never sees, rather than growing the host until the OOM killer intervenes.
+  A refused allocation (with or without a ceiling) exits the worker with a dedicated code
+  so it surfaces as `PoolError::Runtime`/`MemoryError` instead of an unclassifiable abort —
+  the one `Runtime` error whose worker does not survive.
 
 Runtime errors inside the sandbox (`PoolError::Runtime`) are not crashes: the worker and its
-session remain alive and usable.
+session remain alive and usable — the one exception being the `MemoryError` above, raised for
+a worker that has already exited.
 
 ## Transports
 

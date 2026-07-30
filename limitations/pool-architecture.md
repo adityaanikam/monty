@@ -108,12 +108,19 @@ properties that real CPython does not provide, per the caveat above.
   case) can delay enforcement by that long.
 - **`max_memory` can be backstopped by a hard, Linux-only address-space
   ceiling.** `worker_address_space_limit` / `workerAddressSpaceLimit` at pool
-  creation caps each worker's `RLIMIT_AS` — a breach aborts the worker and
-  surfaces as `MontyCrashedError`, never as `MemoryError`, losing the session
-  (the in-sandbox limit, by contrast, leaves the worker usable). Off by default;
-  ignored with a stderr warning on macOS and Windows, and by the WebSocket
-  transport. It is the only worker configuration the parent passes outside the
-  protocol, as a `subprocess` CLI flag. See `limitations/resource_limits.md`.
+  creation caps each worker's `RLIMIT_AS`. Off by default; ignored with a stderr
+  warning on macOS and Windows, and by the WebSocket transport (whose exit codes
+  do not travel, so a remote breach degrades to `Disconnected`). It is the only
+  worker configuration the parent passes outside the protocol, as a `subprocess`
+  CLI flag. See `limitations/resource_limits.md`.
+- **A refused allocation is the one `MemoryError` that kills the session.** The
+  worker's allocator exits with a dedicated code rather than letting Rust abort
+  (`SIGABRT`, which a stack overflow also produces and which would be
+  unclassifiable), so the host gets `MontyRuntimeError`/`MemoryError` with a
+  distinct message instead of `MontyCrashedError` — but the worker is already
+  dead and later calls on that checkout report `Finished`. Every other
+  `MontyRuntimeError` leaves the session usable. Applies on all platforms, with
+  or without a ceiling configured.
 - **Workers are spawned with an empty environment** (on Windows only
   `SystemRoot` is kept, which CRT/WinAPI lookups need): host secrets are
   never in a worker's memory, where a sandbox escape or memory disclosure

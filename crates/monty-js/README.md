@@ -322,10 +322,12 @@ const pool = await Monty.create({
 })
 ```
 
-`workerAddressSpaceLimit` backstops the in-sandbox `maxMemory` limit: a breach
-kills the worker with `MontyCrashedError` instead of growing the host without
-bound. It caps _virtual_ address space, so leave generous headroom, and it is
-enforced on Linux only (elsewhere the worker warns on stderr).
+`workerAddressSpaceLimit` backstops the in-sandbox `maxMemory` limit instead of
+letting the worker grow the host without bound. It caps _virtual_ address space,
+so leave generous headroom, and it is enforced on Linux only (elsewhere the
+worker warns on stderr). A breach raises `MontyRuntimeError` wrapping
+`MemoryError` — but unlike other runtime errors it takes the worker with it, so
+the session is finished (the pool recovers).
 
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo
