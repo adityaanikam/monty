@@ -8,7 +8,10 @@
     // `rust-toolchain.toml` is absent, so stable is what the repo expects.
     "ghcr.io/devcontainers/features/rust:1": {},
     // for `make install-js` / `make test-js`
-    "ghcr.io/devcontainers/features/node:1": {}
+    "ghcr.io/devcontainers/features/node:1": {},
+    // required by `gh cs ssh` (and so by Zed): unlike the default Codespaces
+    // image, devcontainers/base ships no SSH server.
+    "ghcr.io/devcontainers/features/sshd:1": {}
   },
 
   // A 2-core machine builds this workspace painfully slowly.
