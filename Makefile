@@ -29,9 +29,14 @@ install: .cargo install-py install-js ## Install the package, dependencies, and 
 	uvx prek install --install-hooks
 
 .PHONY: dev-py
-dev-py: install-py ## Install the python package for development
+dev-py: install-py ## Install python packages for development
 	uv run maturin develop --uv -m crates/monty-runtime/Cargo.toml
 	uv run maturin develop --uv -m crates/monty-python/Cargo.toml
+
+.PHONY: dev-py-release
+dev-py-release: install-py ## Install python packages for development with a release build
+	uv run maturin develop --uv -m crates/monty-runtime/Cargo.toml --release
+	uv run maturin develop --uv -m crates/monty-python/Cargo.toml --release
 
 .PHONY: build-js
 build-js: install-js ## Build the JS package (napi debug build + TypeScript)
@@ -45,11 +50,6 @@ lint-js: install-js ## Lint JS code with oxlint
 test-js: build-js ## Test the JS package (builds the monty binary the workers run)
 	cargo build -p monty-runtime
 	cd crates/monty-js && MONTY_BIN="$${CARGO_TARGET_DIR:-../../target}/debug/monty$(EXE_EXT)" npm test
-
-.PHONY: dev-py-release
-dev-py-release: ## Install the python package for development with a release build
-	uv run maturin develop --uv -m crates/monty-runtime/Cargo.toml --release
-	uv run maturin develop --uv -m crates/monty-python/Cargo.toml --release
 
 .PHONY: build-wasm
 build-wasm: install-js ## Build the lean wasm worker module (requires the wasm32-wasip1 target)

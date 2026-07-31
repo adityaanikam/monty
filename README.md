@@ -236,6 +236,25 @@ let result = runner2.run(vec![MontyObject::Int(41)], ResourceTracker::default(),
 assert_eq!(result, MontyObject::Int(42));
 ```
 
+## Configuring the hard memory limit
+
+`worker_hard_memory_limit` (`workerHardMemoryLimit` in JavaScript,
+`PoolConfig::worker_hard_memory_limit` in Rust) is a hard `RLIMIT_AS` ceiling on
+each worker process, backstopping the in-sandbox `max_memory` for allocations its
+tracker never sees. A breach kills the worker with a `MemoryError` — losing that
+session, though the pool replaces the worker — rather than letting it grow until
+the OS OOM killer picks a victim. **Linux only:** elsewhere a worker given this
+limit refuses to start rather than run uncapped.
+
+Set it to **`max_memory` + 30MB**, or **+ 40MB if you use type checking**. The same
+numbers are the floor: below 30MB (40MB with type checking) no worker starts at
+all, whatever `max_memory` says.
+
+Those are rounded up from what a worker really occupies — ~23 MiB of address space,
+~31 MiB with type checking — so the binary can grow without anyone having to
+revisit their configuration. `scripts/hard_memory_sweep.py` in
+the repository root measure the exact numbers for a given build and platform.
+
 ## PydanticAI Integration
 
 Monty will power code-mode in
