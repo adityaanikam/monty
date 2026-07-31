@@ -68,10 +68,12 @@ any request. Divergences from every other limit documented here:
   the same way, reporting that the ceiling could not be applied rather than that
   the platform lacks it. Only the *reporting* below is cross-platform.
 - **It bounds virtual address space, not live heap.** Thread stacks, allocator
-  arena reservations and file mappings all count against it, so the value must
-  sit well above the `max_memory` budget it backstops — a few hundred MiB of
-  headroom at minimum. Too tight a ceiling kills healthy workers, most likely on
-  the first type-checked feed (typeshed and salsa caches load then).
+  arena reservations and file mappings all count against it, so it must sit
+  above the `max_memory` budget it backstops by the worker's own footprint (see
+  the README for the headroom to add, and `scripts/hard_memory_sweep.py` to
+  measure it for a given build and host). Too tight a ceiling kills healthy
+  workers, most likely on the first type-checked feed (typeshed and salsa
+  caches load then).
 - **Per process, not per session.** The ceiling is fixed at pool creation and
   never re-derived, so a recycled worker's ceiling still covers whatever residue
   earlier sessions left behind.

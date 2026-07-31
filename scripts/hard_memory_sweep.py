@@ -101,7 +101,12 @@ def run_cell(
                 try:
                     session.feed_run('1 + 1', skip_type_check=True)
                 except MontyError as exc:
-                    return Outcome(NO_START, str(exc))
+                    # A worker that cannot manage `1 + 1` is `no-start`, whatever
+                    # memory outcome it reported. Anything else is unrelated to
+                    # the ceiling and must reach the summary rather than silently
+                    # reading as "ceiling too small" and shifting a threshold.
+                    outcome = record(classify(exc))
+                    return outcome if outcome.code == OTHER else Outcome(NO_START, outcome.detail)
                 session.feed_run(code)
                 return Outcome(OK)
     except MontyError as exc:

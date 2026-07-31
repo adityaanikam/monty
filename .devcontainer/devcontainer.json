@@ -25,8 +25,11 @@
 
   // Putting .venv on PATH is what lets pyo3's build script find the uv-managed
   // CPython (shared libpython) instead of the image's static /usr/bin/python3.
+  // ~/.local/bin (where uv installs itself) belongs here rather than only in
+  // ~/.bashrc so non-interactive processes — VS Code tasks, the debugger — can
+  // run the `make` targets too.
   "remoteEnv": {
     "VIRTUAL_ENV": "${containerWorkspaceFolder}/.venv",
-    "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
+    "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:HOME}/.local/bin:${containerEnv:PATH}"
   }
 }
