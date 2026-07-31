@@ -1037,19 +1037,19 @@ impl Checkout {
             // ceiling was actually configured: blaming a limit nobody asked for
             // would send the reader hunting for a setting that is not set, and
             // nothing stops another binary from returning this code. A subprocess
-            // worker runs on this host, so
-            // `cfg!` distinguishes the two causes: on Linux the rlimit exists and
-            // something else refused it (detail on the worker's stderr), elsewhere
-            // there is no such knob to begin with.
-            let explanation = if cfg!(target_os = "linux") {
-                "see the worker's stderr"
+            // worker runs on this host, so `cfg!` distinguishes the two causes:
+            // on Linux the rlimit exists and something else (a seccomp filter, a
+            // container policy) refused it, which is a configuration failure, not
+            // a missing platform feature.
+            let reason = if cfg!(target_os = "linux") {
+                "Hard memory limit could not be applied, see the worker's stderr"
             } else {
-                "requires Linux"
+                "Hard memory limit is invalid on this platform, requires Linux"
             };
             PoolError::Crashed {
                 status,
                 cause: CrashCause::Announced {
-                    reason: format!("Hard memory limit is invalid on this platform, {explanation}"),
+                    reason: reason.to_owned(),
                 },
             }
         } else if status.and_then(|status| status.code()) == Some(monty_proto::OOM_EXIT_CODE) {

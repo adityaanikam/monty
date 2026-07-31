@@ -23,7 +23,7 @@ pub const MONTY_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Exit code a worker uses when the allocator refused an allocation, so the
 /// parent can report `MemoryError` instead of an unclassifiable `SIGABRT`.
 ///
-/// `EX_DATAERR` from BSD `sysexits.h` see <https://man.freebsd.org/cgi/man.cgi?query=sysexits>,
+/// `EX_DATAERR` from BSD `sysexits.h`. See <https://man.freebsd.org/cgi/man.cgi?query=sysexits>.
 pub const OOM_EXIT_CODE: i32 = 65;
 
 /// Exit code a worker uses when it was given a hard memory limit it cannot

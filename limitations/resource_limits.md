@@ -63,8 +63,10 @@ any request. Divergences from every other limit documented here:
   macOS or Windows yields **no usable workers**, by design — silently ignoring it
   would leave a host that asked to be capped running uncapped. There is no
   spawn-time handshake, so the refusal surfaces on the session's first request
-  (the `Configure` inside `checkout`), not at pool construction. Only the
-  *reporting* below is cross-platform.
+  (the `Configure` inside `checkout`), not at pool construction. A Linux worker
+  whose `setrlimit` is refused by policy (seccomp, container) declines to serve
+  the same way, reporting that the ceiling could not be applied rather than that
+  the platform lacks it. Only the *reporting* below is cross-platform.
 - **It bounds virtual address space, not live heap.** Thread stacks, allocator
   arena reservations and file mappings all count against it, so the value must
   sit well above the `max_memory` budget it backstops — a few hundred MiB of

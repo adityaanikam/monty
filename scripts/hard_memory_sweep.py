@@ -7,7 +7,7 @@ plus salsa all count against it. That makes the usable floor a property of the
 build and the machine, not something we can state once in a doc — hence this
 sweep. Run it on Linux; elsewhere the ceiling cannot be applied at all.
 
-    make dev-py && uv run hard_memory_sweep.py
+    make dev-py && uv run scripts/hard_memory_sweep.py
 
 Thresholds are bisected, so this spawns a few hundred workers over a few minutes.
 Lines like `monty worker: allocation of N bytes failed` are the worker's own
@@ -74,7 +74,9 @@ def classify(exc: BaseException) -> Outcome:
         return Outcome(SOFT, message)
     if 'exceeded its memory ceiling' in message:
         return Outcome(HARD, message)
-    if 'invalid on this platform' in message:
+    # the pool words this two ways: unsupported off Linux, refused (seccomp, a
+    # container policy) on it — both mean the worker declined to serve
+    if 'Hard memory limit' in message:
         return Outcome(NO_START, message)
     return Outcome(OTHER, f'{type(exc).__name__}: {message}')
 
@@ -120,16 +122,16 @@ def alloc(mib: int) -> str:
     return f"x = ' ' * ({mib} * 1024 * 1024)"
 
 
-def churn(mib: int) -> str:
-    """Builds roughly `mib` MiB out of many 64 KiB pieces, all retained.
+def fill() -> str:
+    """Retains 64 KiB pieces until the tracker refuses, peaking at `max_memory`.
 
     Sequence repeat is *pre-checked* against the tracker above 100 KB, so one
     huge `' ' * n` never reaches the allocator once `max_memory` is set and would
     measure nothing about the ceiling. Pieces under that threshold take the
-    ordinary tracked path, so real allocator cost (capacity slack, arenas,
+    ordinary tracked path, so allocator cost (capacity slack, arenas,
     fragmentation) lands against `RLIMIT_AS` as a real workload's would.
     """
-    return f"xs = []\nfor _ in range({mib} * 16):\n    xs.append(' ' * (64 * 1024))"
+    return "xs = []\nwhile True:\n    xs.append(' ' * (64 * 1024))"
 
 
 def worker_vm(type_check: bool) -> str:
@@ -208,24 +210,22 @@ def probe_headroom() -> None:
     """Smallest ceiling at which `max_memory` — not the kernel — stops a workload.
 
     A well-sized ceiling is invisible: the tracker fires first, as a catchable
-    `MemoryError` that leaves the worker alive. Reports the ceiling minus the
-    budget, which is the number to add to `max_memory` when picking one.
+    `MemoryError` that leaves the worker alive. The workload runs until the
+    tracker stops it, so the ceiling is measured against a peak of exactly
+    `max_memory` — the worst case the budget permits, not a sample below it.
+    Reports the ceiling minus the budget, which is the number to add to
+    `max_memory` when picking one.
     """
     for type_check in TYPE_CHECK_MODES:
         print(f'== smallest ceiling that keeps max_memory in charge (type_check={type_check}) ==')
         print('  max_memory   ceiling   ceiling-max_memory')
         for budget in BUDGETS_MIB:
-            peak = max(budget * 3 // 4, 1)
-
-            def backstops(mib: int, b: int = budget, pk: int = peak, t: bool = type_check) -> bool:
-                # filling most of the budget for real must succeed, and going
-                # over it must still be the tracker's refusal, not a hard kill
-                under = run_cell(mib * MIB, churn(pk), max_memory=b * MIB, type_check=t)
-                if under.code != OK:
-                    return False
-                return run_cell(mib * MIB, alloc(b * 4), max_memory=b * MIB, type_check=t).code == SOFT
-
-            found = bisect_min(backstops)
+            # exhausting the budget must end as the tracker's refusal, not a hard kill
+            found = bisect_min(
+                lambda mib, b=budget, t=type_check: (
+                    run_cell(mib * MIB, fill(), max_memory=b * MIB, type_check=t).code == SOFT
+                )
+            )
             if found is None:
                 print(f'  {budget:>7} MiB   (none of the probed ceilings behaved as a backstop)')
             else:

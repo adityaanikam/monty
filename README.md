@@ -253,7 +253,7 @@ all, whatever `max_memory` says.
 Those are rounded up from what a worker really occupies — ~23 MiB of address space,
 ~31 MiB with type checking — so the binary can grow without anyone having to
 revisit their configuration. `scripts/hard_memory_sweep.py` in
-the repository root measure the exact numbers for a given build and platform.
+the repository root measures the exact numbers for a given build and platform.
 
 ## PydanticAI Integration
 
