@@ -108,15 +108,21 @@ properties that real CPython does not provide, per the caveat above.
   case) can delay enforcement by that long.
 - **`max_memory` can be backstopped by a hard, Linux-only memory ceiling.**
   `worker_hard_memory_limit` / `workerHardMemoryLimit` at pool
-  creation caps each worker's `RLIMIT_AS`. Off by default; ignored with a stderr
-  warning on macOS and Windows, and by the WebSocket transport (whose exit codes
-  do not travel, so a remote breach degrades to `Disconnected`). It is the only
-  worker configuration the parent passes outside the protocol, as a `subprocess`
-  CLI flag. See `limitations/resource_limits.md`.
+  creation caps each worker's `RLIMIT_AS`. Off by default. Setting it on macOS or
+  Windows is **fatal, not ignored**: the worker exits 78 (`EX_CONFIG` — a ceiling
+  it cannot provide) rather than run uncapped, and the pool reports
+  `MontyCrashedError` naming the reason,
+  so the knob yields no usable workers there. Ignored by the WebSocket transport
+  (whose exit codes do not travel, so a remote breach degrades to
+  `Disconnected`). It is the only worker configuration the parent passes outside
+  the protocol, as a `subprocess` CLI flag. Both exit codes borrow
+  [`sysexits.h`](https://man.freebsd.org/sysexits) so a bare status is legible in
+  a log. See `limitations/resource_limits.md`.
 - **A refused allocation is the one `MemoryError` that kills the session.** The
-  worker's allocator exits with a dedicated code rather than letting Rust abort
-  (`SIGABRT`, which a stack overflow also produces and which would be
-  unclassifiable), so the host gets `MontyRuntimeError`/`MemoryError` with a
+  worker's allocator exits 65 (`EX_DATAERR` — the fed snippet asked for more than
+  it may have) rather than letting Rust abort (`SIGABRT`, which a stack overflow
+  also produces and which would be unclassifiable), so the host gets
+  `MontyRuntimeError`/`MemoryError` with a
   distinct message instead of `MontyCrashedError` — but the worker is already
   dead and later calls on that checkout report `Finished`. An ordinary in-sandbox
   exception leaves the session usable; a failed `load_session` / `load_snapshot`

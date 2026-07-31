@@ -400,7 +400,10 @@ class Monty:
                 `MontyRuntimeError` wrapping `MemoryError`, but takes the worker
                 (and so the session) with it. `RLIMIT_AS` bounds *virtual*
                 address space, so leave headroom above `limits['max_memory']`.
-                Linux only; ignored with a warning on stderr elsewhere.
+                Linux only, and fatal elsewhere: rather than run a worker you
+                believe is capped, the worker exits and the session raises
+                `MontyCrashedError`, so setting this on macOS or Windows yields
+                no usable workers.
         """
 
     def __enter__(self) -> Self: ...

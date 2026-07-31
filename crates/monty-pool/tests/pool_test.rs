@@ -2,6 +2,8 @@
 //! headline scenarios: a worker dying mid-execution (kill, crash, timeout)
 //! must surface as a clean error and never poison the pool.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     env, fs,
     future::ready,
@@ -1102,8 +1104,8 @@ async fn child_resource_limits_do_not_kill_the_worker() {
 }
 
 /// A ceiling generous enough for the interpreter must not disturb ordinary
-/// sessions. Runs on every platform, so the flag plumbing is covered even where
-/// the kernel cannot enforce it (the worker warns on stderr instead).
+/// sessions: it is a backstop, not a second sandbox budget.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn worker_hard_memory_limit_leaves_normal_work_alone() {
     let mut config = config();
@@ -1120,6 +1122,60 @@ async fn worker_hard_memory_limit_leaves_normal_work_alone() {
         MontyObject::Int(2)
     );
     session.finish().await.unwrap();
+}
+
+/// A ceiling the worker cannot apply must fail loudly at checkout rather than
+/// hand back an uncapped worker. There is no spawn-time handshake, so the
+/// refusal surfaces on the first request as a crash carrying the worker's reason.
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn unappliable_worker_hard_memory_limit_fails_the_checkout() {
+    let mut config = config();
+    config.worker_hard_memory_limit = Some(2 * 1024 * 1024 * 1024);
+    let pool = Pool::new(config).await.unwrap();
+    let err = match pool.checkout(&ReplConfig::default()).await {
+        Ok(mut session) => session
+            .feed("1 + 1", vec![], vec![], false, &mut no_print)
+            .await
+            .expect_err("expected the worker to refuse to serve"),
+        Err(err) => err,
+    };
+    let PoolError::Crashed { cause, .. } = &err else {
+        panic!("expected Crashed, got {err:?}");
+    };
+    let monty_pool::CrashCause::Announced { reason } = cause else {
+        panic!("expected an announced cause, got {cause:?}");
+    };
+    assert_eq!(reason, "Hard memory limit is invalid on this platform, requires Linux");
+}
+
+/// `EX_USAGE` is a code any binary might return, so it must only be read as "the
+/// hard memory limit could not be applied" when a limit was actually configured.
+/// Otherwise the host would go hunting for a setting it never set.
+#[cfg(unix)]
+#[tokio::test]
+async fn usage_exit_is_not_blamed_on_an_unconfigured_memory_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("monty");
+    fs::write(&fake, "#!/bin/sh\nexit 64\n").unwrap();
+    fs::set_permissions(&fake, PermissionsExt::from_mode(0o755)).unwrap();
+
+    // no `worker_hard_memory_limit`, so 64 must stay an opaque death
+    let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
+    let err = match pool.checkout(&ReplConfig::default()).await {
+        Ok(mut session) => session
+            .feed("1 + 1", vec![], vec![], false, &mut no_print)
+            .await
+            .expect_err("expected the stand-in binary to fail the turn"),
+        Err(err) => err,
+    };
+    let PoolError::Crashed { cause, .. } = &err else {
+        panic!("expected Crashed, got {err:?}");
+    };
+    assert!(
+        matches!(cause, monty_pool::CrashCause::Vanished { .. }),
+        "64 without a configured ceiling must not be blamed on one, got {cause:?}"
+    );
 }
 
 /// A refused allocation is the one `Runtime` error whose worker is already

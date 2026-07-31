@@ -1,7 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    fmt, fs,
+    borrow::Cow,
+    fmt, fs, process,
     process::ExitCode,
     time::{Duration, Instant},
 };
@@ -100,8 +101,8 @@ enum Command {
         /// Hard memory ceiling in bytes for this process, set as `RLIMIT_AS`
         /// before any request is served; a breach kills the worker, backstopping
         /// the sandbox's own `max_memory`. `RLIMIT_AS` bounds virtual address
-        /// space, so leave headroom. Linux only — elsewhere it warns and runs
-        /// unbounded.
+        /// space, so leave headroom. Linux only — elsewhere the worker refuses
+        /// to serve rather than run without the ceiling.
         #[arg(long)]
         hard_memory_limit: Option<u64>,
     },
@@ -177,21 +178,21 @@ fn main() -> ExitCode {
             eprintln!("{BOLD_RED}error{RESET}: `subprocess` cannot be combined with {flag}");
             return ExitCode::FAILURE;
         }
+        // A host that asked for a memory ceiling must never silently get a worker
+        // without one, so a ceiling we cannot apply refuses to serve. Exiting on
+        // a dedicated code (rather than returning `ExitCode`) lets the parent
+        // report the cause instead of an opaque death.
         if let Some(bytes) = hard_memory_limit {
-            match rlimit::apply(bytes) {
-                Ok(Some(_)) => {}
-                // the caller asked for a bound this platform cannot give: say so
-                // loudly (stderr reaches the host) but still serve the session
-                Ok(None) => eprintln!(
-                    "{DIM}warning{RESET}: --hard-memory-limit is only enforced on Linux; \
-                     this worker runs without a hard memory ceiling"
-                ),
-                // the bound was available and still could not be set — refuse to
-                // run rather than pretend the worker is capped
-                Err(err) => {
-                    eprintln!("{BOLD_RED}error{RESET}: {err}");
-                    return ExitCode::FAILURE;
-                }
+            let reason = match rlimit::apply(bytes) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(Cow::Borrowed(
+                    "Hard memory limit is invalid on this platform, requires Linux.",
+                )),
+                Err(err) => Some(Cow::Owned(err)),
+            };
+            if let Some(reason) = reason {
+                eprintln!("{BOLD_RED}error{RESET}: {reason}");
+                process::exit(monty_proto::LIMIT_UNAVAILABLE_EXIT_CODE);
             }
         }
         return subprocess::run();

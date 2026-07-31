@@ -84,7 +84,9 @@ and restored later — including on a different worker or machine — with `Chec
   its tracker never sees, rather than growing the host until the OOM killer intervenes.
   A refused allocation (with or without a ceiling) exits the worker with a dedicated code
   so it surfaces as `PoolError::Runtime`/`MemoryError` instead of an unclassifiable abort —
-  the one `Runtime` error whose worker does not survive.
+  the one `Runtime` error whose worker does not survive. On non-Linux hosts a worker given
+  this limit refuses to serve rather than run uncapped, failing the checkout with a crash
+  that names the reason.
 
 Runtime errors inside the sandbox (`PoolError::Runtime`) are not crashes: the worker and its
 session remain alive and usable — the one exception being the `MemoryError` above, raised for

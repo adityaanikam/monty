@@ -21,6 +21,10 @@ use monty_proto::{
     write_frame,
 };
 
+/// BSD `sysexits.h` "remote error in protocol" — the frame stream desynchronized, or
+/// an event too large to frame left the response unsendable.
+const EX_PROTOCOL: u8 = 76;
+
 /// Runs the subprocess child loop until EOF, `Shutdown`, or a fatal error.
 pub(crate) fn run() -> ExitCode {
     install_panic_hook();
@@ -45,7 +49,7 @@ pub(crate) fn run() -> ExitCode {
                         &mut sink,
                         &format!("response frame of {len} bytes exceeds maximum of {max} bytes"),
                     );
-                    return ExitCode::from(2);
+                    return ExitCode::from(EX_PROTOCOL);
                 }
                 // writing to stdout failed: the parent is gone, nothing left to do
                 Err(_) => return ExitCode::from(3),
@@ -67,7 +71,7 @@ pub(crate) fn run() -> ExitCode {
             Err(err) => {
                 // the stream is desynchronized — unrecoverable by design
                 fatal(&child, &mut sink, &format!("malformed request frame: {err}"));
-                return ExitCode::from(2);
+                return ExitCode::from(EX_PROTOCOL);
             }
         }
     }

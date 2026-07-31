@@ -75,7 +75,9 @@ pub struct PoolConfig {
     /// `RLIMIT_AS`: a breach kills the worker and reports `MemoryError`
     /// ([`PoolError::Runtime`]) instead of growing the host without bound. Leave
     /// headroom above the sandbox's `max_memory` — `RLIMIT_AS` bounds *virtual*
-    /// address space. Ignored elsewhere, and by the WebSocket transport.
+    /// address space. On non-Linux hosts the worker refuses to serve at all
+    /// rather than run uncapped, so setting this there yields no usable workers.
+    /// Ignored by the WebSocket transport, whose children this pool cannot spawn.
     pub worker_hard_memory_limit: Option<u64>,
 }
 
@@ -188,8 +190,9 @@ pub enum CrashCause {
         context: String,
     },
     /// It announced a `FatalError` and exited, so its own account replaces
-    /// the pool's. A serving relay also uses this to report that it could not
-    /// start a worker at all.
+    /// the pool's — as does a death the pool can name from the exit code alone
+    /// (a ceiling it could not apply). A serving relay also uses this to report
+    /// that it could not start a worker at all.
     Announced {
         /// What the worker said before dying.
         reason: String,

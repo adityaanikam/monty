@@ -50,8 +50,10 @@ export interface MontyOptions {
    * is refused, raising `MontyRuntimeError`/`MemoryError` and taking the worker
    * (and its session) with it, instead of growing the host until the OS OOM
    * killer intervenes. `RLIMIT_AS` bounds virtual address space, so leave
-   * headroom. **Linux only** — elsewhere the worker warns on stderr and runs
-   * unbounded.
+   * headroom. **Linux only**, and fatal elsewhere: rather than run a worker you
+   * believe is capped, the worker exits and the session fails with a crash
+   * naming the reason — so setting this on macOS or Windows yields no usable
+   * workers.
    */
   workerHardMemoryLimit?: number
 }

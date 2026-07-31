@@ -404,14 +404,33 @@ fn child_enforces_time_limit() {
 }
 
 /// A ceiling generous enough for the interpreter must be invisible: it is a
-/// backstop, not a second sandbox budget. Runs everywhere — on non-Linux the
-/// child warns on stderr and serves the session unbounded.
+/// backstop, not a second sandbox budget.
 #[test]
+#[cfg(target_os = "linux")]
 fn hard_memory_limit_leaves_normal_work_alone() {
     let mut child = ChildProc::spawn_with_args(&["--hard-memory-limit", "2147483648"]); // 2 GiB
     child.create_repl();
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
+}
+
+/// Where the ceiling cannot be applied the worker must refuse to serve on its
+/// own exit code, never run unbounded: a host that asked to be capped would
+/// otherwise get an uncapped worker and no way to know.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unappliable_hard_memory_limit_refuses_to_serve() {
+    let mut child = ChildProc::spawn_stderr_piped(&["--hard-memory-limit", "2147483648"]);
+    let (status, stderr) = child.reap_with_stderr();
+    assert_eq!(
+        status.code(),
+        Some(monty_proto::LIMIT_UNAVAILABLE_EXIT_CODE),
+        "got {status:?}"
+    );
+    assert!(
+        stderr.contains("Hard memory limit is invalid on this platform, requires Linux."),
+        "{stderr}"
+    );
 }
 
 /// A refused allocation must leave the parent something it can classify: the
@@ -727,7 +746,7 @@ fn version_skew_on_create_is_a_fatal_error() {
 fn garbage_stdin_is_a_fatal_error() {
     let mut child = ChildProc::spawn();
     // valid length prefix followed by a truncated stream: the child reads a
-    // mangled frame and must bail out with FatalError + exit code 2
+    // mangled frame and must bail out with FatalError + EX_PROTOCOL
     let raw = &mut child.writer;
     raw.write_all(&[0xFF, 0xFF, 0xFF, 0x7F]).unwrap();
     raw.flush().unwrap();
@@ -738,7 +757,7 @@ fn garbage_stdin_is_a_fatal_error() {
         other => panic!("expected FatalError, got {other:?}"),
     }
     let status = child.child.wait().expect("wait");
-    assert_eq!(status.code(), Some(2));
+    assert_eq!(status.code(), Some(76)); // EX_PROTOCOL
     // disarm Drop's kill — already exited
     let _ = child.child.kill();
 }

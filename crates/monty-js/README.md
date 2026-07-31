@@ -325,7 +325,8 @@ const pool = await Monty.create({
 `workerHardMemoryLimit` backstops the in-sandbox `maxMemory` limit instead of
 letting the worker grow the host without bound. It caps _virtual_ address space,
 so leave generous headroom, and it is enforced on Linux only (elsewhere the
-worker warns on stderr). A breach raises `MontyRuntimeError` wrapping
+worker refuses to start, so setting it there yields no usable workers). A breach
+raises `MontyRuntimeError` wrapping
 `MemoryError` — but unlike other runtime errors it takes the worker with it, so
 the session is finished (the pool recovers).
 

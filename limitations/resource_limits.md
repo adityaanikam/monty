@@ -55,10 +55,15 @@ any request. Divergences from every other limit documented here:
   unlike an in-sandbox `max_memory` breach, the session is gone with the worker
   (later calls on that checkout report `Finished`; the pool itself recovers).
   Sandboxed code cannot observe or catch it.
-- **The ceiling is Linux only.** Darwin refuses to set `RLIMIT_AS` (aliased onto
-  `RLIMIT_RSS`) or `RLIMIT_DATA` at all, and Windows has no rlimits. On those
-  platforms the worker prints a warning to stderr and runs unbounded, so the
-  ceiling is a production backstop, not a portable guarantee. Only the
+- **The ceiling is Linux only, and setting it elsewhere is fatal.** Darwin
+  refuses to set `RLIMIT_AS` (aliased onto `RLIMIT_RSS`) or `RLIMIT_DATA` at all,
+  and Windows has no rlimits. Rather than run a worker the host believes is
+  capped, such a worker exits immediately on a dedicated code and the pool
+  reports a crash naming the reason. So the knob is not portable: setting it on
+  macOS or Windows yields **no usable workers**, by design — silently ignoring it
+  would leave a host that asked to be capped running uncapped. There is no
+  spawn-time handshake, so the refusal surfaces on the session's first request
+  (the `Configure` inside `checkout`), not at pool construction. Only the
   *reporting* below is cross-platform.
 - **It bounds virtual address space, not live heap.** Thread stacks, allocator
   arena reservations and file mappings all count against it, so the value must
