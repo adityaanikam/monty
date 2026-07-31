@@ -98,6 +98,9 @@ pub struct NativePoolOptions {
     pub duration_limit_grace_ms: Option<f64>,
     /// Recycle a worker after serving this many checkouts.
     pub max_checkouts_per_worker: Option<u32>,
+    /// Logfire write token; when set, the pool records every session it
+    /// serves from the host process. Absent: no telemetry and no exporter.
+    pub logfire_token: Option<String>,
 }
 
 /// Session options for `checkout()`.
@@ -155,6 +158,7 @@ impl NativePool {
         config.request_timeout = options.request_timeout_ms.map(duration_from_ms).transpose()?;
         config.duration_limit_grace = options.duration_limit_grace_ms.map(duration_from_ms).transpose()?;
         config.max_checkouts_per_worker = options.max_checkouts_per_worker;
+        config.logfire_token = options.logfire_token;
         if config.max_processes < 1 {
             return Err(invalid("maxProcesses must be at least 1"));
         }

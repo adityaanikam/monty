@@ -44,6 +44,12 @@ export interface MontyOptions {
   durationLimitGrace?: number | null
   /** Recycle a worker (kill and replace) after serving this many sessions. */
   maxCheckoutsPerWorker?: number
+  /**
+   * Logfire write token. When set, the pool records every session to Logfire
+   * from the host process; workers receive no token, and any OTel setup of
+   * your own application is untouched.
+   */
+  logfireToken?: string
 }
 
 /** Options for [`Monty.checkout`], mirroring `pydantic_monty`. */
@@ -106,6 +112,7 @@ export class Monty {
         ? { durationLimitGraceMs: (options.durationLimitGrace ?? 1) * 1000 }
         : {}),
       ...(options.maxCheckoutsPerWorker !== undefined ? { maxCheckoutsPerWorker: options.maxCheckoutsPerWorker } : {}),
+      ...(options.logfireToken !== undefined ? { logfireToken: options.logfireToken } : {}),
     })
     await native.start()
     return new Monty(native)

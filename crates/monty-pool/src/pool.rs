@@ -8,15 +8,18 @@ use std::{
 };
 
 use futures_util::future::join_all;
+use logfire::Logfire;
 use monty_proto::pb;
 use tokio::{
     sync::Notify,
+    task::spawn_blocking,
     time::{Instant, timeout_at},
 };
 
 use crate::{
     PoolConfig, PoolError,
     checkout::{Checkout, ReplConfig, request},
+    telemetry,
     worker::Worker,
 };
 
@@ -44,6 +47,10 @@ pub(crate) struct PoolInner {
     /// Signalled whenever a worker returns to the idle queue or capacity is
     /// released, waking blocked `checkout` calls.
     available: Notify,
+    /// The pool's logfire (`PoolConfig::logfire_token`), which every worker's
+    /// recorder holds a clone of. `None`: telemetry is off. [`Pool::close`]
+    /// shuts it down, flushing the exporter.
+    logfire: Option<Logfire>,
 }
 
 struct PoolState {
@@ -63,12 +70,18 @@ impl Pool {
                 config.min_processes, config.max_processes
             )));
         }
+        let logfire = config
+            .logfire_token
+            .clone()
+            .map(telemetry::init)
+            .transpose()
+            .map_err(|err| PoolError::Telemetry(err.to_string()))?;
         // Only the subprocess transport pre-warms workers; WebSocket connections
         // are made per-checkout (its `min_processes` is 0).
         let mut idle = Vec::with_capacity(config.min_processes);
         if !config.transport.is_websocket() {
             for _ in 0..config.min_processes {
-                idle.push(Worker::new(&config).await?);
+                idle.push(Worker::new(&config, logfire.as_ref()).await?);
             }
         }
         let total = idle.len();
@@ -77,6 +90,7 @@ impl Pool {
                 config,
                 state: Mutex::new(PoolState { idle, total }),
                 available: Notify::new(),
+                logfire,
             }),
         })
     }
@@ -120,6 +134,14 @@ impl Pool {
             worker.reap_or_kill(SHUTDOWN_EXIT_GRACE).await;
         }))
         .await;
+        // Flush and stop the telemetry exporter, off the async runtime —
+        // `shutdown` blocks until the exporter confirms. Errors are swallowed:
+        // they are export failures (e.g. a bad token) teardown cannot fix, and
+        // a second `close` reports "already shut down". A pool merely dropped
+        // skips this and may lose its last, not-yet-exported batch of spans.
+        if let Some(logfire) = self.inner.logfire.clone() {
+            let _ = spawn_blocking(move || logfire.shutdown()).await;
+        }
     }
 
     /// Number of idle workers right now (diagnostics/tests only — the value
@@ -185,7 +207,7 @@ impl PoolInner {
                 // guard the reserved slot: a failed — or cancelled, for the
                 // WebSocket dial — spawn must release it or the pool shrinks
                 let capacity = CapacityGuard::new(self);
-                let worker = Worker::new(&self.config).await?;
+                let worker = Worker::new(&self.config, self.logfire.as_ref()).await?;
                 capacity.disarm();
                 return Ok(worker);
             }

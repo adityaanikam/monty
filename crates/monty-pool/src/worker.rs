@@ -22,6 +22,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
+use logfire::Logfire;
 use monty_proto::{FrameError, MAX_FRAME_LEN, decode_frame, encode_framed_into, encode_to_capped_vec, pb};
 use rustls::crypto::aws_lc_rs::default_provider;
 use tokio::{
@@ -37,7 +38,7 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message, protocol::WebSocketConfig},
 };
 
-use crate::{MontyTransport, PoolConfig, PoolError};
+use crate::{MontyTransport, PoolConfig, PoolError, telemetry::Recorder};
 
 /// The async WebSocket stream type for a remote worker.
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -49,6 +50,11 @@ pub(crate) struct Worker {
     kind: WorkerKind,
     /// Checkouts this worker has served, for `max_checkouts_per_worker`.
     pub(crate) checkouts_served: u32,
+    /// Records this worker's protocol turns to the pool's logfire (a no-op
+    /// recorder when the pool has no `logfire_token`). Lives here because the
+    /// worker sees every request sent and every event received — the whole
+    /// conversation — regardless of which checkout drives it.
+    recorder: Recorder,
 }
 
 /// The two transports a worker can speak the protocol over. Both variants are
@@ -79,13 +85,15 @@ struct WebSocketWorker {
 }
 
 impl Worker {
-    pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
+    /// Creates a worker for `config`'s transport; `logfire`, when present, is
+    /// the pool's telemetry the worker's turns are recorded to.
+    pub(crate) async fn new(config: &PoolConfig, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
         match &config.transport {
-            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path),
+            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, logfire),
             // Bound the dial by `request_timeout` (see `websocket`); a missing
             // one falls back to a generous fixed budget.
             MontyTransport::Websocket(url) => {
-                Self::websocket(url, config.request_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT)).await
+                Self::websocket(url, config.request_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT), logfire).await
             }
         }
     }
@@ -95,7 +103,7 @@ impl Worker {
     /// There is no spawn-time handshake: a wrong or broken binary surfaces as
     /// an error on the first request the worker serves (typically the
     /// `Configure` of its first checkout).
-    fn subprocess(binary_path: &PathBuf) -> Result<Self, PoolError> {
+    fn subprocess(binary_path: &PathBuf, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
         let mut command = Command::new(binary_path);
         command
             .arg("subprocess")
@@ -120,6 +128,7 @@ impl Worker {
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        let recorder = Recorder::new(logfire.cloned(), child.id());
         Ok(Self {
             kind: WorkerKind::Subprocess(Box::new(SubprocessWorker {
                 child,
@@ -128,6 +137,7 @@ impl Worker {
                 send_buf: Vec::with_capacity(SEND_BUF_CAPACITY),
             })),
             checkouts_served: 0,
+            recorder,
         })
     }
 
@@ -139,7 +149,7 @@ impl Worker {
     /// hung dial would otherwise stall the checkout forever. Frame/message
     /// limits are raised to monty's [`MAX_FRAME_LEN`] so the transport never
     /// rejects a frame the protocol itself would accept.
-    async fn websocket(url: &str, dial_timeout: Duration) -> Result<Self, PoolError> {
+    async fn websocket(url: &str, dial_timeout: Duration, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
         install_crypto_provider();
         let ws_config = WebSocketConfig::default()
             .max_frame_size(Some(MAX_FRAME_LEN as usize))
@@ -152,6 +162,8 @@ impl Worker {
         Ok(Self {
             kind: WorkerKind::WebSocket(Box::new(WebSocketWorker { stream: Some(stream) })),
             checkouts_served: 0,
+            // remote worker: there is no local pid to record
+            recorder: Recorder::new(logfire.cloned(), None),
         })
     }
 
@@ -160,7 +172,7 @@ impl Worker {
     /// oversize frame is rejected *before* any I/O so the stream stays synced
     /// (see `Checkout::request_turn`).
     pub(crate) async fn send(&mut self, request: &pb::ParentRequest) -> Result<(), FrameError> {
-        match &mut self.kind {
+        let result = match &mut self.kind {
             WorkerKind::Subprocess(w) => {
                 // prefix + body in one reused buffer: a single write syscall
                 // per request, no per-frame allocation, and a pipe write needs
@@ -183,7 +195,14 @@ impl Worker {
                     None => Err(FrameError::Truncated),
                 }
             }
+        };
+        // record only requests that hit the wire: a rejected oversize frame
+        // never reached the worker, so the turn (and any pending suspension)
+        // is still exactly where it was
+        if result.is_ok() {
+            self.recorder.begin_turn(request);
         }
+        result
     }
 
     /// Receives one event. EOF/close is an error here because within a
@@ -193,7 +212,7 @@ impl Worker {
     /// module docs), which is what lets `Checkout` race a turn against its
     /// deadline.
     pub(crate) async fn recv(&mut self) -> Result<pb::ChildEvent, FrameError> {
-        match &mut self.kind {
+        let event = match &mut self.kind {
             WorkerKind::Subprocess(w) => match w.recv.recv().await? {
                 Some(event) => Ok(event),
                 None => Err(FrameError::Truncated), // clean EOF mid-checkout is still a vanished peer
@@ -221,7 +240,11 @@ impl Worker {
                 };
                 decode_event(&data)
             }
-        }
+        }?;
+        // recorded only after a complete decode, so a `recv` future dropped
+        // mid-frame (deadline race) records nothing — cancel-safety intact
+        self.recorder.event(&event);
+        Ok(event)
     }
 
     /// The OS process id, when the worker is a local subprocess (`None` for a

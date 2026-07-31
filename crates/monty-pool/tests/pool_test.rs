@@ -1263,6 +1263,38 @@ async fn workers_are_recycled_after_max_checkouts() {
 }
 
 #[tokio::test]
+async fn logfire_token_pool_round_trips() {
+    let mut config = config();
+    // a syntactically valid but fake token: the pool configures its local
+    // logfire and records every turn, while the background exporter's
+    // failures never affect execution
+    config.logfire_token = Some("pylf_v1_us_0000000000000000000000".to_owned());
+    // recycle after every checkout so a replacement worker's recorder is
+    // exercised too
+    config.max_checkouts_per_worker = Some(1);
+    let pool = Pool::new(config).await.unwrap();
+
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    let event = session
+        .feed("1 + 2", vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap();
+    assert_eq!(expect_complete(event), MontyObject::Int(3));
+    session.finish().await.unwrap();
+
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    let event = session
+        .feed("2 + 2", vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap();
+    assert_eq!(expect_complete(event), MontyObject::Int(4));
+    session.finish().await.unwrap();
+
+    // flushes the exporter (its failures against the fake token are swallowed)
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn concurrent_checkouts_run_in_parallel() {
     let mut config = config();
     config.min_processes = 2;

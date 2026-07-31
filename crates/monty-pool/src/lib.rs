@@ -2,6 +2,8 @@
 
 mod checkout;
 mod pool;
+mod telemetry;
+mod telemetry_json;
 mod worker;
 
 use std::{borrow::Cow, error, fmt, io, num::NonZero, path::PathBuf, process::ExitStatus, thread, time::Duration};
@@ -71,6 +73,13 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
+    /// Logfire write token. When set, the pool records every session it
+    /// serves to [Logfire](https://pydantic.dev/logfire) from the host
+    /// process — workers receive no token and run no exporter. Configured in
+    /// logfire's local mode, so the host application's own tracing/OTel
+    /// setup is untouched; [`Pool::close`] flushes the exporter (a pool
+    /// merely dropped may lose its last, not-yet-exported batch of spans).
+    pub logfire_token: Option<String>,
 }
 
 impl PoolConfig {
@@ -99,6 +108,7 @@ impl PoolConfig {
             request_timeout: None,
             duration_limit_grace: Some(Duration::from_secs(1)),
             max_checkouts_per_worker: None,
+            logfire_token: None,
         }
     }
 }
@@ -138,6 +148,9 @@ pub enum PoolError {
     Exhausted,
     /// A worker process could not be spawned.
     Spawn(String),
+    /// The pool's logfire telemetry could not be configured
+    /// ([`PoolConfig::logfire_token`]); the pool was not created.
+    Telemetry(String),
     /// The checkout was already finished or its worker already discarded.
     Finished,
     /// The remote worker's connection dropped without a turn-ending event
@@ -207,6 +220,7 @@ impl fmt::Display for PoolError {
             Self::Typing(diagnostics) => write!(f, "type checking failed:\n{diagnostics}"),
             Self::Exhausted => f.write_str("no monty worker became available within the checkout timeout"),
             Self::Spawn(msg) => write!(f, "failed to spawn monty worker: {msg}"),
+            Self::Telemetry(msg) => write!(f, "failed to configure logfire telemetry: {msg}"),
             Self::Finished => f.write_str("this checkout has already been finished"),
             Self::Disconnected { context } => write!(f, "monty worker connection closed while {context}"),
             Self::Shutdown { dump } => match dump {

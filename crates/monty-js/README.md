@@ -318,12 +318,22 @@ const pool = await Monty.create({
   durationLimitGrace: 1, // maxDurationSecs backstop grace (seconds, null disables)
   maxCheckoutsPerWorker: 100, // recycle workers after this many sessions
   binaryPath: '/path/to/monty', // explicit binary (default: auto-resolved)
+  logfireToken: 'pylf_v1_...', // record sessions to Logfire (default: no telemetry)
 })
 ```
 
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo
 workspace `target/` build (development).
+
+With `logfireToken` set, the pool reports every session it serves to
+[Logfire](https://pydantic.dev/logfire): one span per checkout, with a nested
+span per protocol turn carrying the code fed, its inputs, external call
+arguments and results, exceptions and `print` output. Session dumps and
+restores are recorded by size only. Recording happens in the host process (the
+native pool sees the whole conversation with each worker); the workers receive
+no token and run no exporter. The `/wasm` worker pool has no equivalent — its
+pool is pure TypeScript with no exporter.
 
 ## Value Conversion
 

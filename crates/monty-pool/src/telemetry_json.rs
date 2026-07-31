@@ -1,0 +1,329 @@
+//! Logfire-style JSON encoding of [`MontyObject`]s for telemetry attributes.
+//!
+//! Mirrors the Python logfire JSON encoder (`logfire/_internal/json_encoder.py`):
+//! containers become JSON arrays/objects, dates use isoformat, timedeltas their
+//! total seconds, and opaque objects fall back to their `repr`. Output is
+//! capped at a byte limit so a huge value cannot blow up the telemetry
+//! pipeline; the caller is told when the cap cut serialization short.
+//!
+//! Known divergences from the Python encoder: sets are encoded in storage
+//! order (Python sorts them when comparable), and integers beyond `i128`
+//! become their digit string rather than a raw JSON number.
+
+use std::{
+    fmt::Write as _,
+    io::{self, Write},
+};
+
+use monty_types::{MontyDateTime, MontyObject, bytes_repr};
+use num_traits::ToPrimitive;
+use serde::ser::{Serialize, SerializeMap, Serializer};
+
+/// Serializes `value` to logfire-style JSON (see the module docs for the
+/// format), capped at `limit` bytes. The bool is true when the cap cut
+/// serialization short — the partial output is then no longer valid JSON, and
+/// the caller should mark it as truncated.
+pub(crate) fn serialize_capped(value: &MontyObject, limit: usize) -> (String, bool) {
+    let mut writer = CappedWriter { buf: Vec::new(), limit };
+    let cut = serde_json::to_writer(&mut writer, &JsonEncoded(value)).is_err();
+    // the buffer holds whole serializer writes, so it is valid UTF-8;
+    // from_utf8_lossy just avoids a panic path
+    (String::from_utf8_lossy(&writer.buf).into_owned(), cut)
+}
+
+/// An in-memory writer that rejects any write taking it past `limit` bytes,
+/// aborting serialization instead of building an unbounded string.
+struct CappedWriter {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.buf.len() + data.len() > self.limit {
+            Err(io::Error::other("byte limit reached"))
+        } else {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes a [`MontyObject`] with the logfire value mapping (rather than
+/// the tagged-enum encoding of the derived `Serialize`, which is for the wire).
+struct JsonEncoded<'a>(&'a MontyObject);
+
+impl Serialize for JsonEncoded<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            MontyObject::None => s.serialize_unit(),
+            MontyObject::Bool(b) => s.serialize_bool(*b),
+            MontyObject::Int(i) => s.serialize_i64(*i),
+            // beyond i128 (vanishingly rare) the digits become a string, as a
+            // raw JSON number would need serde_json's arbitrary-precision mode
+            MontyObject::BigInt(b) => match b.to_i128() {
+                Some(i) => s.serialize_i128(i),
+                None => s.collect_str(b),
+            },
+            MontyObject::Float(f) if f.is_finite() => s.serialize_f64(*f),
+            MontyObject::Float(f) => s.serialize_str(nonfinite_str(*f)),
+            MontyObject::String(v) => s.serialize_str(v),
+            // like logfire: the repr's escaped content without the b'' wrapper
+            MontyObject::Bytes(b) => {
+                let repr = bytes_repr(b);
+                s.serialize_str(&repr[2..repr.len() - 1])
+            }
+            MontyObject::List(items)
+            | MontyObject::Tuple(items)
+            | MontyObject::Set(items)
+            | MontyObject::FrozenSet(items) => s.collect_seq(items.iter().map(JsonEncoded)),
+            // a namedtuple is a tuple in Python, so logfire encodes the values
+            // as an array and drops the field names
+            MontyObject::NamedTuple { values, .. } => s.collect_seq(values.iter().map(JsonEncoded)),
+            MontyObject::Dict(pairs) => {
+                let mut map = s.serialize_map(Some(pairs.len()))?;
+                for (key, value) in pairs {
+                    match key {
+                        MontyObject::String(k) => map.serialize_entry(k, &JsonEncoded(value))?,
+                        other => map.serialize_entry(&other.py_repr(), &JsonEncoded(value))?,
+                    }
+                }
+                map.end()
+            }
+            // like logfire dataclasses: an object of the declared fields only
+            MontyObject::Dataclass { field_names, attrs, .. } => {
+                let mut map = s.serialize_map(Some(field_names.len()))?;
+                for name in field_names {
+                    let value = attrs
+                        .into_iter()
+                        .find(|(key, _)| matches!(key, MontyObject::String(k) if k == name));
+                    if let Some((_, value)) = value {
+                        map.serialize_entry(name, &JsonEncoded(value))?;
+                    }
+                }
+                map.end()
+            }
+            MontyObject::Date(d) => s.collect_str(&format_args!("{:04}-{:02}-{:02}", d.year, d.month, d.day)),
+            MontyObject::DateTime(dt) => s.serialize_str(&datetime_isoformat(dt)),
+            MontyObject::TimeDelta(td) => {
+                let micros =
+                    (i64::from(td.days) * 86_400 + i64::from(td.seconds)) * 1_000_000 + i64::from(td.microseconds);
+                #[expect(clippy::cast_precision_loss)]
+                s.serialize_f64(micros as f64 / 1e6)
+            }
+            // like logfire: `str(exc)`, which in Python is the message alone
+            MontyObject::Exception { arg, .. } => s.serialize_str(arg.as_deref().unwrap_or_default()),
+            MontyObject::Path(p) => s.serialize_str(p),
+            MontyObject::Cycle(..) => s.serialize_str("<circular reference>"),
+            MontyObject::Repr(r) => s.serialize_str(r),
+            // everything left is opaque: fall back to its repr, like logfire
+            other => s.serialize_str(&other.py_repr()),
+        }
+    }
+}
+
+/// Python's `str()` of the float values JSON has no representation for.
+pub(crate) fn nonfinite_str(f: f64) -> &'static str {
+    if f.is_nan() {
+        "nan"
+    } else if f > 0.0 {
+        "inf"
+    } else {
+        "-inf"
+    }
+}
+
+/// Python `datetime.isoformat()`: microseconds only when non-zero, and the
+/// UTC offset (when aware) as `±HH:MM`, extended with `:SS` when needed.
+fn datetime_isoformat(dt: &MontyDateTime) -> String {
+    let mut iso = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+    );
+    if dt.microsecond != 0 {
+        let _ = write!(iso, ".{:06}", dt.microsecond);
+    }
+    if let Some(offset) = dt.offset_seconds {
+        let sign = if offset < 0 { '-' } else { '+' };
+        let abs = offset.unsigned_abs();
+        let _ = write!(iso, "{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60);
+        if abs % 60 != 0 {
+            let _ = write!(iso, ":{:02}", abs % 60);
+        }
+    }
+    iso
+}
+
+// tests live here rather than in `tests/` because `serialize_capped` is
+// crate-private: telemetry encoding is not part of the pool's public API
+#[cfg(test)]
+mod tests {
+    use monty_types::{DictPairs, ExcType, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta};
+
+    use super::serialize_capped;
+
+    /// Shorthand: encode with a byte cap nothing here reaches.
+    fn json(obj: &MontyObject) -> String {
+        let (json, cut) = serialize_capped(obj, usize::MAX);
+        assert!(!cut);
+        json
+    }
+
+    #[test]
+    fn scalars_encode_as_json_scalars() {
+        assert_eq!(json(&MontyObject::Bool(true)), "true");
+        assert_eq!(json(&MontyObject::Int(-42)), "-42");
+        assert_eq!(json(&MontyObject::Float(1.5)), "1.5");
+        assert_eq!(json(&MontyObject::String("hello".to_owned())), r#""hello""#);
+        assert_eq!(json(&MontyObject::None), "null");
+    }
+
+    #[test]
+    fn nonfinite_floats_become_python_str() {
+        assert_eq!(json(&MontyObject::Float(f64::INFINITY)), r#""inf""#);
+        assert_eq!(json(&MontyObject::Float(f64::NEG_INFINITY)), r#""-inf""#);
+        assert_eq!(json(&MontyObject::Float(f64::NAN)), r#""nan""#);
+    }
+
+    #[test]
+    fn containers_become_json() {
+        let list = MontyObject::List(vec![
+            MontyObject::Int(1),
+            MontyObject::String("x".to_owned()),
+            MontyObject::None,
+            MontyObject::Float(f64::NAN),
+        ]);
+        assert_eq!(json(&list), r#"[1,"x",null,"nan"]"#);
+
+        let tuple = MontyObject::Tuple(vec![MontyObject::Bool(false), MontyObject::Float(2.5)]);
+        assert_eq!(json(&tuple), "[false,2.5]");
+
+        let nested = MontyObject::List(vec![MontyObject::List(vec![MontyObject::Int(1)])]);
+        assert_eq!(json(&nested), "[[1]]");
+    }
+
+    #[test]
+    fn dict_keys_are_strings_or_reprs() {
+        let dict = MontyObject::dict(vec![
+            (MontyObject::String("a".to_owned()), MontyObject::Int(1)),
+            (MontyObject::Int(2), MontyObject::String("b".to_owned())),
+        ]);
+        assert_eq!(json(&dict), r#"{"a":1,"2":"b"}"#);
+    }
+
+    #[test]
+    fn bytes_use_repr_content() {
+        let bytes = MontyObject::Bytes(b"hi\xff".to_vec());
+        assert_eq!(json(&bytes), r#""hi\\xff""#);
+    }
+
+    #[test]
+    fn dates_use_isoformat() {
+        let date = MontyObject::Date(MontyDate {
+            year: 2024,
+            month: 3,
+            day: 7,
+        });
+        assert_eq!(json(&date), r#""2024-03-07""#);
+
+        let naive = MontyObject::DateTime(MontyDateTime {
+            year: 2024,
+            month: 3,
+            day: 7,
+            hour: 1,
+            minute: 2,
+            second: 3,
+            microsecond: 0,
+            offset_seconds: None,
+            timezone_name: None,
+        });
+        assert_eq!(json(&naive), r#""2024-03-07T01:02:03""#);
+
+        let aware = MontyObject::DateTime(MontyDateTime {
+            year: 2024,
+            month: 3,
+            day: 7,
+            hour: 1,
+            minute: 2,
+            second: 3,
+            microsecond: 450,
+            offset_seconds: Some(-5 * 3600),
+            timezone_name: None,
+        });
+        assert_eq!(json(&aware), r#""2024-03-07T01:02:03.000450-05:00""#);
+    }
+
+    #[test]
+    fn timedelta_is_total_seconds() {
+        let delta = MontyObject::TimeDelta(MontyTimeDelta {
+            days: 1,
+            seconds: 1,
+            microseconds: 500_000,
+        });
+        assert_eq!(json(&delta), "86401.5");
+    }
+
+    #[test]
+    fn exception_is_its_message() {
+        let exc = MontyObject::Exception {
+            exc_type: ExcType::ValueError,
+            arg: Some("boom".to_owned()),
+        };
+        assert_eq!(json(&exc), r#""boom""#);
+    }
+
+    #[test]
+    fn namedtuple_is_a_plain_array() {
+        let nt = MontyObject::NamedTuple {
+            type_name: "Point".to_owned(),
+            field_names: vec!["x".to_owned(), "y".to_owned()],
+            values: vec![MontyObject::Int(1), MontyObject::Int(2)],
+        };
+        assert_eq!(json(&nt), "[1,2]");
+    }
+
+    #[test]
+    fn dataclass_is_an_object_of_declared_fields() {
+        let dc = MontyObject::Dataclass {
+            name: "Point".to_owned(),
+            type_id: 1,
+            field_names: vec!["x".to_owned(), "y".to_owned()],
+            attrs: DictPairs::from(vec![
+                (MontyObject::String("x".to_owned()), MontyObject::Int(1)),
+                (MontyObject::String("y".to_owned()), MontyObject::Int(2)),
+                (MontyObject::String("extra".to_owned()), MontyObject::Int(9)),
+            ]),
+            frozen: false,
+        };
+        assert_eq!(json(&dc), r#"{"x":1,"y":2}"#);
+    }
+
+    #[test]
+    fn opaque_values_fall_back_to_repr() {
+        assert_eq!(json(&MontyObject::Ellipsis), r#""Ellipsis""#);
+        assert_eq!(json(&MontyObject::Path("/mnt/data".to_owned())), r#""/mnt/data""#);
+        assert_eq!(
+            json(&MontyObject::Cycle(0, "[...]".to_owned())),
+            r#""<circular reference>""#
+        );
+    }
+
+    #[test]
+    fn big_ints_encode_as_numbers() {
+        let big = MontyObject::BigInt("123456789012345678901234567890".parse().unwrap());
+        assert_eq!(json(&big), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn oversize_output_is_cut_off_and_flagged() {
+        let value = MontyObject::List((0..1000).map(MontyObject::Int).collect());
+        let (s, cut) = serialize_capped(&value, 20);
+        assert!(cut);
+        assert!(s.len() <= 20);
+        assert!(s.starts_with("[0,1,"));
+    }
+}

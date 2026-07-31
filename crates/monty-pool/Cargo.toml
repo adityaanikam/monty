@@ -32,12 +32,31 @@ futures-util = { workspace = true }
 # Pulled in only so the pool can install a process-level rustls `CryptoProvider`
 # before the first `wss://` dial (see `install_crypto_provider` in worker.rs).
 rustls = { workspace = true }
+# Telemetry for pools created with a `logfire_token`, configured in local mode
+# so the host application's own tracing/OTel setup is untouched. `data-dir` is
+# off: the pool must never read `.logfire/logfire_credentials.json` from its cwd.
+logfire = { version = "0.11", default-features = false, features = ["export-http-protobuf"] }
+# telemetry_json's logfire-style value encoding
+num-traits = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Resource attributes logfire's own builder does not cover
+# (`service.instance.id`, `process.pid`); versions must match logfire's.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+# Only for the span/level types logfire's own API exposes; all recording goes
+# through the `logfire::` macros.
+tracing = "0.1"
+# The pool's own `service.instance.id`: v7 so the ids sort by pool start.
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # The mock WebSocket child servers in tests stay synchronous, on plain threads.
 tungstenite = { workspace = true }
+# In-memory exporters for the telemetry recorder's structural tests.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 
 [lints]
 workspace = true

@@ -115,7 +115,9 @@ impl PyMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
+        logfire_token = None,
     ))]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         binary_path: Option<PathBuf>,
@@ -124,6 +126,7 @@ impl PyMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
+        logfire_token: Option<String>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -134,6 +137,7 @@ impl PyMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
+                logfire_token,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -474,7 +478,9 @@ impl PyAsyncMonty {
         checkout_timeout = None,
         request_timeout = None,
         max_checkouts_per_worker = None,
+        logfire_token = None,
     ))]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         binary_path: Option<PathBuf>,
@@ -483,6 +489,7 @@ impl PyAsyncMonty {
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
         max_checkouts_per_worker: Option<u32>,
+        logfire_token: Option<String>,
     ) -> PyResult<Self> {
         Ok(Self {
             config: parse_pool_config(
@@ -493,6 +500,7 @@ impl PyAsyncMonty {
                 checkout_timeout,
                 request_timeout,
                 max_checkouts_per_worker,
+                logfire_token,
             )?,
             pool: Arc::new(Mutex::new(None)),
         })
@@ -912,6 +920,7 @@ impl PyAsyncMontySession {
 /// Builds the subprocess-transport `monty-pool` config from the (shared)
 /// `Monty`/`AsyncMonty` constructor arguments, resolving the binary via
 /// `pydantic_monty._binary` when not given explicitly.
+#[expect(clippy::too_many_arguments)]
 fn parse_pool_config(
     py: Python<'_>,
     binary_path: Option<PathBuf>,
@@ -920,6 +929,7 @@ fn parse_pool_config(
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
     max_checkouts_per_worker: Option<u32>,
+    logfire_token: Option<String>,
 ) -> PyResult<PoolConfig> {
     let binary_path = match binary_path {
         Some(path) => path,
@@ -937,6 +947,7 @@ fn parse_pool_config(
     config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
     config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
     config.max_checkouts_per_worker = max_checkouts_per_worker;
+    config.logfire_token = logfire_token;
     Ok(config)
 }
 
@@ -1718,7 +1729,9 @@ pub(crate) fn pool_err_to_py(py: Python<'_>, err: PoolError) -> PyErr {
         PoolError::Disconnected { .. } => MontyDisconnectError::new_err(py, message),
         PoolError::Shutdown { dump } => MontyShutdown::new_err(py, message, dump),
         PoolError::Exhausted => PyTimeoutError::new_err(message),
-        PoolError::Protocol(_) | PoolError::Spawn(_) | PoolError::Finished => PyRuntimeError::new_err(message),
+        PoolError::Protocol(_) | PoolError::Spawn(_) | PoolError::Telemetry(_) | PoolError::Finished => {
+            PyRuntimeError::new_err(message)
+        }
     }
 }
 

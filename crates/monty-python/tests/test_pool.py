@@ -167,6 +167,14 @@ result
     assert result == snapshot('Max argument depth exceeded')
 
 
+def test_logfire_token_pool_round_trips():
+    # a syntactically valid but fake token: the pool records every turn, and
+    # the failing background export never affects execution
+    with Monty(logfire_token='pylf_v1_us_0000000000000000000000') as pool:
+        with pool.checkout() as session:
+            assert session.feed_run('1 + 2') == snapshot(3)
+
+
 # === async variants ===
 
 
@@ -223,3 +231,9 @@ async def test_async_pool_not_entered():
     assert exc_info.value.args[0] == snapshot(
         'the pool is not active — enter the Monty / AsyncMonty context manager first'
     )
+
+
+async def test_async_logfire_token_pool_round_trips():
+    async with AsyncMonty(logfire_token='pylf_v1_us_0000000000000000000000') as pool:
+        async with pool.checkout() as session:
+            assert await session.feed_run('1 + 2') == snapshot(3)

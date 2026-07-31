@@ -376,6 +376,7 @@ class Monty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
+        logfire_token: str | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `with`.
@@ -394,6 +395,10 @@ class Monty:
                 exceeds it is killed and the call raises `MontyCrashedError`
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
+            logfire_token: Logfire write token. When set, the pool records
+                every session to Logfire from the host process; workers
+                receive no token, and any logfire/OTel setup of your own
+                application is untouched.
         """
 
     def __enter__(self) -> Self: ...
@@ -657,6 +662,7 @@ class AsyncMonty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
+        logfire_token: str | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `async with`.
