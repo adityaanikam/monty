@@ -34,7 +34,9 @@ use opentelemetry_sdk::Resource;
 use tracing::{Span, level_filters::LevelFilter};
 use uuid::Uuid;
 
-use crate::telemetry_json::{nonfinite_str, serialize_capped};
+use crate::telemetry_json::{
+    nonfinite_str, serialize_capped, serialize_dict_capped, serialize_named_capped, serialize_seq_capped,
+};
 
 /// Configures a pool-scoped logfire with `token` and records that the pool
 /// started.
@@ -263,6 +265,12 @@ impl Recorder {
         // the session span's Configure) showing what the time is measured against
         let micros = event.total_execution_micros;
         let max_duration = event.max_duration_micros;
+        // only a `Load` reply carries this: the session span was opened by the
+        // preceding `Configure`, so the script name the dump restored — the one
+        // the session actually runs under — is recorded on the load turn instead
+        if let Some(script_name) = &event.restored_script_name {
+            logfire::info!(parent: self.context_span(), "restored {script_name}", script_name = script_name);
+        }
         match &event.kind {
             Some(pb::child_event::Kind::Print(p)) => {
                 let (text, cut) = truncate_str(&p.text);
@@ -411,36 +419,39 @@ impl Recorder {
 const MISSING: &str = "<missing>";
 
 /// Renders a feed's named inputs as one JSON object of name → encoded value;
-/// the bool reports a cut at [`ATTR_SIZE_LIMIT`]. The inputs are cloned into
-/// a dict to encode them; only run when telemetry is enabled.
+/// the bool reports a cut at [`ATTR_SIZE_LIMIT`]. The values are borrowed, not
+/// cloned: a feed's inputs can be a large object graph, and only 64 KiB of the
+/// encoding survives.
 fn render_inputs(inputs: &[pb::NamedValue]) -> (Option<String>, bool) {
     if inputs.is_empty() {
         return (None, false);
     }
-    let pairs = inputs
+    // one placeholder, borrowed by every value the frame left out
+    let missing = MontyObject::Repr(MISSING.to_owned());
+    let pairs: Vec<(&str, &MontyObject)> = inputs
         .iter()
         .map(|i| {
-            let value = i.value.as_ref().and_then(|v| v.0.clone());
-            let value = value.unwrap_or_else(|| MontyObject::Repr(MISSING.to_owned()));
-            (MontyObject::String(i.name.clone()), value)
+            let value = i.value.as_ref().and_then(|v| v.0.as_ref()).unwrap_or(&missing);
+            (i.name.as_str(), value)
         })
-        .collect::<Vec<_>>();
-    let (json, cut) = serialize_capped(&MontyObject::dict(pairs), ATTR_SIZE_LIMIT);
+        .collect();
+    let (json, cut) = serialize_named_capped(&pairs, ATTR_SIZE_LIMIT);
     (Some(json), cut)
 }
 
 /// Renders a suspended call's positional arguments as a JSON list and its
 /// keyword arguments as a JSON object; either is absent when empty. The
-/// arguments are cloned to encode them; only run when telemetry is enabled.
+/// arguments are borrowed, not cloned, for the reason given in
+/// [`render_inputs`].
 fn render_call_arguments(call: &WireFunctionCall) -> (Option<String>, Option<String>, bool) {
     let mut any_cut = false;
     let args = (!call.args.is_empty()).then(|| {
-        let (json, cut) = serialize_capped(&MontyObject::List(call.args.clone()), ATTR_SIZE_LIMIT);
+        let (json, cut) = serialize_seq_capped(&call.args, ATTR_SIZE_LIMIT);
         any_cut |= cut;
         json
     });
     let kwargs = (!call.kwargs.is_empty()).then(|| {
-        let (json, cut) = serialize_capped(&MontyObject::dict(call.kwargs.clone()), ATTR_SIZE_LIMIT);
+        let (json, cut) = serialize_dict_capped(&call.kwargs, ATTR_SIZE_LIMIT);
         any_cut |= cut;
         json
     });
@@ -453,9 +464,16 @@ fn render_call_arguments(call: &WireFunctionCall) -> (Option<String>, Option<Str
 fn render_ext_result(result: Option<&pb::ExtFunctionResult>) -> (OtelValue, bool) {
     match result.and_then(|r| r.kind.as_ref()) {
         Some(pb::ext_function_result::Kind::ReturnValue(v)) => attr_value(v),
-        Some(pb::ext_function_result::Kind::Error(e)) => (format!("raise {}", render_exception(e)).into(), false),
+        // the host writes both of these, so both need the cap
+        Some(pb::ext_function_result::Kind::Error(e)) => {
+            let (text, cut) = truncate_str(&format!("raise {}", render_exception(e)));
+            (text.into(), cut)
+        }
         Some(pb::ext_function_result::Kind::Future(id)) => (format!("future {id}").into(), false),
-        Some(pb::ext_function_result::Kind::NotFound(name)) => (format!("not found: {name}").into(), false),
+        Some(pb::ext_function_result::Kind::NotFound(name)) => {
+            let (text, cut) = truncate_str(&format!("not found: {name}"));
+            (text.into(), cut)
+        }
         Some(pb::ext_function_result::Kind::NotHandled(_)) => ("not handled".into(), false),
         None => (MISSING.into(), false),
     }
@@ -673,20 +691,25 @@ fn record_error(error: &pb::Error, micros: u64, max_duration: Option<u64>, paren
                 Some(pb::unicode_error_data::Object::ObjectStr(s)) => truncate_str(s),
                 None => (MISSING.to_owned(), false),
             };
+            // the codec name is whatever the sandbox passed to `decode`, so it
+            // needs the cap as much as the object does
+            let (encoding, encoding_cut) = truncate_str(&u.encoding);
+            let (reason, reason_cut) = truncate_str(&u.reason);
             error_event!(
-                base_cut | object_cut,
-                exc_data.encoding = &u.encoding,
+                base_cut | object_cut | encoding_cut | reason_cut,
+                exc_data.encoding = encoding,
                 exc_data.object = object,
                 exc_data.start = u.start,
                 exc_data.end = u.end,
-                exc_data.reason = &u.reason,
+                exc_data.reason = reason,
             );
         }
         Some(pb::exc_data::Kind::Json(j)) => {
             let (doc, doc_cut) = unzip(j.doc.as_deref().map(truncate_str));
+            let (msg, msg_cut) = truncate_str(&j.msg);
             error_event!(
-                base_cut | doc_cut,
-                exc_data.msg = &j.msg,
+                base_cut | doc_cut | msg_cut,
+                exc_data.msg = msg,
                 exc_data.doc = doc,
                 exc_data.pos = j.pos,
                 exc_data.lineno = j.lineno,
@@ -741,9 +764,16 @@ fn unzip<T>(pair: Option<(T, bool)>) -> (Option<T>, bool) {
 
 /// A bytes value as logfire renders bytes: the repr's escaped content without
 /// the b'' wrapper, as raw text capped at [`ATTR_SIZE_LIMIT`].
+///
+/// Only the leading [`ATTR_SIZE_LIMIT`] bytes are escaped: every byte escapes
+/// to at least one character, so that is already enough to fill the cap, and
+/// escaping the rest would quadruple a payload as big as a `write_bytes` call
+/// allows just to throw it away.
 fn bytes_attr(b: &[u8]) -> (String, bool) {
-    let repr = bytes_repr(b);
-    truncate_str(&repr[2..repr.len() - 1])
+    let head = &b[..b.len().min(ATTR_SIZE_LIMIT)];
+    let repr = bytes_repr(head);
+    let (text, cut) = truncate_str(&repr[2..repr.len() - 1]);
+    (text, cut | (head.len() < b.len()))
 }
 
 /// Renders strings as a JSON list, absent when empty.
@@ -781,13 +811,13 @@ mod tests {
     use logfire::{Logfire, config::AdvancedOptions};
     use monty_proto::{WireFunctionCall, pb};
     use monty_types::MontyObject;
-    use opentelemetry::trace::SpanId;
+    use opentelemetry::{logs::AnyValue, trace::SpanId};
     use opentelemetry_sdk::{
         logs::{InMemoryLogExporter, SimpleLogProcessor},
         trace::{InMemorySpanExporter, SimpleSpanProcessor, SpanData},
     };
 
-    use super::Recorder;
+    use super::{ATTR_SIZE_LIMIT, Recorder, bytes_attr, render_ext_result};
 
     /// A local logfire capturing spans and logs in memory instead of exporting.
     fn test_logfire() -> (Logfire, InMemorySpanExporter, InMemoryLogExporter) {
@@ -893,6 +923,77 @@ mod tests {
         };
         assert_eq!(parent_of("call result"), call.span_context.span_id());
         assert_eq!(parent_of("complete"), feed.span_context.span_id());
+    }
+
+    /// Every attribute a host or the sandbox can make arbitrarily long is
+    /// capped and flagged — including the ones reached through an
+    /// `ExtFunctionResult` or a structured exception payload, and including a
+    /// `bytes` payload, which is escaped only as far as the cap can keep.
+    #[test]
+    fn oversize_attributes_are_capped_and_flagged() {
+        let long = "x".repeat(ATTR_SIZE_LIMIT * 2);
+        let result = pb::ExtFunctionResult {
+            kind: Some(pb::ext_function_result::Kind::Error(pb::RaisedException {
+                exc_type: "ValueError".to_owned(),
+                message: Some(long.clone()),
+                traceback: vec![],
+                data: None,
+            })),
+        };
+        let (value, cut) = render_ext_result(Some(&result));
+        assert!(cut);
+        assert_eq!(value.as_str().len(), ATTR_SIZE_LIMIT);
+
+        let (name, cut) = render_ext_result(Some(&pb::ExtFunctionResult {
+            kind: Some(pb::ext_function_result::Kind::NotFound(long)),
+        }));
+        assert!(cut);
+        assert_eq!(name.as_str().len(), ATTR_SIZE_LIMIT);
+
+        // a payload one byte past the cap: the escaped head fills it exactly,
+        // so only the dropped input marks it as cut
+        let (text, cut) = bytes_attr(&vec![b'a'; ATTR_SIZE_LIMIT + 1]);
+        assert!(cut);
+        assert_eq!(text.len(), ATTR_SIZE_LIMIT);
+        assert_eq!(bytes_attr(b"hi\xff"), ("hi\\xff".to_owned(), false));
+    }
+
+    /// The `Error` event's structured payload fields are capped too — the
+    /// codec name of a `UnicodeDecodeError` is whatever the sandbox passed.
+    #[test]
+    fn oversize_error_payload_is_capped() {
+        let (logfire, _spans, logs) = test_logfire();
+        let mut recorder = Recorder::new(Some(logfire), None);
+        recorder.event(&event(pb::child_event::Kind::Error(pb::Error {
+            exception: Some(pb::RaisedException {
+                exc_type: "UnicodeDecodeError".to_owned(),
+                message: None,
+                traceback: vec![],
+                data: Some(pb::ExcData {
+                    kind: Some(pb::exc_data::Kind::Unicode(pb::UnicodeErrorData {
+                        encoding: "u".repeat(ATTR_SIZE_LIMIT * 2),
+                        object: None,
+                        start: 0,
+                        end: 1,
+                        reason: "bad".to_owned(),
+                    })),
+                }),
+            }),
+        })));
+
+        let logs = logs.get_emitted_logs().unwrap();
+        let record = &logs.first().unwrap().record;
+        let attr = |key: &str| {
+            record
+                .attributes_iter()
+                .find(|(k, _)| k.as_str() == key)
+                .map(|(_, v)| v.clone())
+        };
+        let Some(AnyValue::String(encoding)) = attr("exc_data.encoding") else {
+            panic!("expected a string encoding attribute");
+        };
+        assert_eq!(encoding.as_str().len(), ATTR_SIZE_LIMIT);
+        assert_eq!(attr("length_limit_exceeded"), Some(AnyValue::Boolean(true)));
     }
 
     /// A disabled recorder (pool without a token) records nothing and holds

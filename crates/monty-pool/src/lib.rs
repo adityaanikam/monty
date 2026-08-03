@@ -43,7 +43,10 @@ impl MontyTransport {
 }
 
 /// Configuration for a [`Pool`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to redact [`Self::logfire_token`] — a write
+/// credential must not end up in a host's diagnostic log.
+#[derive(Clone)]
 pub struct PoolConfig {
     /// Workers spawned eagerly at pool creation and kept warm. Forced to 0 for
     /// the [`MontyTransport::Websocket`] transport (connections are made
@@ -80,6 +83,21 @@ pub struct PoolConfig {
     /// setup is untouched; [`Pool::close`] flushes the exporter (a pool
     /// merely dropped may lose its last, not-yet-exported batch of spans).
     pub logfire_token: Option<String>,
+}
+
+impl fmt::Debug for PoolConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PoolConfig")
+            .field("min_processes", &self.min_processes)
+            .field("max_processes", &self.max_processes)
+            .field("transport", &self.transport)
+            .field("checkout_timeout", &self.checkout_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("duration_limit_grace", &self.duration_limit_grace)
+            .field("max_checkouts_per_worker", &self.max_checkouts_per_worker)
+            .field("logfire_token", &self.logfire_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl PoolConfig {

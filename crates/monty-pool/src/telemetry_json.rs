@@ -11,6 +11,7 @@
 //! become their digit string rather than a raw JSON number.
 
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     io::{self, Write},
 };
@@ -24,8 +25,32 @@ use serde::ser::{Serialize, SerializeMap, Serializer};
 /// serialization short — the partial output is then no longer valid JSON, and
 /// the caller should mark it as truncated.
 pub(crate) fn serialize_capped(value: &MontyObject, limit: usize) -> (String, bool) {
+    capped(&JsonEncoded { value, limit }, limit)
+}
+
+/// [`serialize_capped`] for a list of values, borrowing them rather than
+/// cloning them into a [`MontyObject::List`].
+pub(crate) fn serialize_seq_capped(items: &[MontyObject], limit: usize) -> (String, bool) {
+    capped(&JsonSeq { items, limit }, limit)
+}
+
+/// [`serialize_capped`] for dict pairs (non-string keys rendered by their
+/// repr), borrowing them rather than cloning them into a [`MontyObject::Dict`].
+pub(crate) fn serialize_dict_capped(pairs: &[(MontyObject, MontyObject)], limit: usize) -> (String, bool) {
+    capped(&JsonDict { pairs, limit }, limit)
+}
+
+/// [`serialize_capped`] for named values as a JSON object, borrowing them
+/// rather than cloning them into a dict.
+pub(crate) fn serialize_named_capped(pairs: &[(&str, &MontyObject)], limit: usize) -> (String, bool) {
+    capped(&JsonNamed { pairs, limit }, limit)
+}
+
+/// Serializes into a [`CappedWriter`]; the bool reports the cap cutting
+/// serialization short.
+fn capped(value: &impl Serialize, limit: usize) -> (String, bool) {
     let mut writer = CappedWriter { buf: Vec::new(), limit };
-    let cut = serde_json::to_writer(&mut writer, &JsonEncoded(value)).is_err();
+    let cut = serde_json::to_writer(&mut writer, value).is_err();
     // the buffer holds whole serializer writes, so it is valid UTF-8;
     // from_utf8_lossy just avoids a panic path
     (String::from_utf8_lossy(&writer.buf).into_owned(), cut)
@@ -55,11 +80,28 @@ impl Write for CappedWriter {
 
 /// Serializes a [`MontyObject`] with the logfire value mapping (rather than
 /// the tagged-enum encoding of the derived `Serialize`, which is for the wire).
-struct JsonEncoded<'a>(&'a MontyObject);
+///
+/// `limit` is the caller's byte cap, carried down the value tree so a huge
+/// `bytes` leaf is escaped only as far as the cap can keep — the writer alone
+/// cannot help, since it sees the escaped string only once it is built.
+struct JsonEncoded<'a> {
+    value: &'a MontyObject,
+    limit: usize,
+}
+
+impl<'a> JsonEncoded<'a> {
+    /// The same encoder for a nested value.
+    const fn nested(&self, value: &'a MontyObject) -> Self {
+        Self {
+            value,
+            limit: self.limit,
+        }
+    }
+}
 
 impl Serialize for JsonEncoded<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self.0 {
+        match self.value {
             MontyObject::None => s.serialize_unit(),
             MontyObject::Bool(b) => s.serialize_bool(*b),
             MontyObject::Int(i) => s.serialize_i64(*i),
@@ -72,49 +114,49 @@ impl Serialize for JsonEncoded<'_> {
             MontyObject::Float(f) if f.is_finite() => s.serialize_f64(*f),
             MontyObject::Float(f) => s.serialize_str(nonfinite_str(*f)),
             MontyObject::String(v) => s.serialize_str(v),
-            // like logfire: the repr's escaped content without the b'' wrapper
+            // like logfire: the repr's escaped content without the b'' wrapper.
+            // Escaping stops at `limit` bytes of input: every byte escapes to
+            // at least one character, so the rest could only produce output the
+            // cap discards — after quadrupling a huge payload to build it
             MontyObject::Bytes(b) => {
-                let repr = bytes_repr(b);
+                let repr = bytes_repr(&b[..b.len().min(self.limit)]);
                 s.serialize_str(&repr[2..repr.len() - 1])
             }
             MontyObject::List(items)
             | MontyObject::Tuple(items)
             | MontyObject::Set(items)
-            | MontyObject::FrozenSet(items) => s.collect_seq(items.iter().map(JsonEncoded)),
+            | MontyObject::FrozenSet(items) => s.collect_seq(items.iter().map(|v| self.nested(v))),
             // a namedtuple is a tuple in Python, so logfire encodes the values
             // as an array and drops the field names
-            MontyObject::NamedTuple { values, .. } => s.collect_seq(values.iter().map(JsonEncoded)),
+            MontyObject::NamedTuple { values, .. } => s.collect_seq(values.iter().map(|v| self.nested(v))),
             MontyObject::Dict(pairs) => {
-                let mut map = s.serialize_map(Some(pairs.len()))?;
-                for (key, value) in pairs {
-                    match key {
-                        MontyObject::String(k) => map.serialize_entry(k, &JsonEncoded(value))?,
-                        other => map.serialize_entry(&other.py_repr(), &JsonEncoded(value))?,
-                    }
-                }
-                map.end()
+                serialize_pairs(pairs.into_iter().map(|(k, v)| (k, v)), pairs.len(), self.limit, s)
             }
             // like logfire dataclasses: an object of the declared fields only
             MontyObject::Dataclass { field_names, attrs, .. } => {
+                // indexed once: scanning `attrs` per field is quadratic, and
+                // both sides are as long as the sandbox's source made them
+                let mut by_name: HashMap<&str, &MontyObject> = HashMap::with_capacity(attrs.len());
+                for (key, value) in attrs {
+                    if let MontyObject::String(k) = key {
+                        by_name.entry(k.as_str()).or_insert(value);
+                    }
+                }
                 let mut map = s.serialize_map(Some(field_names.len()))?;
                 for name in field_names {
-                    let value = attrs
-                        .into_iter()
-                        .find(|(key, _)| matches!(key, MontyObject::String(k) if k == name));
-                    if let Some((_, value)) = value {
-                        map.serialize_entry(name, &JsonEncoded(value))?;
+                    if let Some(value) = by_name.get(name.as_str()) {
+                        map.serialize_entry(name, &self.nested(value))?;
                     }
                 }
                 map.end()
             }
             MontyObject::Date(d) => s.collect_str(&format_args!("{:04}-{:02}-{:02}", d.year, d.month, d.day)),
             MontyObject::DateTime(dt) => s.serialize_str(&datetime_isoformat(dt)),
-            MontyObject::TimeDelta(td) => {
-                let micros =
-                    (i64::from(td.days) * 86_400 + i64::from(td.seconds)) * 1_000_000 + i64::from(td.microseconds);
-                #[expect(clippy::cast_precision_loss)]
-                s.serialize_f64(micros as f64 / 1e6)
-            }
+            // total seconds, accumulated in f64 throughout: an extreme `days`
+            // overflows the microseconds of the same sum in i64
+            MontyObject::TimeDelta(td) => s.serialize_f64(
+                f64::from(td.days).mul_add(86_400.0, f64::from(td.seconds)) + f64::from(td.microseconds) / 1e6,
+            ),
             // like logfire: `str(exc)`, which in Python is the message alone
             MontyObject::Exception { arg, .. } => s.serialize_str(arg.as_deref().unwrap_or_default()),
             MontyObject::Path(p) => s.serialize_str(p),
@@ -124,6 +166,75 @@ impl Serialize for JsonEncoded<'_> {
             other => s.serialize_str(&other.py_repr()),
         }
     }
+}
+
+/// Encodes borrowed values as a JSON array, for a caller holding the items
+/// but no [`MontyObject`] container to point [`JsonEncoded`] at.
+struct JsonSeq<'a> {
+    items: &'a [MontyObject],
+    limit: usize,
+}
+
+impl Serialize for JsonSeq<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.items.iter().map(|value| JsonEncoded {
+            value,
+            limit: self.limit,
+        }))
+    }
+}
+
+/// [`JsonSeq`] for dict pairs: a JSON object keyed like [`MontyObject::Dict`].
+struct JsonDict<'a> {
+    pairs: &'a [(MontyObject, MontyObject)],
+    limit: usize,
+}
+
+impl Serialize for JsonDict<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serialize_pairs(self.pairs.iter().map(|(k, v)| (k, v)), self.pairs.len(), self.limit, s)
+    }
+}
+
+/// [`JsonSeq`] for named values: a JSON object of `name` → encoded value.
+struct JsonNamed<'a> {
+    pairs: &'a [(&'a str, &'a MontyObject)],
+    limit: usize,
+}
+
+impl Serialize for JsonNamed<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(Some(self.pairs.len()))?;
+        for (name, value) in self.pairs {
+            map.serialize_entry(
+                name,
+                &JsonEncoded {
+                    value,
+                    limit: self.limit,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+/// Serializes key/value pairs as a JSON object, string keys verbatim and
+/// everything else by its Python repr (JSON has no non-string keys).
+fn serialize_pairs<'a, S: Serializer>(
+    pairs: impl Iterator<Item = (&'a MontyObject, &'a MontyObject)>,
+    len: usize,
+    limit: usize,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let mut map = s.serialize_map(Some(len))?;
+    for (key, value) in pairs {
+        let value = JsonEncoded { value, limit };
+        match key {
+            MontyObject::String(k) => map.serialize_entry(k, &value)?,
+            other => map.serialize_entry(&other.py_repr(), &value)?,
+        }
+    }
+    map.end()
 }
 
 /// Python's `str()` of the float values JSON has no representation for.
@@ -164,7 +275,7 @@ fn datetime_isoformat(dt: &MontyDateTime) -> String {
 mod tests {
     use monty_types::{DictPairs, ExcType, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta};
 
-    use super::serialize_capped;
+    use super::{serialize_capped, serialize_dict_capped, serialize_named_capped, serialize_seq_capped};
 
     /// Shorthand: encode with a byte cap nothing here reaches.
     fn json(obj: &MontyObject) -> String {
@@ -267,6 +378,18 @@ mod tests {
         assert_eq!(json(&delta), "86401.5");
     }
 
+    /// The extreme end of Python's `timedelta` range overflows an i64 of
+    /// microseconds, so the total is accumulated in f64 instead.
+    #[test]
+    fn huge_timedelta_does_not_overflow() {
+        let delta = MontyObject::TimeDelta(MontyTimeDelta {
+            days: i32::MAX,
+            seconds: 86_399,
+            microseconds: 999_999,
+        });
+        assert_eq!(json(&delta), "185542587187200.0");
+    }
+
     #[test]
     fn exception_is_its_message() {
         let exc = MontyObject::Exception {
@@ -325,5 +448,45 @@ mod tests {
         assert!(cut);
         assert!(s.len() <= 20);
         assert!(s.starts_with("[0,1,"));
+    }
+
+    /// A `bytes` leaf is escaped only as far as the byte cap can keep, so a
+    /// huge payload is never quadrupled into a repr that is then thrown away.
+    #[test]
+    fn oversize_bytes_are_capped_before_escaping() {
+        let value = MontyObject::List(vec![MontyObject::Bytes(vec![0xff; 10_000]), MontyObject::Int(1)]);
+        let (s, cut) = serialize_capped(&value, 64);
+        assert!(cut);
+        assert!(s.len() <= 64);
+        // a payload the cap can hold is still encoded in full
+        let value = MontyObject::Bytes(vec![0xff; 4]);
+        assert_eq!(json(&value), r#""\\xff\\xff\\xff\\xff""#);
+    }
+
+    /// The borrowed-value encoders (used so telemetry never deep-clones a
+    /// feed's inputs or a call's arguments) match their owned counterparts.
+    #[test]
+    fn borrowed_values_encode_like_owned_ones() {
+        let items = vec![MontyObject::Int(1), MontyObject::String("x".to_owned())];
+        assert_eq!(
+            serialize_seq_capped(&items, usize::MAX),
+            (r#"[1,"x"]"#.to_owned(), false)
+        );
+
+        let pairs = vec![
+            (MontyObject::String("a".to_owned()), MontyObject::Int(1)),
+            (MontyObject::Int(2), MontyObject::None),
+        ];
+        assert_eq!(
+            serialize_dict_capped(&pairs, usize::MAX),
+            (r#"{"a":1,"2":null}"#.to_owned(), false)
+        );
+
+        let one = MontyObject::Int(1);
+        let two = MontyObject::List(vec![MontyObject::Bool(true)]);
+        assert_eq!(
+            serialize_named_capped(&[("x", &one), ("y", &two)], usize::MAX),
+            (r#"{"x":1,"y":[true]}"#.to_owned(), false)
+        );
     }
 }

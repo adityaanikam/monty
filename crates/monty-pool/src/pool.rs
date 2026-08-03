@@ -110,6 +110,10 @@ impl Pool {
     ///
     /// Optional: dropping the pool kills idle workers instead, which is just
     /// as safe — this only trades a SIGKILL for a clean protocol goodbye.
+    ///
+    /// This also shuts the telemetry exporter down, so it is the last thing a
+    /// pool should be asked to do: what sessions still checked out here go on
+    /// to record is dropped rather than exported.
     pub async fn close(&self) {
         // Pair each removed worker with a capacity guard immediately: if this
         // future is dropped mid-close, every unreaped worker is killed by its
