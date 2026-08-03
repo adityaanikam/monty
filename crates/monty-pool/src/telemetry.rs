@@ -19,15 +19,14 @@ use monty_proto::{WireFunctionCall, WireObject, pb, pb::os_call::Call};
 use monty_types::{MontyObject, bytes_repr};
 use opentelemetry::{KeyValue, Value as OtelValue};
 use opentelemetry_sdk::Resource;
-use tracing::{Span, level_filters::LevelFilter};
+use tracing::{Span, field::Empty, level_filters::LevelFilter};
 use uuid::Uuid;
 
 use crate::telemetry_json::{
     nonfinite_str, serialize_capped, serialize_dict_capped, serialize_named_capped, serialize_seq_capped,
 };
 
-/// Configures a pool-scoped logfire with `token` and records that the pool
-/// started.
+/// Configures a pool-scoped logfire with `token`.
 ///
 /// Local mode (see the module docs) makes the returned [`Logfire`] the only
 /// handle: the pool must keep it alive and `shutdown` it to flush the exporter.
@@ -50,8 +49,6 @@ pub(crate) fn init(token: String) -> Result<Logfire, ConfigureError> {
         .with_default_level_filter(LevelFilter::INFO)
         .with_advanced_options(AdvancedOptions::default().with_resource(resource))
         .finish()?;
-    let _guard = set_local_logfire(logfire.clone());
-    logfire::info!("monty pool started");
     Ok(logfire)
 }
 
@@ -72,10 +69,10 @@ pub(crate) struct Recorder {
     turn: Option<Span>,
     /// The span of the suspension the feed is blocked on, closed when the
     /// answering `Resume*` is sent so its duration is the host round-trip.
-    pending: Option<Span>,
+    pending: Option<OpenSpan>,
     /// The in-flight feed's span, held across suspension round-trips so the
     /// whole feed is one span. Closed by the turn-ending event.
-    feed: Option<Span>,
+    feed: Option<OpenSpan>,
     /// The session span every turn nests inside; `Configure` opens it and
     /// `Reset` closes it.
     session: Option<Span>,
@@ -159,38 +156,33 @@ impl Recorder {
                 // worker rejects; close the stale spans so nesting stays sane
                 self.pending = None;
                 self.feed = None;
-                self.feed = Some(logfire::span!(
+                let cut = code_cut | inputs_cut;
+                let span = logfire::span!(
                     parent: self.context_span(),
-                    "feed",
+                    "run code",
                     code = &code,
                     code.language = "python",
                     inputs = inputs,
                     skip_type_check = f.skip_type_check,
-                    length_limit_exceeded = (code_cut | inputs_cut).then_some(true),
-                ));
-            }
-            // the resume family opens no span: it records the host's answer
-            // inside the pending suspension span, then closes it
-            Some(pb::parent_request::Kind::ResumeCall(r)) => {
-                let pending = self.take_pending();
-                let (result, cut) = render_ext_result(r.result.as_ref());
-                logfire::info!(
-                    parent: pending,
-                    "call result",
-                    call_id = r.call_id,
-                    result = result,
                     length_limit_exceeded = cut.then_some(true),
+                    // declared empty here, filled in by the `Complete` event
+                    // that closes this span
+                    output = Empty,
+                    total_execution_micros = Empty,
+                    max_duration_micros = Empty,
                 );
+                self.feed = Some(OpenSpan::new(span, cut));
+            }
+            // the resume family opens no span: the host's answer is an
+            // attribute of the suspension span it closes, so a round-trip
+            // reads as one span rather than a span plus a child record
+            Some(pb::parent_request::Kind::ResumeCall(r)) => {
+                let (result, cut) = render_ext_result(r.result.as_ref());
+                self.close_pending("return_value", &result, cut);
             }
             Some(pb::parent_request::Kind::ResumeNameLookup(r)) => {
-                let pending = self.take_pending();
                 let (result, cut) = render_name_lookup(r.kind.as_ref());
-                logfire::info!(
-                    parent: pending,
-                    "name lookup result",
-                    result = result,
-                    length_limit_exceeded = cut.then_some(true),
-                );
+                self.close_pending("value", &result, cut);
             }
             Some(pb::parent_request::Kind::ResumeFutures(r)) => {
                 let pending = self.take_pending();
@@ -246,9 +238,9 @@ impl Recorder {
             }
             Some(pb::child_event::Kind::FunctionCall(c)) => {
                 let (args, kwargs, cut) = render_call_arguments(c);
-                self.pending = Some(logfire::span!(
+                let span = logfire::span!(
                     parent: self.context_span(),
-                    "function call {function_name}",
+                    "call {function_name}",
                     function_name = &c.function_name,
                     args = args,
                     kwargs = kwargs,
@@ -257,39 +249,40 @@ impl Recorder {
                     length_limit_exceeded = cut.then_some(true),
                     total_execution_micros = micros,
                     max_duration_micros = max_duration,
-                ));
+                    // filled in by the answering `ResumeCall`
+                    return_value = Empty,
+                );
+                self.pending = Some(OpenSpan::new(span, cut));
             }
             Some(pb::child_event::Kind::OsCall(c)) => {
                 self.pending = Some(os_call_span(c, micros, max_duration, &self.context_span()));
             }
             Some(pb::child_event::Kind::NameLookup(n)) => {
-                self.pending = Some(logfire::span!(
+                let span = logfire::span!(
                     parent: self.context_span(),
                     "name lookup {name}",
                     name = &n.name,
                     total_execution_micros = micros,
                     max_duration_micros = max_duration,
-                ));
+                    // filled in by the answering `ResumeNameLookup`
+                    value = Empty,
+                    length_limit_exceeded = Empty,
+                );
+                self.pending = Some(OpenSpan::new(span, false));
             }
             Some(pb::child_event::Kind::ResolveFutures(r)) => {
-                self.pending = Some(logfire::span!(
+                let span = logfire::span!(
                     parent: self.context_span(),
                     "resolve futures",
                     pending_call_ids = render_call_ids(&r.pending_call_ids),
                     total_execution_micros = micros,
                     max_duration_micros = max_duration,
-                ));
+                );
+                self.pending = Some(OpenSpan::new(span, false));
             }
             Some(pb::child_event::Kind::Complete(c)) => {
                 let (value, cut) = optional_attr(c.value.as_ref());
-                logfire::info!(
-                    parent: self.context_span(),
-                    "complete",
-                    value = value,
-                    length_limit_exceeded = cut.then_some(true),
-                    total_execution_micros = micros,
-                    max_duration_micros = max_duration,
-                );
+                self.record_complete(value, cut, micros, max_duration);
                 self.end_feed();
             }
             Some(pb::child_event::Kind::Error(e)) => {
@@ -347,22 +340,59 @@ impl Recorder {
         }
     }
 
+    /// Records a completed run's result on the feed span itself, so the run
+    /// reads as one span rather than a span plus a child record.
+    ///
+    /// A restored suspension has no feed span (its `Load` turn stands in for
+    /// one), so its completion is recorded as an event instead.
+    fn record_complete(&mut self, value: Option<OtelValue>, cut: bool, micros: u64, max_duration: Option<u64>) {
+        // taking the span closes it here rather than in the `end_feed` the
+        // caller runs next, which would close it a moment later anyway
+        match self.feed.take() {
+            Some(mut feed) => {
+                if let Some(value) = value {
+                    feed.record("output", &value, cut);
+                }
+                feed.span.record("total_execution_micros", micros_attr(micros));
+                if let Some(max_duration) = max_duration {
+                    feed.span.record("max_duration_micros", micros_attr(max_duration));
+                }
+            }
+            None => logfire::info!(
+                parent: self.context_span(),
+                "complete",
+                output = value,
+                length_limit_exceeded = cut.then_some(true),
+                total_execution_micros = micros,
+                max_duration_micros = max_duration,
+            ),
+        }
+    }
+
     /// The innermost open span, used as the explicit parent for new spans and
     /// records; [`Span::none`] (a root record) when nothing is open.
     fn context_span(&self) -> Span {
         self.turn
             .as_ref()
-            .or(self.pending.as_ref())
-            .or(self.feed.as_ref())
+            .or(self.pending.as_ref().map(OpenSpan::span))
+            .or(self.feed.as_ref().map(OpenSpan::span))
             .or(self.session.as_ref())
             .cloned()
             .unwrap_or_else(Span::none)
     }
 
-    /// Takes the pending suspension span so the resume answer can be recorded
+    /// Records the host's answer on the suspension span it answers, then
+    /// closes that span by dropping it.
+    fn close_pending(&mut self, field: &'static str, value: &OtelValue, cut: bool) {
+        if let Some(mut pending) = self.pending.take() {
+            pending.record(field, value, cut);
+        }
+    }
+
+    /// Takes the pending suspension span so a resume answer can be recorded
     /// inside it before the caller drops it, closing it.
     fn take_pending(&mut self) -> Span {
-        self.pending.take().unwrap_or_else(Span::none)
+        self.pending.take().map_or_else(Span::none, |pending| pending.span)
     }
 
     /// Closes the feed-scoped spans after a turn-ending
@@ -372,6 +402,38 @@ impl Recorder {
         self.turn = None;
         self.pending = None;
         self.feed = None;
+    }
+}
+
+/// An open span plus whether it already carries `length_limit_exceeded`.
+///
+/// The spans that gain an attribute after they open — a suspension's answer, a
+/// run's return value — may need to flag a cut the span was opened without.
+/// A key recorded twice is exported twice, so the flag has to be remembered.
+struct OpenSpan {
+    span: Span,
+    cut: bool,
+}
+
+impl OpenSpan {
+    /// Holds a span already flagged (or not) by the values it was opened with.
+    const fn new(span: Span, cut: bool) -> Self {
+        Self { span, cut }
+    }
+
+    const fn span(&self) -> &Span {
+        &self.span
+    }
+
+    /// Records `value` on the span, flagging a cut it does not already carry.
+    /// The field must have been declared when the span was opened (as
+    /// [`Empty`] at the latest) or `tracing` drops it silently.
+    fn record(&mut self, field: &'static str, value: &OtelValue, cut: bool) {
+        record_attr(&self.span, field, value);
+        if cut && !self.cut {
+            self.span.record("length_limit_exceeded", true);
+            self.cut = true;
+        }
     }
 }
 
@@ -479,8 +541,11 @@ fn render_call_ids(ids: &[u32]) -> Option<String> {
 /// Each call shape gets its own macro invocation because the attribute set is
 /// baked into the span's `logfire.json_schema` at compile time — a union-shaped
 /// call would surface every unused argument as `null` in the UI.
-fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, parent: &Span) -> Span {
+fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, parent: &Span) -> OpenSpan {
     let call_id = os_call.call_id;
+    // set by the arms whose arguments can be cut; recorded once below, so that
+    // the answering `ResumeCall` can tell whether the flag is already there
+    let mut args_cut = false;
     /// One span with only the given `args.*` attributes plus the shared tail.
     macro_rules! os_call {
         ($function:expr $(, $($key:ident).+ = $value:expr)* $(,)?) => {
@@ -492,10 +557,13 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, pa
                 call_id = call_id,
                 total_execution_micros = micros,
                 max_duration_micros = max_duration,
+                // filled in by the answering `ResumeCall`
+                return_value = Empty,
+                length_limit_exceeded = Empty,
             )
         };
     }
-    match os_call.call.as_ref() {
+    let span = match os_call.call.as_ref() {
         Some(Call::Exists(p)) => os_call!("exists", args.path = p),
         Some(Call::IsFile(p)) => os_call!("is_file", args.path = p),
         Some(Call::IsDir(p)) => os_call!("is_dir", args.path = p),
@@ -510,39 +578,23 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, pa
         Some(Call::Rmdir(p)) => os_call!("rmdir", args.path = p),
         Some(Call::WriteText(w)) => {
             let (data, cut) = truncate_str(&w.data);
-            os_call!(
-                "write_text",
-                args.path = &w.path,
-                args.data = data,
-                length_limit_exceeded = cut.then_some(true)
-            )
+            args_cut = cut;
+            os_call!("write_text", args.path = &w.path, args.data = data)
         }
         Some(Call::AppendText(w)) => {
             let (data, cut) = truncate_str(&w.data);
-            os_call!(
-                "append_text",
-                args.path = &w.path,
-                args.data = data,
-                length_limit_exceeded = cut.then_some(true)
-            )
+            args_cut = cut;
+            os_call!("append_text", args.path = &w.path, args.data = data)
         }
         Some(Call::WriteBytes(w)) => {
             let (data, cut) = bytes_attr(&w.data);
-            os_call!(
-                "write_bytes",
-                args.path = &w.path,
-                args.data = data,
-                length_limit_exceeded = cut.then_some(true)
-            )
+            args_cut = cut;
+            os_call!("write_bytes", args.path = &w.path, args.data = data)
         }
         Some(Call::AppendBytes(w)) => {
             let (data, cut) = bytes_attr(&w.data);
-            os_call!(
-                "append_bytes",
-                args.path = &w.path,
-                args.data = data,
-                length_limit_exceeded = cut.then_some(true)
-            )
+            args_cut = cut;
+            os_call!("append_bytes", args.path = &w.path, args.data = data)
         }
         Some(Call::Open(o)) => os_call!("open", args.path = &o.path, args.mode = &o.mode),
         Some(Call::Mkdir(m)) => os_call!(
@@ -558,12 +610,8 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, pa
         Some(Call::Getenv(g)) => {
             let (default, cut) = optional_attr(g.default.as_ref());
             let default = default.map(|v| v.as_str().into_owned());
-            os_call!(
-                "getenv",
-                args.key = &g.key,
-                args.default = default,
-                length_limit_exceeded = cut.then_some(true)
-            )
+            args_cut = cut;
+            os_call!("getenv", args.key = &g.key, args.default = default)
         }
         Some(Call::GetEnviron(_)) => os_call!("get_environ"),
         Some(Call::DateToday(_)) => os_call!("date_today"),
@@ -580,7 +628,11 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, pa
             }
         }
         None => os_call!(MISSING),
+    };
+    if args_cut {
+        span.record("length_limit_exceeded", true);
     }
+    OpenSpan::new(span, args_cut)
 }
 
 /// Renders an exception as `Type: message`.
@@ -704,6 +756,25 @@ fn attr_value(value: &WireObject) -> (OtelValue, bool) {
     }
 }
 
+/// Records `value` on an already-open span, keeping its native attribute type:
+/// [`Span::record`] takes statically typed `tracing` values, so the dynamic
+/// [`OtelValue`] has to be matched out.
+fn record_attr(span: &Span, field: &'static str, value: &OtelValue) {
+    match value {
+        OtelValue::Bool(b) => span.record(field, *b),
+        OtelValue::I64(i) => span.record(field, *i),
+        OtelValue::F64(f) => span.record(field, *f),
+        // `attr_value` never yields an array; `as_str` renders one anyway
+        other => span.record(field, other.as_str().as_ref()),
+    };
+}
+
+/// A microsecond count as the i64 `tracing` records integers as; saturating,
+/// since it has no u64 (an unsigned one would land as a debug string).
+fn micros_attr(micros: u64) -> i64 {
+    i64::try_from(micros).unwrap_or(i64::MAX)
+}
+
 /// [`attr_value`] for an optional field: an absent value renders as an absent
 /// attribute, not as [`MISSING`].
 fn optional_attr(value: Option<&WireObject>) -> (Option<OtelValue>, bool) {
@@ -760,7 +831,7 @@ fn print_stream(stream: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use logfire::{Logfire, config::AdvancedOptions};
-    use monty_proto::{WireFunctionCall, pb};
+    use monty_proto::{WireFunctionCall, pb, pb::os_call::Call};
     use monty_types::MontyObject;
     use opentelemetry::{logs::AnyValue, trace::SpanId};
     use opentelemetry_sdk::{
@@ -842,33 +913,100 @@ mod tests {
         // spans are exported innermost-first as they close
         let spans = spans.get_finished_spans().unwrap();
         let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
-        assert_eq!(
-            names,
-            ["function call {function_name}", "feed", "session {script_name}"]
-        );
+        assert_eq!(names, ["call {function_name}", "run code", "session {script_name}"]);
         let by_name = |name: &str| -> &SpanData { spans.iter().find(|s| s.name == name).unwrap() };
         let session = by_name("session {script_name}");
-        let feed = by_name("feed");
-        let call = by_name("function call {function_name}");
+        let feed = by_name("run code");
+        let call = by_name("call {function_name}");
         assert_eq!(session.parent_span_id, SpanId::INVALID);
         assert_eq!(feed.parent_span_id, session.span_context.span_id());
         assert_eq!(call.parent_span_id, feed.span_context.span_id());
-        let worker_pid = session.attributes.iter().find(|kv| kv.key.as_str() == "worker_pid");
-        assert_eq!(worker_pid.unwrap().value, 4321.into());
-
-        // the resume answer lands in the suspension span, completion in the feed
-        let logs = logs.get_emitted_logs().unwrap();
-        let parent_of = |name: &str| {
-            logs.iter()
-                .find(|l| l.record.event_name() == Some(name))
-                .unwrap()
-                .record
-                .trace_context()
-                .unwrap()
-                .span_id
+        let attr = |span: &SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
         };
-        assert_eq!(parent_of("call result"), call.span_context.span_id());
-        assert_eq!(parent_of("complete"), feed.span_context.span_id());
+        assert_eq!(attr(session, "worker_pid"), Some(4321.into()));
+        // the run's result and the host's answer to the suspension are
+        // attributes of their own spans, typed as the values were, rather
+        // than child records — which leaves this session with no records at all
+        assert_eq!(attr(feed, "output"), Some(4.into()));
+        assert_eq!(attr(feed, "total_execution_micros"), Some(42.into()));
+        assert_eq!(attr(call, "return_value"), Some(4.into()));
+        assert!(logs.get_emitted_logs().unwrap().is_empty());
+    }
+
+    /// A suspension's answer is an attribute of the span it closes, and a cut
+    /// answer flags `length_limit_exceeded` only once — the os call below is
+    /// opened with the flag already set by its own oversize argument, and a
+    /// key recorded twice would be exported twice.
+    #[test]
+    fn suspension_answers_land_on_their_span() {
+        let (logfire, spans, _logs) = test_logfire();
+        let mut recorder = Recorder::new(Some(logfire), None);
+        let long = "x".repeat(ATTR_SIZE_LIMIT * 2);
+
+        recorder.event(&event(pb::child_event::Kind::NameLookup(pb::NameLookup {
+            name: "fetch".to_owned(),
+        })));
+        recorder.begin_turn(&request(pb::parent_request::Kind::ResumeNameLookup(
+            pb::ResumeNameLookup {
+                kind: Some(pb::resume_name_lookup::Kind::Value(
+                    MontyObject::String("<function>".to_owned()).into(),
+                )),
+            },
+        )));
+        recorder.event(&event(pb::child_event::Kind::OsCall(pb::OsCall {
+            call_id: 1,
+            call: Some(Call::WriteText(pb::os_call::TextWrite {
+                path: "/mnt/data/f.txt".to_owned(),
+                data: long.clone(),
+            })),
+        })));
+        recorder.begin_turn(&request(pb::parent_request::Kind::ResumeCall(pb::ResumeCall {
+            call_id: 1,
+            result: Some(pb::ExtFunctionResult {
+                kind: Some(pb::ext_function_result::Kind::ReturnValue(
+                    MontyObject::String(long).into(),
+                )),
+            }),
+        })));
+
+        let spans = spans.get_finished_spans().unwrap();
+        let by_name = |name: &str| -> &SpanData { spans.iter().find(|s| s.name == name).unwrap() };
+        let lookup = by_name("name lookup {name}");
+        let value = lookup.attributes.iter().find(|kv| kv.key.as_str() == "value");
+        assert_eq!(value.unwrap().value, "<function>".into());
+
+        let os_call = by_name("os call {function}");
+        let flags: Vec<_> = os_call
+            .attributes
+            .iter()
+            .filter(|kv| kv.key.as_str() == "length_limit_exceeded")
+            .collect();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].value, true.into());
+    }
+
+    /// A feed restored mid-suspension has no feed span of its own, so its
+    /// completion keeps the record it would otherwise be an attribute of.
+    #[test]
+    fn completion_without_a_feed_span_is_recorded() {
+        let (logfire, _spans, logs) = test_logfire();
+        let mut recorder = Recorder::new(Some(logfire), None);
+        recorder.event(&event(pb::child_event::Kind::Complete(pb::Complete {
+            value: Some(MontyObject::Int(7).into()),
+        })));
+
+        let logs = logs.get_emitted_logs().unwrap();
+        let record = &logs.first().unwrap().record;
+        assert_eq!(record.event_name(), Some("complete"));
+        let value = record
+            .attributes_iter()
+            .find(|(k, _)| k.as_str() == "output")
+            .map(|(_, v)| v.clone());
+        assert_eq!(value, Some(AnyValue::Int(7)));
     }
 
     /// Every attribute a host or the sandbox can make arbitrarily long is
