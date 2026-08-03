@@ -17,7 +17,7 @@ use std::{
     env,
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    sync::Once,
+    sync::{Arc, Once},
     time::Duration,
 };
 
@@ -52,8 +52,9 @@ pub(crate) struct Worker {
     pub(crate) checkouts_served: u32,
     /// Records this worker's protocol turns to the pool's logfire (a no-op
     /// when the pool has no `logfire_token`). It lives here because the worker
-    /// sees the whole conversation, whichever checkout drives it.
-    recorder: Recorder,
+    /// sees the whole conversation, whichever checkout drives it — boxed to
+    /// keep a `Worker` pointer-sized, since checkout and release move it.
+    recorder: Box<Recorder>,
 }
 
 /// The two transports a worker can speak the protocol over. Both variants are
@@ -86,7 +87,7 @@ struct WebSocketWorker {
 impl Worker {
     /// Creates a worker for `config`'s transport, recording its turns to the
     /// pool's `logfire` when telemetry is on.
-    pub(crate) async fn new(config: &PoolConfig, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
+    pub(crate) async fn new(config: &PoolConfig, logfire: Option<&Arc<Logfire>>) -> Result<Self, PoolError> {
         match &config.transport {
             MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, logfire),
             // Bound the dial by `request_timeout` (see `websocket`); a missing
@@ -102,7 +103,7 @@ impl Worker {
     /// There is no spawn-time handshake: a wrong or broken binary surfaces as
     /// an error on the first request the worker serves (typically the
     /// `Configure` of its first checkout).
-    fn subprocess(binary_path: &PathBuf, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
+    fn subprocess(binary_path: &PathBuf, logfire: Option<&Arc<Logfire>>) -> Result<Self, PoolError> {
         let mut command = Command::new(binary_path);
         command
             .arg("subprocess")
@@ -127,7 +128,7 @@ impl Worker {
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        let recorder = Recorder::new(logfire.cloned(), child.id());
+        let recorder = Box::new(Recorder::new(logfire.cloned(), child.id()));
         Ok(Self {
             kind: WorkerKind::Subprocess(Box::new(SubprocessWorker {
                 child,
@@ -148,7 +149,7 @@ impl Worker {
     /// hung dial would otherwise stall the checkout forever. Frame/message
     /// limits are raised to monty's [`MAX_FRAME_LEN`] so the transport never
     /// rejects a frame the protocol itself would accept.
-    async fn websocket(url: &str, dial_timeout: Duration, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
+    async fn websocket(url: &str, dial_timeout: Duration, logfire: Option<&Arc<Logfire>>) -> Result<Self, PoolError> {
         install_crypto_provider();
         let ws_config = WebSocketConfig::default()
             .max_frame_size(Some(MAX_FRAME_LEN as usize))
@@ -162,7 +163,7 @@ impl Worker {
             kind: WorkerKind::WebSocket(Box::new(WebSocketWorker { stream: Some(stream) })),
             checkouts_served: 0,
             // remote worker: there is no local pid to record
-            recorder: Recorder::new(logfire.cloned(), None),
+            recorder: Box::new(Recorder::new(logfire.cloned(), None)),
         })
     }
 

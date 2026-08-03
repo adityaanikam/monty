@@ -12,7 +12,7 @@
 //! entered — a checkout's turns can run on different threads, so an
 //! entered-span stack would be wrong and make [`crate::Checkout`] `!Send`.
 
-use std::process;
+use std::{process, sync::Arc};
 
 use logfire::{ConfigureError, Logfire, config::AdvancedOptions, set_local_logfire};
 use monty_proto::{WireFunctionCall, WireObject, pb, pb::os_call::Call};
@@ -59,8 +59,10 @@ pub(crate) fn init(token: String) -> Result<Logfire, ConfigureError> {
 /// values at all, so the worker is written the same way either way. Spans close
 /// by being dropped, so a worker that dies mid-turn still closes its own.
 pub(crate) struct Recorder {
-    /// `None` disables the recorder entirely.
-    logfire: Option<Logfire>,
+    /// `None` disables the recorder entirely. Behind an [`Arc`] because
+    /// [`Logfire`] is ~2 KiB and this lives on every [`crate::worker::Worker`],
+    /// which is moved on each checkout and release.
+    logfire: Option<Arc<Logfire>>,
     /// OS pid of the worker, recorded on its session spans (`None` for a
     /// remote WebSocket worker).
     worker_pid: Option<u32>,
@@ -83,7 +85,7 @@ pub(crate) struct Recorder {
 
 impl Recorder {
     /// A recorder for one worker; `logfire = None` records nothing.
-    pub(crate) const fn new(logfire: Option<Logfire>, worker_pid: Option<u32>) -> Self {
+    pub(crate) const fn new(logfire: Option<Arc<Logfire>>, worker_pid: Option<u32>) -> Self {
         Self {
             logfire,
             worker_pid,
@@ -99,7 +101,7 @@ impl Recorder {
     /// rejected oversize frame records nothing.
     pub(crate) fn begin_turn(&mut self, request: &pb::ParentRequest) {
         let Some(logfire) = &self.logfire else { return };
-        let _guard = set_local_logfire(logfire.clone());
+        let _guard = set_local_logfire(logfire.as_ref().clone());
         // a turn span whose ending event never arrived (worker died mid-turn,
         // undecodable reply) closes here rather than leaking open
         self.turn = None;
@@ -225,7 +227,7 @@ impl Recorder {
     /// span, turn-ending events close the feed and turn spans.
     pub(crate) fn event(&mut self, event: &pb::ChildEvent) {
         let Some(logfire) = &self.logfire else { return };
-        let _guard = set_local_logfire(logfire.clone());
+        let _guard = set_local_logfire(logfire.as_ref().clone());
         // the budget travels with the elapsed time so `Load`-restored sessions,
         // whose limits come from the dump, show what it is measured against
         let micros = event.total_execution_micros;
@@ -841,6 +843,8 @@ fn print_stream(stream: i32) -> &'static str {
 // recording is a side effect of the worker, not part of the pool's public API
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use logfire::{Logfire, config::AdvancedOptions};
     use monty_proto::{WireFunctionCall, pb, pb::os_call::Call};
     use monty_types::MontyObject;
@@ -888,7 +892,7 @@ mod tests {
     #[test]
     fn one_feed_produces_a_nested_span_tree() {
         let (logfire, spans, logs) = test_logfire();
-        let mut recorder = Recorder::new(Some(logfire), Some(4321));
+        let mut recorder = Recorder::new(Some(Arc::new(logfire)), Some(4321));
 
         recorder.begin_turn(&request(pb::parent_request::Kind::Configure(pb::Configure {
             script_name: "main.py".to_owned(),
@@ -955,7 +959,7 @@ mod tests {
     #[test]
     fn suspension_answers_land_on_their_span() {
         let (logfire, spans, _logs) = test_logfire();
-        let mut recorder = Recorder::new(Some(logfire), None);
+        let mut recorder = Recorder::new(Some(Arc::new(logfire)), None);
         let long = "x".repeat(ATTR_SIZE_LIMIT * 2);
 
         recorder.event(&event(pb::child_event::Kind::NameLookup(pb::NameLookup {
@@ -1005,7 +1009,7 @@ mod tests {
     #[test]
     fn housekeeping_turns_report_on_their_span() {
         let (logfire, spans, logs) = test_logfire();
-        let mut recorder = Recorder::new(Some(logfire), None);
+        let mut recorder = Recorder::new(Some(Arc::new(logfire)), None);
 
         recorder.begin_turn(&request(pb::parent_request::Kind::Load(pb::Load { state: vec![0; 8] })));
         recorder.event(&pb::ChildEvent {
@@ -1041,7 +1045,7 @@ mod tests {
     #[test]
     fn completion_without_a_feed_span_is_recorded() {
         let (logfire, _spans, logs) = test_logfire();
-        let mut recorder = Recorder::new(Some(logfire), None);
+        let mut recorder = Recorder::new(Some(Arc::new(logfire)), None);
         recorder.event(&event(pb::child_event::Kind::Complete(pb::Complete {
             value: Some(MontyObject::Int(7).into()),
         })));
@@ -1092,7 +1096,7 @@ mod tests {
     #[test]
     fn oversize_error_payload_is_capped() {
         let (logfire, _spans, logs) = test_logfire();
-        let mut recorder = Recorder::new(Some(logfire), None);
+        let mut recorder = Recorder::new(Some(Arc::new(logfire)), None);
         recorder.event(&event(pb::child_event::Kind::Error(pb::Error {
             exception: Some(pb::RaisedException {
                 exc_type: "UnicodeDecodeError".to_owned(),

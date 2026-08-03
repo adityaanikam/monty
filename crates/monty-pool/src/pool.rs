@@ -47,9 +47,9 @@ pub(crate) struct PoolInner {
     /// Signalled whenever a worker returns to the idle queue or capacity is
     /// released, waking blocked `checkout` calls.
     available: Notify,
-    /// The pool's logfire (`PoolConfig::logfire_token`), cloned into every
+    /// The pool's logfire (`PoolConfig::logfire_token`), shared with every
     /// worker's recorder; `None` when telemetry is off.
-    logfire: Option<Logfire>,
+    logfire: Option<Arc<Logfire>>,
 }
 
 struct PoolState {
@@ -74,7 +74,8 @@ impl Pool {
             .clone()
             .map(telemetry::init)
             .transpose()
-            .map_err(|err| PoolError::Telemetry(err.to_string()))?;
+            .map_err(|err| PoolError::Telemetry(err.to_string()))?
+            .map(Arc::new);
         // Only the subprocess transport pre-warms workers; WebSocket connections
         // are made per-checkout (its `min_processes` is 0).
         let mut idle = Vec::with_capacity(config.min_processes);
