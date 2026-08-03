@@ -132,6 +132,9 @@ impl Recorder {
                     parent: self.context_span(),
                     "load",
                     state_bytes = l.state.len(),
+                    // filled in by the reply, which announces the name the
+                    // restored session runs under
+                    script_name = Empty,
                 ));
             }
             // ends the session: closing the spans is the whole record, since
@@ -196,7 +199,14 @@ impl Recorder {
             }
             Some(pb::parent_request::Kind::Dump(_)) => {
                 self.dump_turn = true;
-                self.turn = Some(logfire::span!(parent: self.context_span(), "dump"));
+                self.turn = Some(logfire::span!(
+                    parent: self.context_span(),
+                    "dump",
+                    // filled in by the `DumpResult` reply
+                    state_bytes = Empty,
+                    total_execution_micros = Empty,
+                    max_duration_micros = Empty,
+                ));
             }
             // no span of its own: the session is normally already reset, and
             // a lone "shutdown" span would start a whole trace for a worker
@@ -221,9 +231,9 @@ impl Recorder {
         let micros = event.total_execution_micros;
         let max_duration = event.max_duration_micros;
         // only a `Load` reply carries this: the session span already exists with
-        // the `Configure` name, so the dump's name goes on the load turn
-        if let Some(script_name) = &event.restored_script_name {
-            logfire::info!(parent: self.context_span(), "restored {script_name}", script_name = script_name);
+        // the `Configure` name, so the dump's name goes on the load span
+        if let (Some(script_name), Some(load)) = (&event.restored_script_name, &self.turn) {
+            load.record("script_name", script_name.as_str());
         }
         match &event.kind {
             Some(pb::child_event::Kind::Print(p)) => {
@@ -307,14 +317,15 @@ impl Recorder {
                 );
                 self.end_feed();
             }
+            // the dump span carries its own result, and closes on it
             Some(pb::child_event::Kind::DumpResult(d)) => {
-                logfire::info!(
-                    parent: self.context_span(),
-                    "dump result",
-                    state_bytes = d.state.len(),
-                    total_execution_micros = micros,
-                    max_duration_micros = max_duration,
-                );
+                if let Some(dump) = &self.turn {
+                    dump.record("state_bytes", int_attr(d.state.len()));
+                    dump.record("total_execution_micros", int_attr(micros));
+                    if let Some(max_duration) = max_duration {
+                        dump.record("max_duration_micros", int_attr(max_duration));
+                    }
+                }
                 self.turn = None;
             }
             // only a serving relay sends this (a WebSocket worker's server is
@@ -353,9 +364,9 @@ impl Recorder {
                 if let Some(value) = value {
                     feed.record("output", &value, cut);
                 }
-                feed.span.record("total_execution_micros", micros_attr(micros));
+                feed.span.record("total_execution_micros", int_attr(micros));
                 if let Some(max_duration) = max_duration {
-                    feed.span.record("max_duration_micros", micros_attr(max_duration));
+                    feed.span.record("max_duration_micros", int_attr(max_duration));
                 }
             }
             None => logfire::info!(
@@ -769,10 +780,10 @@ fn record_attr(span: &Span, field: &'static str, value: &OtelValue) {
     };
 }
 
-/// A microsecond count as the i64 `tracing` records integers as; saturating,
-/// since it has no u64 (an unsigned one would land as a debug string).
-fn micros_attr(micros: u64) -> i64 {
-    i64::try_from(micros).unwrap_or(i64::MAX)
+/// An unsigned count as the i64 `tracing` records integers as; saturating,
+/// since `tracing` has no u64 (one would land as a debug string instead).
+fn int_attr(count: impl TryInto<i64>) -> i64 {
+    count.try_into().unwrap_or(i64::MAX)
 }
 
 /// [`attr_value`] for an optional field: an absent value renders as an absent
@@ -987,6 +998,42 @@ mod tests {
             .collect();
         assert_eq!(flags.len(), 1);
         assert_eq!(flags[0].value, true.into());
+    }
+
+    /// A `Load` and a `Dump` report their result on their own span, so a
+    /// housekeeping turn is one span with nothing hanging off it.
+    #[test]
+    fn housekeeping_turns_report_on_their_span() {
+        let (logfire, spans, logs) = test_logfire();
+        let mut recorder = Recorder::new(Some(logfire), None);
+
+        recorder.begin_turn(&request(pb::parent_request::Kind::Load(pb::Load { state: vec![0; 8] })));
+        recorder.event(&pb::ChildEvent {
+            kind: Some(pb::child_event::Kind::Ok(pb::Ok {})),
+            total_execution_micros: 42,
+            max_duration_micros: None,
+            restored_script_name: Some("dumped.py".to_owned()),
+        });
+        recorder.begin_turn(&request(pb::parent_request::Kind::Dump(pb::Dump {})));
+        recorder.event(&event(pb::child_event::Kind::DumpResult(pb::DumpResult {
+            state: vec![0; 16],
+        })));
+
+        let spans = spans.get_finished_spans().unwrap();
+        let attr = |name: &str, key: &str| {
+            spans
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        };
+        assert_eq!(attr("load", "script_name"), Some("dumped.py".into()));
+        assert_eq!(attr("dump", "state_bytes"), Some(16.into()));
+        assert_eq!(attr("dump", "total_execution_micros"), Some(42.into()));
+        assert!(logs.get_emitted_logs().unwrap().is_empty());
     }
 
     /// A feed restored mid-suspension has no feed span of its own, so its
