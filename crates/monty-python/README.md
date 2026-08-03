@@ -233,13 +233,14 @@ with Monty() as pool:
 ### Observability
 
 Passing a [Logfire](https://pydantic.dev/logfire) write token instruments the
-pool. Each checkout becomes one session span, with a nested span per turn
+pool: each checkout becomes one session span, with a nested span per turn
 recording the code fed, its inputs, external call arguments and results,
 exceptions and `print` output. Session dumps and restores are recorded by size
-only. Without the token nothing is recorded and no exporter runs. Recording
-happens in the host process (the pool sees the whole conversation with each
-worker); the workers themselves receive no token and run no exporter, and any
-logfire/OTel setup of your own application is untouched.
+only. Without a token nothing is recorded and no exporter runs.
+
+Recording happens in the host process, which sees the whole conversation with
+each worker; the workers get no token, and your application's own logfire/OTel
+setup is untouched.
 
 ```python test="skip"
 from pydantic_monty import Monty

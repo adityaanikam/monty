@@ -396,9 +396,8 @@ class Monty:
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
             logfire_token: Logfire write token. When set, the pool records
-                every session to Logfire from the host process; workers
-                receive no token, and any logfire/OTel setup of your own
-                application is untouched.
+                every session from the host process; the workers get no token
+                and your application's own logfire/OTel setup is untouched.
         """
 
     def __enter__(self) -> Self: ...

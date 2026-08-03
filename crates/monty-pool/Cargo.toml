@@ -44,8 +44,8 @@ serde_json = { workspace = true }
 # (`service.instance.id`, `process.pid`); versions must match logfire's.
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
-# Only for the span/level types logfire's own API exposes; all recording goes
-# through the `logfire::` macros.
+# Only for the span/level types logfire's API exposes; recording goes through
+# the `logfire::` macros.
 tracing = "0.1"
 # The pool's own `service.instance.id`: v7 so the ids sort by pool start.
 uuid = { version = "1", features = ["v7"] }

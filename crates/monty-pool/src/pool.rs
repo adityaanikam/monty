@@ -47,9 +47,8 @@ pub(crate) struct PoolInner {
     /// Signalled whenever a worker returns to the idle queue or capacity is
     /// released, waking blocked `checkout` calls.
     available: Notify,
-    /// The pool's logfire (`PoolConfig::logfire_token`), which every worker's
-    /// recorder holds a clone of. `None`: telemetry is off. [`Pool::close`]
-    /// shuts it down, flushing the exporter.
+    /// The pool's logfire (`PoolConfig::logfire_token`), cloned into every
+    /// worker's recorder; `None` when telemetry is off.
     logfire: Option<Logfire>,
 }
 
@@ -111,9 +110,9 @@ impl Pool {
     /// Optional: dropping the pool kills idle workers instead, which is just
     /// as safe — this only trades a SIGKILL for a clean protocol goodbye.
     ///
-    /// This also shuts the telemetry exporter down, so it is the last thing a
-    /// pool should be asked to do: what sessions still checked out here go on
-    /// to record is dropped rather than exported.
+    /// This also shuts the telemetry exporter down, so it must be the last
+    /// thing asked of a pool: whatever a still-checked-out session records
+    /// afterwards is dropped rather than exported.
     pub async fn close(&self) {
         // Pair each removed worker with a capacity guard immediately: if this
         // future is dropped mid-close, every unreaped worker is killed by its
@@ -138,11 +137,10 @@ impl Pool {
             worker.reap_or_kill(SHUTDOWN_EXIT_GRACE).await;
         }))
         .await;
-        // Flush and stop the telemetry exporter, off the async runtime —
-        // `shutdown` blocks until the exporter confirms. Errors are swallowed:
-        // they are export failures (e.g. a bad token) teardown cannot fix, and
-        // a second `close` reports "already shut down". A pool merely dropped
-        // skips this and may lose its last, not-yet-exported batch of spans.
+        // Flush and stop the exporter off the async runtime — `shutdown`
+        // blocks until the exporter confirms. Errors are swallowed: they are
+        // export failures (e.g. a bad token) teardown cannot fix, and a second
+        // `close` reports "already shut down".
         if let Some(logfire) = self.inner.logfire.clone() {
             let _ = spawn_blocking(move || logfire.shutdown()).await;
         }

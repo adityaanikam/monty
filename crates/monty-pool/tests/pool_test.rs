@@ -1265,12 +1265,10 @@ async fn workers_are_recycled_after_max_checkouts() {
 #[tokio::test]
 async fn logfire_token_pool_round_trips() {
     let mut config = config();
-    // a syntactically valid but fake token: the pool configures its local
-    // logfire and records every turn, while the background exporter's
-    // failures never affect execution
+    // a syntactically valid but fake token: the pool records every turn, while
+    // the background exporter's failures never affect execution
     config.logfire_token = Some("pylf_v1_us_0000000000000000000000".to_owned());
-    // recycle after every checkout so a replacement worker's recorder is
-    // exercised too
+    // recycle after every checkout, so a replacement worker's recorder runs too
     config.max_checkouts_per_worker = Some(1);
     let pool = Pool::new(config).await.unwrap();
 

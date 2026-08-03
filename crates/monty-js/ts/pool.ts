@@ -45,9 +45,8 @@ export interface MontyOptions {
   /** Recycle a worker (kill and replace) after serving this many sessions. */
   maxCheckoutsPerWorker?: number
   /**
-   * Logfire write token. When set, the pool records every session to Logfire
-   * from the host process; workers receive no token, and any OTel setup of
-   * your own application is untouched.
+   * Logfire write token. When set, the pool records every session from the host
+   * process; workers get no token and your app's own OTel setup is untouched.
    */
   logfireToken?: string
 }

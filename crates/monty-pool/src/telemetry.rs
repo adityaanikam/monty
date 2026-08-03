@@ -1,28 +1,16 @@
 //! Logfire instrumentation of the pool's protocol conversations.
 //!
-//! The pool records every worker's wire traffic from the host side: it builds
-//! each `ParentRequest` and decodes each `ChildEvent` anyway, so the whole
-//! conversation is observable without instrumenting the sandbox itself. A
-//! worker serves one REPL session per checkout, so the trace is shaped the
-//! same way: `Configure` opens a session span carrying its arguments and
-//! `Reset` closes it. Each `Feed` opens a span held across suspension
-//! round-trips, so the whole logical feed is one span: every suspension
-//! (external function call, os call, name lookup, future resolution) becomes
-//! a child span closed when the pool's `Resume*` answer is sent — its
-//! duration is the host round-trip — and the turn-ending
-//! `Complete`/`Error`/`TypingError` event closes the feed span. Housekeeping
-//! requests (`Load`, `Dump`, ...) are plain turn spans of their own.
-//! Everything the protocol carries is recorded verbatim — code, inputs, call
-//! arguments, results, exceptions — except the opaque `Load`/`Dump` snapshot
-//! blobs, which are recorded as a byte count.
+//! The pool builds every `ParentRequest` and decodes every `ChildEvent`
+//! anyway, so the sandbox needs no instrumenting. The trace mirrors the
+//! protocol: `Configure` opens a session span `Reset` closes, `Feed` opens a
+//! span held across suspensions, and each suspension is a child span the
+//! answering `Resume*` closes — its duration is the host round-trip.
 //!
-//! Logfire is configured in *local* mode: nothing global is touched, so the
-//! host application keeps its own `tracing`/OTel setup and several pools can
-//! coexist in one process. The flip side is that every recording call must
-//! scope the pool's own logfire in via [`set_local_logfire`], and spans must
-//! be parented explicitly (`parent:`) rather than by thread-local entering —
-//! a checkout's turns can run on different threads, so an entered-span stack
-//! would both be wrong and make [`crate::Checkout`] `!Send`.
+//! Logfire runs in *local* mode, leaving the host's own tracing/OTel setup
+//! alone, so every recording call must scope the pool's logfire in via
+//! [`set_local_logfire`] and spans are parented explicitly rather than
+//! entered — a checkout's turns can run on different threads, so an
+//! entered-span stack would be wrong and make [`crate::Checkout`] `!Send`.
 
 use std::process;
 
@@ -41,16 +29,13 @@ use crate::telemetry_json::{
 /// Configures a pool-scoped logfire with `token` and records that the pool
 /// started.
 ///
-/// Local mode (see the module docs) means the returned [`Logfire`] is the
-/// only handle on this configuration: the pool must keep it alive and call
-/// `shutdown` on teardown to flush the exporter. The pool identifies itself
-/// with a fresh `service.instance.id` (UUIDv7, so ids sort by pool start)
-/// plus the host `process.pid`. `RUST_LOG` in the host environment filters
-/// what is recorded, as in any logfire-instrumented process; the default
-/// level is INFO, which everything recorded here is emitted at.
+/// Local mode (see the module docs) makes the returned [`Logfire`] the only
+/// handle: the pool must keep it alive and `shutdown` it to flush the exporter.
+/// Everything here is recorded at INFO, so `RUST_LOG` can filter it out.
 pub(crate) fn init(token: String) -> Result<Logfire, ConfigureError> {
-    // `builder_empty` so this adds only these two attributes: logfire fills
-    // in service name/version and the sdk resource itself
+    // `builder_empty` so this adds only these two attributes: logfire fills in
+    // service name/version and the sdk resource itself. UUIDv7 so instance ids
+    // sort by pool start.
     let resource = Resource::builder_empty()
         .with_attributes([
             KeyValue::new("service.instance.id", Uuid::now_v7().to_string()),
@@ -72,16 +57,10 @@ pub(crate) fn init(token: String) -> Result<Logfire, ConfigureError> {
 
 /// Records one worker's protocol turns to the pool's logfire.
 ///
-/// Lives on the [`crate::worker::Worker`], which sees every request sent and
-/// every event received — the same vantage point the child's own loop would
-/// have. A disabled recorder (pool without a `logfire_token`) makes every
-/// method a no-op and, crucially, skips rendering values to strings, so the
-/// worker is written the same way whether or not telemetry is on.
-///
-/// Spans are plain [`Span`] handles closed by dropping them (never entered —
-/// see the module docs), so a worker that dies mid-turn closes everything
-/// still open when it is dropped, and the spans survive the crash — they were
-/// never inside the crashed process.
+/// Lives on the [`crate::worker::Worker`], which sees every request and event.
+/// A disabled recorder (no `logfire_token`) is a no-op that skips rendering
+/// values at all, so the worker is written the same way either way. Spans close
+/// by being dropped, so a worker that dies mid-turn still closes its own.
 pub(crate) struct Recorder {
     /// `None` disables the recorder entirely.
     logfire: Option<Logfire>,
@@ -91,22 +70,17 @@ pub(crate) struct Recorder {
     /// The span of a housekeeping turn (`Load`, `Dump`, ...), closed by the
     /// turn-ending event. Innermost: a `Dump` can run mid-suspension.
     turn: Option<Span>,
-    /// The span of the suspension the feed is blocked on (external function
-    /// call, os call, name lookup, future resolution). Opened by the
-    /// suspension event, closed when the answering `Resume*` is sent, so its
-    /// duration is the host round-trip.
+    /// The span of the suspension the feed is blocked on, closed when the
+    /// answering `Resume*` is sent so its duration is the host round-trip.
     pending: Option<Span>,
-    /// The span of the in-flight feed, held across suspension round-trips so
-    /// the whole logical feed is one span. Opened by `Feed`, closed by the
-    /// turn-ending `Complete`/`Error`/`TypingError` event.
+    /// The in-flight feed's span, held across suspension round-trips so the
+    /// whole feed is one span. Closed by the turn-ending event.
     feed: Option<Span>,
-    /// The session span every turn nests inside. `Configure` opens it,
-    /// `Reset` closes it, and dropping the recorder closes one left open by
-    /// a crash or shutdown.
+    /// The session span every turn nests inside; `Configure` opens it and
+    /// `Reset` closes it.
     session: Option<Span>,
-    /// Whether the current turn is a `Dump`: an `Error` reply to one (e.g. an
-    /// oversize dump) leaves the feed suspended and resumable, so it must
-    /// close only the dump span, not the feed.
+    /// Whether the current turn is a `Dump`: an `Error` reply to one leaves
+    /// the feed suspended and resumable, so it closes only the dump span.
     dump_turn: bool,
 }
 
@@ -124,13 +98,8 @@ impl Recorder {
         }
     }
 
-    /// Starts recording one turn, called after the request frame is written
-    /// (a rejected oversize frame never reaches the worker, so it records
-    /// nothing): opens the session span on `Configure`, the feed span on
-    /// `Feed`, or a turn span for the housekeeping requests. `Resume*`
-    /// requests open no span — they record the host's answer inside the
-    /// pending suspension span and close it, so a feed reads as one span with
-    /// a child span per suspension.
+    /// Starts recording one turn; called once the frame is on the wire, so a
+    /// rejected oversize frame records nothing.
     pub(crate) fn begin_turn(&mut self, request: &pb::ParentRequest) {
         let Some(logfire) = &self.logfire else { return };
         let _guard = set_local_logfire(logfire.clone());
@@ -139,8 +108,7 @@ impl Recorder {
         self.turn = None;
         self.dump_turn = false;
         match &request.kind {
-            // Configure opens the session span rather than a turn span; a
-            // stale session (impossible via the checkout state machine, but
+            // a stale session (impossible via the checkout state machine, but
             // cheap to be safe against) is closed by the overwrite
             Some(pb::parent_request::Kind::Configure(c)) => {
                 self.pending = None;
@@ -157,7 +125,7 @@ impl Recorder {
                     max_memory_bytes = limits.and_then(|l| l.max_memory_bytes),
                     gc_interval = limits.and_then(|l| l.gc_interval),
                     max_recursion_depth = limits.and_then(|l| l.max_recursion_depth),
-                    // i64: a u32 has no typed `tracing` value and would be
+                    // i64: `tracing` has no typed u32 value, so a u32 would be
                     // recorded as its debug string
                     worker_pid = self.worker_pid.map(i64::from),
                 ));
@@ -169,9 +137,9 @@ impl Recorder {
                     state_bytes = l.state.len(),
                 ));
             }
-            // ends the session: closing the spans is the whole record, and
-            // the bare `Ok` it is answered with would say nothing. A reset
-            // can land mid-suspension in principle, so close innermost-first.
+            // ends the session: closing the spans is the whole record, since
+            // the bare `Ok` it is answered with would say nothing. A reset can
+            // land mid-suspension, so close innermost-first.
             Some(pb::parent_request::Kind::Reset(_)) => {
                 self.pending = None;
                 self.feed = None;
@@ -201,8 +169,8 @@ impl Recorder {
                     length_limit_exceeded = (code_cut | inputs_cut).then_some(true),
                 ));
             }
-            // the resume family: record the host's answer inside the pending
-            // suspension span, then close it — its duration is the host time
+            // the resume family opens no span: it records the host's answer
+            // inside the pending suspension span, then closes it
             Some(pb::parent_request::Kind::ResumeCall(r)) => {
                 let pending = self.take_pending();
                 let (result, cut) = render_ext_result(r.result.as_ref());
@@ -251,23 +219,17 @@ impl Recorder {
         }
     }
 
-    /// Records one event received from the worker.
-    ///
-    /// The suspension events open the pending span the matching `Resume*`
-    /// closes; the turn-ending events close the feed and/or housekeeping turn
-    /// spans. `DumpResult` records only its snapshot size, for the reason
-    /// given in the module docs.
+    /// Records one event from the worker: suspension events open the pending
+    /// span, turn-ending events close the feed and turn spans.
     pub(crate) fn event(&mut self, event: &pb::ChildEvent) {
         let Some(logfire) = &self.logfire else { return };
         let _guard = set_local_logfire(logfire.clone());
-        // carried by every turn-ending event; recording the budget alongside
-        // keeps `Load`-restored sessions (whose limits come from the dump, not
-        // the session span's Configure) showing what the time is measured against
+        // the budget travels with the elapsed time so `Load`-restored sessions,
+        // whose limits come from the dump, show what it is measured against
         let micros = event.total_execution_micros;
         let max_duration = event.max_duration_micros;
-        // only a `Load` reply carries this: the session span was opened by the
-        // preceding `Configure`, so the script name the dump restored — the one
-        // the session actually runs under — is recorded on the load turn instead
+        // only a `Load` reply carries this: the session span already exists with
+        // the `Configure` name, so the dump's name goes on the load turn
         if let Some(script_name) = &event.restored_script_name {
             logfire::info!(parent: self.context_span(), "restored {script_name}", script_name = script_name);
         }
@@ -332,9 +294,8 @@ impl Recorder {
             }
             Some(pb::child_event::Kind::Error(e)) => {
                 record_error(e, micros, max_duration, &self.context_span());
-                // an error reply to `Dump` (e.g. an oversize dump) does not
-                // end the in-flight feed — the worker stays suspended and
-                // resumable — so it closes only the dump span
+                // an error reply to `Dump` leaves the feed suspended and
+                // resumable, so it closes only the dump span
                 if self.dump_turn {
                     self.turn = None;
                 } else {
@@ -364,9 +325,9 @@ impl Recorder {
                 self.turn = None;
             }
             // only a serving relay sends this (a WebSocket worker's server is
-            // shutting down); its final state dump is an opaque blob,
-            // recorded by size, absent when there was no session or the dump
-            // failed. The worker is discarded right after, closing its spans.
+            // shutting down); its final state dump is absent when there was no
+            // session or the dump failed. The worker is discarded right after,
+            // closing its spans.
             Some(pb::child_event::Kind::Shutdown(s)) => {
                 logfire::info!(
                     parent: self.context_span(),
@@ -399,7 +360,7 @@ impl Recorder {
     }
 
     /// Takes the pending suspension span so the resume answer can be recorded
-    /// inside it before it closes (by dropping) at the end of the caller.
+    /// inside it before the caller drops it, closing it.
     fn take_pending(&mut self) -> Span {
         self.pending.take().unwrap_or_else(Span::none)
     }
@@ -418,10 +379,9 @@ impl Recorder {
 /// worker rejects such frames; telemetry still has to render something.
 const MISSING: &str = "<missing>";
 
-/// Renders a feed's named inputs as one JSON object of name → encoded value;
-/// the bool reports a cut at [`ATTR_SIZE_LIMIT`]. The values are borrowed, not
-/// cloned: a feed's inputs can be a large object graph, and only 64 KiB of the
-/// encoding survives.
+/// Renders a feed's named inputs as one JSON object; the bool reports a cut at
+/// [`ATTR_SIZE_LIMIT`]. Values are borrowed, never cloned — inputs can be a
+/// large graph of which only the cap survives.
 fn render_inputs(inputs: &[pb::NamedValue]) -> (Option<String>, bool) {
     if inputs.is_empty() {
         return (None, false);
@@ -439,10 +399,9 @@ fn render_inputs(inputs: &[pb::NamedValue]) -> (Option<String>, bool) {
     (Some(json), cut)
 }
 
-/// Renders a suspended call's positional arguments as a JSON list and its
-/// keyword arguments as a JSON object; either is absent when empty. The
-/// arguments are borrowed, not cloned, for the reason given in
-/// [`render_inputs`].
+/// Renders a call's positional arguments as a JSON list and its keyword
+/// arguments as a JSON object, either absent when empty; borrowed for the
+/// reason given in [`render_inputs`].
 fn render_call_arguments(call: &WireFunctionCall) -> (Option<String>, Option<String>, bool) {
     let mut any_cut = false;
     let args = (!call.args.is_empty()).then(|| {
@@ -513,15 +472,13 @@ fn render_call_ids(ids: &[u32]) -> Option<String> {
     (!ids.is_empty()).then(|| serde_json::to_string(ids).unwrap_or_default())
 }
 
-/// Opens the span for one os call suspension: the function name plus each of
-/// its arguments as a standalone `args.*` attribute named after the proto
-/// field (strings as strings, numbers as numbers, bools as bools; `bytes`
-/// data as its Python repr). Every path is a virtual sandbox path. The span
-/// stays open until the pool's answer closes it.
+/// Opens the span for one os call suspension: the function name plus each
+/// argument as an `args.*` attribute named after its proto field. Every path
+/// is a virtual sandbox path.
 ///
 /// Each call shape gets its own macro invocation because the attribute set is
-/// baked into the span's `logfire.json_schema` at compile time — a single
-/// union-shaped call would surface every unused argument as `null` in the UI.
+/// baked into the span's `logfire.json_schema` at compile time — a union-shaped
+/// call would surface every unused argument as `null` in the UI.
 fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, parent: &Span) -> Span {
     let call_id = os_call.call_id;
     /// One span with only the given `args.*` attributes plus the shared tail.
@@ -595,9 +552,9 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_duration: Option<u64>, pa
             args.exist_ok = m.exist_ok
         ),
         Some(Call::Rename(r)) => os_call!("rename", args.src = &r.src, args.dst = &r.dst),
-        // a getenv with no default is recorded with `args.default = null`,
-        // matching the `None` that `os.getenv` defaults to in Python; span
-        // attributes cannot carry a dynamic typed value, so it is stringified
+        // no default is recorded as `args.default = null`, matching Python's
+        // `os.getenv`; a span attribute cannot carry a dynamically typed
+        // value, so the default is stringified
         Some(Call::Getenv(g)) => {
             let (default, cut) = optional_attr(g.default.as_ref());
             let default = default.map(|v| v.as_str().into_owned());
@@ -653,13 +610,10 @@ fn render_traceback(frames: &[pb::StackFrame]) -> (Option<String>, bool) {
     (Some(traceback), cut)
 }
 
-/// Records an `Error` event: exception type, message, traceback, and — for
-/// the exception types carrying a structured payload — each payload field as
-/// a standalone `exc_data.*` attribute, including the offending input (it is
-/// the value being debugged).
-///
-/// Like [`os_call_span`], each payload shape gets its own macro invocation
-/// so records don't surface the other shape's attributes as `null`.
+/// Records an `Error` event: exception type, message, traceback, and each
+/// field of a structured payload as an `exc_data.*` attribute — including the
+/// offending input, the value being debugged. One macro invocation per payload
+/// shape, for the reason given in [`os_call_span`].
 fn record_error(error: &pb::Error, micros: u64, max_duration: Option<u64>, parent: &Span) {
     let exc = error.exception.as_ref();
     let exc_type = exc.map_or_else(|| MISSING.to_owned(), |e| e.exc_type.clone());
@@ -763,12 +717,9 @@ fn unzip<T>(pair: Option<(T, bool)>) -> (Option<T>, bool) {
 }
 
 /// A bytes value as logfire renders bytes: the repr's escaped content without
-/// the b'' wrapper, as raw text capped at [`ATTR_SIZE_LIMIT`].
-///
-/// Only the leading [`ATTR_SIZE_LIMIT`] bytes are escaped: every byte escapes
-/// to at least one character, so that is already enough to fill the cap, and
-/// escaping the rest would quadruple a payload as big as a `write_bytes` call
-/// allows just to throw it away.
+/// the b'' wrapper, capped at [`ATTR_SIZE_LIMIT`]. Only that many input bytes
+/// are escaped — each escapes to at least one character, so the rest would
+/// inflate a whole `write_bytes` payload just to throw it away.
 fn bytes_attr(b: &[u8]) -> (String, bool) {
     let head = &b[..b.len().min(ATTR_SIZE_LIMIT)];
     let repr = bytes_repr(head);
@@ -849,12 +800,9 @@ mod tests {
         }
     }
 
-    /// Drives one whole session — configure, feed, a suspension round-trip,
-    /// completion, reset — and checks the exported span tree: the suspension
-    /// span is a child of the feed span, the feed span of the session span,
-    /// the session span a root; and the resume/complete log records land
-    /// inside the right spans. This is what proves the explicit-parent
-    /// plumbing (spans are never entered — see the module docs) holds up.
+    /// Drives a whole session and checks the exported spans nest and the log
+    /// records land in the right ones — this is what proves the explicit-parent
+    /// plumbing (see the module docs) holds up.
     #[test]
     fn one_feed_produces_a_nested_span_tree() {
         let (logfire, spans, logs) = test_logfire();
@@ -905,8 +853,6 @@ mod tests {
         assert_eq!(session.parent_span_id, SpanId::INVALID);
         assert_eq!(feed.parent_span_id, session.span_context.span_id());
         assert_eq!(call.parent_span_id, feed.span_context.span_id());
-        // the worker's identity is a session attribute (the child-side
-        // recorder used to carry it as a per-process resource attribute)
         let worker_pid = session.attributes.iter().find(|kv| kv.key.as_str() == "worker_pid");
         assert_eq!(worker_pid.unwrap().value, 4321.into());
 
@@ -926,9 +872,7 @@ mod tests {
     }
 
     /// Every attribute a host or the sandbox can make arbitrarily long is
-    /// capped and flagged — including the ones reached through an
-    /// `ExtFunctionResult` or a structured exception payload, and including a
-    /// `bytes` payload, which is escaped only as far as the cap can keep.
+    /// capped and flagged, including those inside an `ExtFunctionResult`.
     #[test]
     fn oversize_attributes_are_capped_and_flagged() {
         let long = "x".repeat(ATTR_SIZE_LIMIT * 2);
@@ -958,8 +902,8 @@ mod tests {
         assert_eq!(bytes_attr(b"hi\xff"), ("hi\\xff".to_owned(), false));
     }
 
-    /// The `Error` event's structured payload fields are capped too — the
-    /// codec name of a `UnicodeDecodeError` is whatever the sandbox passed.
+    /// The `Error` event's structured `exc_data.*` payload fields are capped
+    /// and flagged too.
     #[test]
     fn oversize_error_payload_is_capped() {
         let (logfire, _spans, logs) = test_logfire();

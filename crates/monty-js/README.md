@@ -330,10 +330,10 @@ With `logfireToken` set, the pool reports every session it serves to
 [Logfire](https://pydantic.dev/logfire): one span per checkout, with a nested
 span per protocol turn carrying the code fed, its inputs, external call
 arguments and results, exceptions and `print` output. Session dumps and
-restores are recorded by size only. Recording happens in the host process (the
-native pool sees the whole conversation with each worker); the workers receive
-no token and run no exporter. The `/wasm` worker pool has no equivalent — its
-pool is pure TypeScript with no exporter.
+restores are recorded by size only. Recording happens in the host process,
+which sees the whole conversation with each worker; the workers get no token.
+The `/wasm` worker pool has no equivalent — it is pure TypeScript with no
+exporter.
 
 ## Value Conversion
 

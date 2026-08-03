@@ -51,9 +51,8 @@ pub(crate) struct Worker {
     /// Checkouts this worker has served, for `max_checkouts_per_worker`.
     pub(crate) checkouts_served: u32,
     /// Records this worker's protocol turns to the pool's logfire (a no-op
-    /// recorder when the pool has no `logfire_token`). Lives here because the
-    /// worker sees every request sent and every event received — the whole
-    /// conversation — regardless of which checkout drives it.
+    /// when the pool has no `logfire_token`). It lives here because the worker
+    /// sees the whole conversation, whichever checkout drives it.
     recorder: Recorder,
 }
 
@@ -85,8 +84,8 @@ struct WebSocketWorker {
 }
 
 impl Worker {
-    /// Creates a worker for `config`'s transport; `logfire`, when present, is
-    /// the pool's telemetry the worker's turns are recorded to.
+    /// Creates a worker for `config`'s transport, recording its turns to the
+    /// pool's `logfire` when telemetry is on.
     pub(crate) async fn new(config: &PoolConfig, logfire: Option<&Logfire>) -> Result<Self, PoolError> {
         match &config.transport {
             MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, logfire),
@@ -197,8 +196,7 @@ impl Worker {
             }
         };
         // record only requests that hit the wire: a rejected oversize frame
-        // never reached the worker, so the turn (and any pending suspension)
-        // is still exactly where it was
+        // leaves the turn (and any pending suspension) exactly where it was
         if result.is_ok() {
             self.recorder.begin_turn(request);
         }
@@ -241,8 +239,8 @@ impl Worker {
                 decode_event(&data)
             }
         }?;
-        // recorded only after a complete decode, so a `recv` future dropped
-        // mid-frame (deadline race) records nothing — cancel-safety intact
+        // only after a complete decode, so a `recv` future dropped mid-frame
+        // (deadline race) records nothing — cancel-safety intact
         self.recorder.event(&event);
         Ok(event)
     }

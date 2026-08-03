@@ -86,20 +86,19 @@ session remain alive and usable.
 ## Observability
 
 Setting `PoolConfig::logfire_token` records every session the pool serves to
-[Logfire](https://pydantic.dev/logfire), from the host process — the pool builds every request
-and decodes every event anyway, so the whole conversation is observable without instrumenting
-the workers (they receive no token and run no exporter, and recording works on both
-transports). Each checkout becomes one session span; each feed is a nested span held across
-suspension round-trips, with a child span per suspension whose duration is the host round-trip.
-Fed code, inputs, call arguments and results, exceptions and `print` output are recorded in
-full — values are encoded the way the Python logfire SDK encodes attributes, capped at 64KB
-per value — while `Load`/`Dump` snapshot blobs are recorded by size only.
+[Logfire](https://pydantic.dev/logfire). Recording happens in the host process, which builds
+every request and decodes every event anyway, so both transports are covered and the workers
+stay uninstrumented — they receive no token and run no exporter. Each checkout becomes one
+session span; each feed is a nested span held across suspension round-trips, with a child span
+per suspension whose duration is the host round-trip. Fed code, inputs, call arguments and
+results, exceptions and `print` output are recorded in full — values encoded the way the
+Python logfire SDK encodes attributes, capped at 64KB per value — while `Load`/`Dump` snapshot
+blobs are recorded by size only.
 
 Logfire is configured in *local* mode: the host application's own `tracing`/OTel setup is
 untouched and several pools can coexist. `Pool::close` flushes the exporter (a pool merely
-dropped may lose its last, not-yet-exported batch of spans). As in any logfire-instrumented
-process, a `RUST_LOG` directive in the host environment filters what is recorded (everything
-here is emitted at INFO).
+dropped may lose its last batch of spans). As in any logfire-instrumented process, a `RUST_LOG`
+directive filters what is recorded — everything here is emitted at INFO.
 
 ## Transports
 

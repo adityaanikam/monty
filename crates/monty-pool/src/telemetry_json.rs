@@ -2,13 +2,12 @@
 //!
 //! Mirrors the Python logfire JSON encoder (`logfire/_internal/json_encoder.py`):
 //! containers become JSON arrays/objects, dates use isoformat, timedeltas their
-//! total seconds, and opaque objects fall back to their `repr`. Output is
-//! capped at a byte limit so a huge value cannot blow up the telemetry
-//! pipeline; the caller is told when the cap cut serialization short.
+//! total seconds, and opaque objects fall back to their `repr`. Output is capped
+//! at a byte limit so a huge value cannot blow up the telemetry pipeline.
 //!
-//! Known divergences from the Python encoder: sets are encoded in storage
-//! order (Python sorts them when comparable), and integers beyond `i128`
-//! become their digit string rather than a raw JSON number.
+//! Divergences from the Python encoder: sets are encoded in storage order
+//! (Python sorts them when comparable), and integers beyond `i128` become their
+//! digit string rather than a raw JSON number.
 
 use std::{
     collections::HashMap,
@@ -20,28 +19,27 @@ use monty_types::{MontyDateTime, MontyObject, bytes_repr};
 use num_traits::ToPrimitive;
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
-/// Serializes `value` to logfire-style JSON (see the module docs for the
-/// format), capped at `limit` bytes. The bool is true when the cap cut
-/// serialization short — the partial output is then no longer valid JSON, and
-/// the caller should mark it as truncated.
+/// Serializes `value` to logfire-style JSON (see the module docs), capped at
+/// `limit` bytes. The bool is true when the cap cut serialization short — the
+/// partial output is then no longer valid JSON, so the caller should mark it
+/// truncated.
 pub(crate) fn serialize_capped(value: &MontyObject, limit: usize) -> (String, bool) {
     capped(&JsonEncoded { value, limit }, limit)
 }
 
-/// [`serialize_capped`] for a list of values, borrowing them rather than
-/// cloning them into a [`MontyObject::List`].
+/// [`serialize_capped`] for a borrowed list; this and the two variants below
+/// exist to avoid cloning values into an owned [`MontyObject`] container.
 pub(crate) fn serialize_seq_capped(items: &[MontyObject], limit: usize) -> (String, bool) {
     capped(&JsonSeq { items, limit }, limit)
 }
 
-/// [`serialize_capped`] for dict pairs (non-string keys rendered by their
-/// repr), borrowing them rather than cloning them into a [`MontyObject::Dict`].
+/// [`serialize_capped`] for borrowed dict pairs; non-string keys render as
+/// their repr.
 pub(crate) fn serialize_dict_capped(pairs: &[(MontyObject, MontyObject)], limit: usize) -> (String, bool) {
     capped(&JsonDict { pairs, limit }, limit)
 }
 
-/// [`serialize_capped`] for named values as a JSON object, borrowing them
-/// rather than cloning them into a dict.
+/// [`serialize_capped`] for borrowed name → value pairs, as a JSON object.
 pub(crate) fn serialize_named_capped(pairs: &[(&str, &MontyObject)], limit: usize) -> (String, bool) {
     capped(&JsonNamed { pairs, limit }, limit)
 }
@@ -81,16 +79,16 @@ impl Write for CappedWriter {
 /// Serializes a [`MontyObject`] with the logfire value mapping (rather than
 /// the tagged-enum encoding of the derived `Serialize`, which is for the wire).
 ///
-/// `limit` is the caller's byte cap, carried down the value tree so a huge
-/// `bytes` leaf is escaped only as far as the cap can keep — the writer alone
-/// cannot help, since it sees the escaped string only once it is built.
+/// `limit` is carried down the value tree so a huge `bytes` leaf is escaped
+/// only as far as the cap can keep — the writer alone cannot help, since it
+/// sees the escaped string only once it is built.
 struct JsonEncoded<'a> {
     value: &'a MontyObject,
     limit: usize,
 }
 
 impl<'a> JsonEncoded<'a> {
-    /// The same encoder for a nested value.
+    /// An encoder for a child value, carrying `limit` down the tree.
     const fn nested(&self, value: &'a MontyObject) -> Self {
         Self {
             value,
@@ -105,8 +103,8 @@ impl Serialize for JsonEncoded<'_> {
             MontyObject::None => s.serialize_unit(),
             MontyObject::Bool(b) => s.serialize_bool(*b),
             MontyObject::Int(i) => s.serialize_i64(*i),
-            // beyond i128 (vanishingly rare) the digits become a string, as a
-            // raw JSON number would need serde_json's arbitrary-precision mode
+            // beyond i128 the digits become a string: a raw JSON number would
+            // need serde_json's arbitrary-precision mode
             MontyObject::BigInt(b) => match b.to_i128() {
                 Some(i) => s.serialize_i128(i),
                 None => s.collect_str(b),
@@ -115,9 +113,9 @@ impl Serialize for JsonEncoded<'_> {
             MontyObject::Float(f) => s.serialize_str(nonfinite_str(*f)),
             MontyObject::String(v) => s.serialize_str(v),
             // like logfire: the repr's escaped content without the b'' wrapper.
-            // Escaping stops at `limit` bytes of input: every byte escapes to
-            // at least one character, so the rest could only produce output the
-            // cap discards — after quadrupling a huge payload to build it
+            // Escaping stops at `limit` input bytes — each escapes to at least
+            // one character, so the rest would only inflate a huge payload to
+            // produce output the cap discards
             MontyObject::Bytes(b) => {
                 let repr = bytes_repr(&b[..b.len().min(self.limit)]);
                 s.serialize_str(&repr[2..repr.len() - 1])
@@ -168,8 +166,8 @@ impl Serialize for JsonEncoded<'_> {
     }
 }
 
-/// Encodes borrowed values as a JSON array, for a caller holding the items
-/// but no [`MontyObject`] container to point [`JsonEncoded`] at.
+/// [`JsonEncoded`] for borrowed items with no owning [`MontyObject`]
+/// container: a JSON array.
 struct JsonSeq<'a> {
     items: &'a [MontyObject],
     limit: usize,
@@ -269,8 +267,8 @@ fn datetime_isoformat(dt: &MontyDateTime) -> String {
     iso
 }
 
-// tests live here rather than in `tests/` because `serialize_capped` is
-// crate-private: telemetry encoding is not part of the pool's public API
+// tests live here because the encoders are crate-private: telemetry encoding
+// is not part of the pool's public API
 #[cfg(test)]
 mod tests {
     use monty_types::{DictPairs, ExcType, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta};

@@ -76,12 +76,11 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
-    /// Logfire write token. When set, the pool records every session it
-    /// serves to [Logfire](https://pydantic.dev/logfire) from the host
-    /// process — workers receive no token and run no exporter. Configured in
-    /// logfire's local mode, so the host application's own tracing/OTel
-    /// setup is untouched; [`Pool::close`] flushes the exporter (a pool
-    /// merely dropped may lose its last, not-yet-exported batch of spans).
+    /// Logfire write token. When set, the pool records every session it serves
+    /// to [Logfire](https://pydantic.dev/logfire) from the host process —
+    /// workers receive no token. Logfire is configured in local mode, so the
+    /// host's own tracing/OTel setup is untouched, and [`Pool::close`] flushes
+    /// the exporter (a pool merely dropped may lose its last batch of spans).
     pub logfire_token: Option<String>,
 }
 

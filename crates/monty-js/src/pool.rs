@@ -98,8 +98,8 @@ pub struct NativePoolOptions {
     pub duration_limit_grace_ms: Option<f64>,
     /// Recycle a worker after serving this many checkouts.
     pub max_checkouts_per_worker: Option<u32>,
-    /// Logfire write token; when set, the pool records every session it
-    /// serves from the host process. Absent: no telemetry and no exporter.
+    /// Logfire write token; when set, the pool records every session it serves
+    /// from the host process. The workers get no token and run no exporter.
     pub logfire_token: Option<String>,
 }
 
