@@ -1221,12 +1221,12 @@ async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
 /// in-sandbox `max_memory` limit, which leaves the worker alive (see
 /// `child_resource_limits_do_not_kill_the_worker`).
 #[cfg(target_os = "linux")]
-#[test]
-fn worker_hard_memory_breach_is_a_memory_error() {
+#[tokio::test]
+async fn worker_hard_memory_breach_is_a_memory_error() {
     let mut config = config();
     config.worker_hard_memory_limit = Some(1024 * 1024 * 1024); // 1 GiB
-    let pool = Pool::new(config).unwrap();
-    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    let pool = Pool::new(config).await.unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     let err = session
         .feed(
             "x = ' ' * (4 * 1024 * 1024 * 1024)",
@@ -1235,18 +1235,24 @@ fn worker_hard_memory_breach_is_a_memory_error() {
             false,
             &mut no_print,
         )
+        .await
         .unwrap_err();
     let PoolError::Runtime(exc) = err else {
         panic!("expected Runtime, got {err:?}");
     };
     assert_eq!(exc.exc_type().to_string(), "MemoryError");
 
-    let mut session = pool.checkout(&ReplConfig::default()).unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     assert_eq!(
-        expect_complete(session.feed("3 + 3", vec![], vec![], false, &mut no_print).unwrap()),
+        expect_complete(
+            session
+                .feed("3 + 3", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap()
+        ),
         MontyObject::Int(6)
     );
-    session.finish().unwrap();
+    session.finish().await.unwrap();
 }
 
 #[cfg(unix)]
