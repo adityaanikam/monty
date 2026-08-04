@@ -21,7 +21,7 @@ use crate::{
     heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     types::{
-        AttrCallResult, CmpOrder, LazyHeapSet, PyTrait, TimeDelta, Type,
+        AttrCallResult, LazyHeapSet, PyTrait, RichCmpOp, TimeDelta, Type,
         str::{allocate_string, allocate_string_no_interning},
         timedelta,
     },
@@ -206,8 +206,20 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Date> {
         Ok(Some(HashValue::new(hasher.finish())))
     }
 
-    fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
-        Ok(CmpOrder::from_total(self.get(vm.heap).partial_cmp(other.get(vm.heap))))
+    fn py_rich_compare_impl(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
+        }
+        let Some(HeapReadOutput::Date(other)) = other.read_heap(vm) else {
+            return Ok(Value::NotImplemented);
+        };
+        Ok(Value::Bool(op.holds(self.get(vm.heap).cmp(other.get(vm.heap)))))
     }
 
     fn py_bool(&self, _vm: &mut VM<'h>) -> RunResult<bool> {

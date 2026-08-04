@@ -20,7 +20,7 @@ use crate::{
     hash::HashValue,
     heap::{HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::StaticStrings,
-    types::{CmpOrder, LazyHeapSet, PyTrait, Type, date, datetime, str::allocate_string},
+    types::{LazyHeapSet, PyTrait, RichCmpOp, Type, date, datetime, str::allocate_string},
     value::{EitherStr, Value},
 };
 
@@ -320,10 +320,21 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, TimeDelta> {
         Ok(Some(HashValue::new(hasher.finish())))
     }
 
-    fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
-        Ok(CmpOrder::Ordered(
-            total_microseconds(self.get(vm.heap)).cmp(&total_microseconds(other.get(vm.heap))),
-        ))
+    fn py_rich_compare_impl(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
+        }
+        let Some(HeapReadOutput::TimeDelta(other)) = other.read_heap(vm) else {
+            return Ok(Value::NotImplemented);
+        };
+        let ordering = total_microseconds(self.get(vm.heap)).cmp(&total_microseconds(other.get(vm.heap)));
+        Ok(Value::Bool(op.holds(ordering)))
     }
 
     fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {

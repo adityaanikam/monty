@@ -13,7 +13,6 @@ use crate::{
     asyncio::{Awaiter, Coroutine, ExternalFuture, ExternalFutureState, GatherFuture, GatherState},
     bytecode::{CallResult, VM},
     exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
-    expressions::CmpOperator,
     hash::{HashValue, identity_hash},
     heap::{DropWithContext, HeapId, HeapItem, HeapReadOutput},
     intern::FunctionId,
@@ -25,9 +24,9 @@ use crate::{
         BoundMethod, Bytes, BytesIterator, Class, Dataclass, Deque, Dict, DictItemIterator, DictItemsView,
         DictKeyIterator, DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, Instance,
         ItertoolsIter, LazyHeapSet, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, PyTrait, Range,
-        RangeIterator, ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, Tuple, TupleIterator, Type,
-        callable_iterator::CallableIterator, date, datetime, deque::DequeIterator, list::ListIterator,
-        str::allocate_string, timedelta, timezone,
+        RangeIterator, ReMatch, RePattern, RichCmpOp, Set, SetIterator, Slice, Str, StringIterator, Tuple,
+        TupleIterator, Type, callable_iterator::CallableIterator, date, datetime, deque::DequeIterator,
+        list::ListIterator, str::allocate_string, timedelta, timezone,
     },
     value::{EitherStr, Value},
 };
@@ -793,6 +792,26 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
         )
     }
 
+    fn py_rich_compare_impl(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_rich_compare_impl(other, op, vm, self_id),
+            else {
+                if op.is_equality() {
+                    Ok(op.equality_result(self.py_eq_impl(other, vm)?))
+                } else {
+                    Ok(Value::NotImplemented)
+                }
+            }
+        )
+    }
+
     /// Dispatches hashing to per-type `PyTrait` implementations where possible.
     fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         heap_read_output_py_trait_forward!(
@@ -907,10 +926,6 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
 
     fn py_ior_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
         heap_read_output_py_trait_forward!(self, |value| value.py_ior_impl(other, vm), else Ok(false))
-    }
-
-    fn py_cmp_op(&self, other: &Value, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        heap_read_output_py_trait_forward!(self, |value| value.py_cmp_op(other, op, vm), else Ok(None))
     }
 
     fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {

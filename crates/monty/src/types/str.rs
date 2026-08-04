@@ -9,7 +9,7 @@ pub use monty_types::{StringRepr, string_repr_fmt};
 use ruff_python_stdlib::{identifiers::is_identifier, keyword::is_keyword};
 use smallvec::smallvec;
 
-use super::{Bytes, CmpOrder, PyTrait};
+use super::{Bytes, PyTrait, RichCmpOp};
 use crate::{
     args::{ArgValues, FromArgs, StrArg},
     bytecode::{CallResult, VM},
@@ -330,8 +330,22 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
         Ok(!self.get(vm.heap).0.is_empty())
     }
 
-    fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
-        Ok(CmpOrder::Ordered(self.get(vm.heap).0.cmp(&other.get(vm.heap).0)))
+    fn py_rich_compare_impl(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
+        }
+        let other = match other {
+            Value::InternString(id) => vm.interns.get_str(*id),
+            Value::Ref(id) if let HeapData::Str(other) = vm.heap.get(*id) => other.as_str(),
+            _ => return Ok(Value::NotImplemented),
+        };
+        Ok(Value::Bool(op.holds(self.get(vm.heap).as_str().cmp(other))))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {

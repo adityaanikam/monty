@@ -9,17 +9,13 @@ use hashbrown::HashTable;
 use serde::ser::SerializeStruct;
 use smallvec::{SmallVec, smallvec};
 
-use super::{DictItemsView, DictKeysView, DictValuesView, LazyHeapSet, PyTrait, allocate_tuple, list::repr_check_time};
+use super::{DictItemsView, DictKeysView, DictValuesView, LazyHeapSet, PyTrait, RichCmpOp, allocate_tuple};
 use crate::{
     args::{ArgValues, FromArgs, KwargsValues},
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunResult},
-    expressions::CmpOperator,
-    heap::{
-        ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead,
-        HeapReadOutput,
-    },
+    heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     modules::collections::{
         counter::{
@@ -1187,24 +1183,29 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Dict> {
         Ok(!self.get(vm.heap).is_empty())
     }
 
-    /// Two Counters compare as multisets; every other pairing defers to `py_cmp`,
-    /// which has no dict ordering and so raises `TypeError` — CPython's
-    /// `Counter.__lt__` likewise returns `NotImplemented` for a non-Counter,
-    /// which is why `Counter(a=1) < {'a': 2}` never becomes a dict comparison.
-    fn py_cmp_op(&self, other: &Value, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+    /// Two Counters compare as multisets; ordinary dicts decline ordering.
+    fn py_rich_compare_impl(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
+        }
         let cmp = match op {
-            CmpOperator::Lt => CounterCmp::Lt,
-            CmpOperator::LtE => CounterCmp::Le,
-            CmpOperator::Gt => CounterCmp::Gt,
-            CmpOperator::GtE => CounterCmp::Ge,
-            // Only the four ordering operators reach `py_cmp_op`.
-            _ => return Ok(None),
+            RichCmpOp::Lt => CounterCmp::Lt,
+            RichCmpOp::Le => CounterCmp::Le,
+            RichCmpOp::Gt => CounterCmp::Gt,
+            RichCmpOp::Ge => CounterCmp::Ge,
+            RichCmpOp::Eq | RichCmpOp::Ne => unreachable!("equality handled above"),
         };
-        match other.ref_id() {
-            Some(other_id) if self.both_counters(other_id, vm) => {
-                Ok(Some(counter_compare(self.id(), other_id, cmp, vm)?))
+        match (self_id, other.ref_id()) {
+            (Some(lhs), Some(rhs)) if self.both_counters(rhs, vm) => {
+                Ok(Value::Bool(counter_compare(lhs, rhs, cmp, vm)?))
             }
-            _ => Ok(None),
+            _ => Ok(Value::NotImplemented),
         }
     }
 

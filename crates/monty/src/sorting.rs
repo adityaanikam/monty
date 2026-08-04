@@ -8,14 +8,12 @@
 //! This module provides [`sort_indices`] for the comparison step and
 //! [`apply_permutation`] for the in-place rearrangement step.
 
-use std::cmp::Ordering;
-
 use crate::{
     args::{ArgValues, FromArgs, LaxBool},
     bytecode::VM,
     defer_drop, defer_drop_mut,
-    exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
-    types::{CmpOrder, PyTrait},
+    exception_private::{RunError, RunResult},
+    types::RichCmpOp,
     value::Value,
 };
 
@@ -77,33 +75,81 @@ pub fn sort_values(values: &mut [Value], key_fn: Option<&Value>, reverse: bool, 
 
         Ok(())
     } else {
-        // With no key function can sort directly on the original array
-        let mut sort_result: RunResult<()> = Ok(());
-        let mut n = 0usize;
-        values.sort_by(|a, b| {
-            n += 1;
-            compare_values(n, a, b, reverse, &mut sort_result, vm)
-        });
-        sort_result
+        let mut indices = (0..values.len()).collect::<Vec<_>>();
+        sort_indices(&mut indices, values, reverse, vm)?;
+        apply_permutation(values, &mut indices);
+        Ok(())
     }
 }
 
 /// Sorts a vector of indices by comparing items at those positions.
 ///
-/// Compares `values[a]` vs `values[b]` using `py_cmp`, optionally reversing
-/// the ordering. If any comparison fails (type error or runtime error), the
-/// sort finishes early and the error is returned.
+/// Compares `values[a] < values[b]`, swapping operands for reverse order.
+/// If any comparison fails, the sort finishes early and returns the error.
 ///
 /// The `values` slice is typically either the items themselves (no key function)
 /// or the pre-computed key values.
 pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> Result<(), RunError> {
-    let mut sort_result: RunResult<()> = Ok(());
-    let mut n = 0usize;
-    indices.sort_by(|&a, &b| {
-        n += 1;
-        compare_values(n, &values[a], &values[b], reverse, &mut sort_result, vm)
-    });
-    sort_result
+    let mut scratch = indices.to_vec();
+    let mut width = 1;
+    while width < indices.len() {
+        let stride = width.saturating_mul(2);
+        for start in (0..indices.len()).step_by(stride) {
+            let mid = start.saturating_add(width).min(indices.len());
+            let end = start.saturating_add(stride).min(indices.len());
+            merge_indices(indices, &mut scratch, values, start, mid, end, reverse, vm)?;
+        }
+        indices.copy_from_slice(&scratch);
+        width = stride;
+    }
+    Ok(())
+}
+
+/// Stably merges adjacent sorted index ranges using Python's `<` predicate.
+///
+/// The right item moves first only when it is strictly less than the left;
+/// equality and partial-order ties retain their original order.
+#[expect(clippy::too_many_arguments)]
+fn merge_indices(
+    indices: &[usize],
+    scratch: &mut [usize],
+    values: &[Value],
+    start: usize,
+    mid: usize,
+    end: usize,
+    reverse: bool,
+    vm: &mut VM<'_>,
+) -> RunResult<()> {
+    let (mut left, mut right) = (start, mid);
+    for destination in &mut scratch[start..end] {
+        let take_right = if left == mid {
+            true
+        } else if right == end {
+            false
+        } else {
+            comes_before(&values[indices[right]], &values[indices[left]], reverse, vm)?
+        };
+        *destination = if take_right {
+            let index = indices[right];
+            right += 1;
+            index
+        } else {
+            let index = indices[left];
+            left += 1;
+            index
+        };
+    }
+    Ok(())
+}
+
+/// Tests whether `lhs` precedes `rhs` in the requested sort direction.
+fn comes_before(lhs: &Value, rhs: &Value, reverse: bool, vm: &mut VM<'_>) -> RunResult<bool> {
+    vm.heap.check_time()?;
+    if reverse {
+        rhs.py_rich_compare_bool(lhs, RichCmpOp::Lt, vm)
+    } else {
+        lhs.py_rich_compare_bool(rhs, RichCmpOp::Lt, vm)
+    }
 }
 
 /// Rearranges `items` in-place according to a permutation of indices.
@@ -133,39 +179,4 @@ pub fn apply_permutation<T>(items: &mut [T], indices: &mut [usize]) {
             current = target;
         }
     }
-}
-
-/// Helper for the sort functions which compares two values, handling any exceptions and timeouts.
-/// `n` is the caller's running comparison count, keying the amortized time check.
-fn compare_values(
-    n: usize,
-    a: &Value,
-    b: &Value,
-    reverse: bool,
-    sort_result: &mut RunResult<()>,
-    vm: &mut VM<'_>,
-) -> Ordering {
-    if sort_result.is_err() {
-        // short-circuit if we've already encountered an error in a previous comparison
-        return Ordering::Equal;
-    }
-    if let Err(e) = vm.heap.tracker.check_time_every(n) {
-        *sort_result = Err(e.into());
-        return Ordering::Equal;
-    }
-    let err = match a.py_cmp(b, vm) {
-        Ok(CmpOrder::Ordered(ord)) => return if reverse { ord.reverse() } else { ord },
-        // A `NaN` (or `NaN`-carrying container) has no ordering but must not
-        // raise: CPython's `sorted`/`list.sort` leave such elements wherever the
-        // comparisons happen to place them. Treat it as "equal" — no swap.
-        Ok(CmpOrder::Unordered) => return Ordering::Equal,
-        Ok(CmpOrder::Incomparable) => ExcType::type_error(format!(
-            "'<' not supported between instances of '{}' and '{}'",
-            a.py_type_name(vm),
-            b.py_type_name(vm)
-        )),
-        Err(e) => e,
-    };
-    *sort_result = Err(err);
-    Ordering::Equal
 }
