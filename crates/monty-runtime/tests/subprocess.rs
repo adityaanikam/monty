@@ -145,6 +145,20 @@ impl ChildProc {
         }
     }
 
+    /// Writes a bare 200 MiB frame-length prefix — no body — and expects the
+    /// child to die buying the buffer: under the wire cap, over any ceiling a
+    /// test arms, and four bytes of writing, so the parent cannot block on a
+    /// pipe whose reader has already gone.
+    fn oversized_prefix_expecting_death(&mut self) {
+        self.writer
+            .write_all(&(200u32 * 1024 * 1024).to_le_bytes())
+            .expect("failed to write length prefix");
+        match self.reader.read::<pb::ChildEvent>() {
+            Ok(None) | Err(_) => {}
+            Ok(Some(event)) => panic!("expected the child to die, got {:?}", event.kind),
+        }
+    }
+
     /// Waits for the child and returns its status with everything it wrote to
     /// stderr. Only valid for a child spawned by [`Self::spawn_stderr_piped`].
     fn reap_with_stderr(&mut self) -> (ExitStatus, String) {
@@ -441,15 +455,36 @@ fn refused_allocation_exits_with_the_oom_code() {
 fn memory_ceiling_breach_exits_with_the_oom_code() {
     let mut child = ChildProc::spawn_stderr_piped();
     child.create_repl_with(configure_with_max_memory(1024));
-    child
-        .writer
-        .write_all(&(200u32 * 1024 * 1024).to_le_bytes())
-        .expect("failed to write length prefix");
-    match child.reader.read::<pb::ChildEvent>() {
-        Ok(None) | Err(_) => {}
-        Ok(Some(event)) => panic!("expected the child to die, got {:?}", event.kind),
-    }
+    child.oversized_prefix_expecting_death();
     let (status, stderr) = child.reap_with_stderr();
+    assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
+    assert!(
+        stderr.contains("allocation of 209715200 bytes exceeds the memory ceiling"),
+        "{stderr}"
+    );
+}
+
+/// A dump carries its own limits, so restoring one must re-derive the ceiling
+/// from them: this `Load` lands on a child that was never configured with a
+/// budget, and the restored session's `max_memory` is all there is to bound it.
+#[test]
+fn loading_a_dump_arms_the_ceiling_from_its_own_limits() {
+    let mut source = ChildProc::spawn();
+    source.create_repl_with(configure_with_max_memory(1024));
+    assert_eq!(source.feed_complete("x = 1"), MontyObject::None);
+    source.send(pb::parent_request::Kind::Dump(pb::Dump {}));
+    let pb::child_event::Kind::DumpResult(dump) = source.recv() else {
+        panic!("expected DumpResult");
+    };
+    source.shutdown();
+
+    let mut restored = ChildProc::spawn_stderr_piped();
+    restored.send(pb::parent_request::Kind::Load(pb::Load { state: dump.state }));
+    let pb::child_event::Kind::Ok(_) = restored.recv() else {
+        panic!("expected Ok for Load");
+    };
+    restored.oversized_prefix_expecting_death();
+    let (status, stderr) = restored.reap_with_stderr();
     assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
     assert!(
         stderr.contains("allocation of 209715200 bytes exceeds the memory ceiling"),

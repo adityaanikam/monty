@@ -148,6 +148,22 @@ def test_refused_allocation_raises_memory_error():
             assert session.feed_run('1 + 1') == snapshot(2)
 
 
+def test_derived_ceiling_breach_raises_memory_error():
+    # the fed snippet is untracked — the worker buys a frame buffer for it before
+    # the interpreter ever sees it — so a snippet far larger than the budget
+    # breaches the ceiling derived from `max_memory` rather than the tracker
+    with Monty() as pool:
+        with pool.checkout(limits={'max_memory': 1024}) as session:
+            with pytest.raises(MontyRuntimeError) as exc_info:
+                session.feed_run('# ' + 'a' * (16 * 1024 * 1024))
+            assert str(exc_info.value) == snapshot(
+                'MemoryError: the worker exceeded its memory ceiling and was terminated'
+            )
+        # the ceiling took the worker with it; the pool replaces it
+        with pool.checkout() as session:
+            assert session.feed_run('1 + 1') == snapshot(2)
+
+
 def test_concurrent_sessions_run_in_parallel(pool: Monty):
     results: list[object] = []
 

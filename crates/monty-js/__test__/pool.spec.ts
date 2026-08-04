@@ -87,6 +87,22 @@ test('a refused allocation raises MemoryError and the pool recovers', async (ctx
   await next.close()
 })
 
+test('a breach of the derived ceiling raises MemoryError and the pool recovers', async (ctx) => {
+  skipIfBrowser(ctx)
+  await using pool = await Monty.create()
+  const session = await pool.checkout({ limits: { maxMemory: 1024 } })
+  // the fed snippet is untracked — the worker buys a frame buffer for it before
+  // the interpreter ever sees it — so a snippet far larger than the budget
+  // breaches the ceiling derived from maxMemory rather than the tracker
+  const error = await t.throwsAsync(() => session.feedRun('# ' + 'a'.repeat(16 * 1024 * 1024)), {
+    instanceOf: MontyRuntimeError,
+  })
+  t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')
+  const next = await pool.checkout()
+  t.is(await next.feedRun('1 + 1'), 2)
+  await next.close()
+})
+
 test('concurrent sessions run in distinct workers', async (ctx) => {
   skipIfBrowser(ctx)
   await using pool = await Monty.create()

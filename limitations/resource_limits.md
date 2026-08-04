@@ -44,11 +44,11 @@ subprocess and WebAssembly runtimes do.
 allocations the interpreter remembers to account for. A worker subprocess
 therefore backstops it with a second ceiling below the interpreter, enforced in
 its own global allocator by counting live bytes. There is nothing to configure:
-setting `max_memory` on a session arms it, and the ceiling is
-`5 × max_memory`, plus what the worker had already allocated when the session
-was configured, plus fixed headroom (4 MiB, or 32 MiB when type checking) for
-machinery no `max_memory` covers. A session with no `max_memory` gets no
-ceiling. Divergences from every other limit documented here:
+setting `max_memory` on a session arms it, and the ceiling is `5 × max_memory`,
+plus the worker's own baseline footprint, plus fixed headroom (4 MiB, or 32 MiB
+when type checking) for machinery no `max_memory` covers. A session with no
+`max_memory` gets no ceiling. Divergences from every other limit documented
+here:
 
 - **It kills the worker, though it still reports `MemoryError`.** A breach fails
   an allocation the interpreter cannot handle, so the worker exits mid-turn. The
@@ -79,17 +79,19 @@ ceiling. Divergences from every other limit documented here:
   too tight a ceiling kills healthy workers, most often on the first
   type-checked feed (typeshed and salsa caches load then). Use `max_processes`
   and an OS-level limit to bound a host, not this.
-- **Per session, and it moves with the baseline.** A worker serves many
-  checkouts; each `Configure` re-derives the ceiling from that session's budget
-  and from the bytes then live, so a worker carrying residue from earlier
-  sessions gets a correspondingly higher ceiling rather than an unservable one.
-- **A restored dump can disagree with its ceiling.** `load_session` /
-  `load_snapshot` restore the dump's own limits and ignore the `checkout()`
-  ones (see `limitations/pool-architecture.md`), but the ceiling is derived from
-  the checkout's. Restoring a dump whose `max_memory` is larger than the
-  checkout's therefore reinstates the ordering above the wrong way round: the
-  session can breach the ceiling before its tracker fires. Pass the dump's
-  budget to `checkout()` as well when restoring.
+- **Per session, but against a fixed baseline.** A worker serves many checkouts
+  and re-derives the ceiling for each session's budget, always from the leanest
+  the process has been. Memory retained between sessions — the type checker
+  keeps a small pool of salsa databases alive process-wide — therefore consumes
+  the headroom instead of raising the ceiling, and a worker whose residue
+  outgrows it is killed and replaced rather than allowed to grow indefinitely.
+- **Restoring a dump is bounded by the checkout it lands in.** `load_session` /
+  `load_snapshot` restore the dump's own limits (see
+  `limitations/pool-architecture.md`), and the ceiling is re-derived from them
+  once the session exists — but the load *itself* runs under the ceiling the
+  `checkout()` config armed. Restoring a large dump into a checkout with a much
+  smaller `max_memory` can therefore breach the ceiling while loading; pass a
+  comparable budget to `checkout()`.
 - Only worker subprocesses apply it: WebSocket workers are remote processes this
   pool does not spawn, and the wasm worker (a module, not a binary) declares no
   allocator of its own.

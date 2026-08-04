@@ -20,6 +20,12 @@ use monty_proto::OOM_EXIT_CODE;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// The leanest the process has ever been at an arming point, which is the
+/// worker's own footprint. Deriving each ceiling from the *current* live total
+/// instead would let memory retained between sessions (the type checker's memo
+/// graphs) ratchet the ceiling up checkout after checkout.
+static BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 /// How far above `max_memory` the ceiling sits, covering what the interpreter's
 /// tracker undercounts (arena slots, capacity slack, allocator rounding) —
 /// measured at worst ~3.8× for the smallest objects, so this is a backstop.
@@ -31,14 +37,19 @@ const CEILING_MULTIPLE: usize = 5;
 const BASE_HEADROOM: usize = 4 * 1024 * 1024;
 const TYPE_CHECK_HEADROOM: usize = 32 * 1024 * 1024;
 
-/// Derives the ceiling from a session's sandbox budget, or lifts it for a
-/// session with no `max_memory`. The bytes already live are part of it (the
-/// budget bounds what *this* session adds), so arming cannot kill the worker.
+/// Derives the ceiling from the current session's sandbox budget, or lifts it
+/// while no session has one. Called after every request, since a session can
+/// also arrive (or end) through `Load` and `Reset`; the result depends only on
+/// the budget and the baseline, so re-deriving mid-session is a no-op.
 pub(crate) fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
+    let live = LIVE.load(Ordering::Relaxed);
+    // `fetch_min` both reads and lowers the baseline: the first arming, on a
+    // pristine worker, sets it, and a later leaner moment can only improve it.
+    let baseline = BASELINE.fetch_min(live, Ordering::Relaxed).min(live);
     let limit = match max_memory {
         Some(bytes) => {
             let headroom = if type_check { TYPE_CHECK_HEADROOM } else { BASE_HEADROOM };
-            LIVE.load(Ordering::Relaxed)
+            baseline
                 .saturating_add(
                     usize::try_from(bytes)
                         .unwrap_or(usize::MAX)

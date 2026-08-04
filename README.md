@@ -244,9 +244,9 @@ tracker never sees. A breach kills the worker with a `MemoryError` — losing th
 session, though the pool replaces the worker — rather than letting it grow until
 the OS OOM killer picks a victim.
 
-There is nothing to configure. The ceiling sits at `5 × max_memory` above what
-the worker had already allocated, plus a few MiB of headroom (more when type
-checking) for the worker's own machinery. Nothing the interpreter allocates can
+There is nothing to configure. The ceiling sits at `5 × max_memory` above the
+worker's own baseline footprint, plus a few MiB of headroom (more when type
+checking) for machinery the budget does not cover. Nothing the interpreter allocates can
 reach it: the multiple covers what the tracker undercounts, so a tracked
 allocation raises `MemoryError` at `max_memory` first, leaving the worker alive.
 See [`limitations/resource_limits.md`](limitations/resource_limits.md).
