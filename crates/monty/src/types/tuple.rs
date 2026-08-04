@@ -24,7 +24,7 @@ use std::{
 /// All tuple methods from Python's builtins are implemented.
 use smallvec::SmallVec;
 
-use super::{PyTrait, RichCmpOp, iter::collect_owned_iterable};
+use super::{PyTrait, RichCmpOp, RichCmpVtable, iter::collect_owned_iterable};
 use crate::{
     args::ArgValues,
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
@@ -279,7 +279,73 @@ impl<'h, C: ContainsVM<'h>> DropWithContext<C> for TupleIter<'_, 'h> {
     }
 }
 
+impl<'h> HeapObjectRead<'h, Tuple> {
+    /// Compares tuple elements for the equality slots.
+    fn eq_bool(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let Some(HeapReadOutput::Tuple(other)) = other.read_heap(vm) else {
+            return Ok(None);
+        };
+        if self.get(vm.heap).items.len() != other.get(vm.heap).items.len() {
+            return Ok(Some(false));
+        }
+        let iter = self.iter(vm)?;
+        defer_drop_mut!(iter, vm);
+        while let Some((i, a)) = iter.next_with_index(vm)? {
+            let b = other.clone_item(i, vm);
+            defer_drop!(b, vm);
+            if !a.py_eq(b, vm)? {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    /// Compares tuples lexicographically, including against named tuples.
+    ///
+    /// Equality identifies the shared prefix; the first unequal pair receives
+    /// the original operator and may return any Python value. Lengths decide
+    /// only when every shared element compares equal.
+    fn rich_compare(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.eq_bool(other, vm)?));
+        }
+        let other = match other.read_heap(vm) {
+            Some(HeapReadOutput::Tuple(other)) => other,
+            Some(HeapReadOutput::NamedTuple(other)) => {
+                let (a, b) = (self.cloned_items(vm), other.cloned_items(vm));
+                return rich_compare_item_seqs(a, b, op, vm);
+            }
+            _ => return Ok(Value::NotImplemented),
+        };
+
+        let a_len = self.get(vm.heap).items.len();
+        let b_len = other.get(vm.heap).items.len();
+        let min_len = a_len.min(b_len);
+        let iter = self.iter(vm)?;
+        defer_drop_mut!(iter, vm);
+        while let Some((i, av)) = iter.next_with_index(vm)? {
+            if i >= min_len {
+                break;
+            }
+            let bv = other.clone_item(i, vm);
+            defer_drop!(bv, vm);
+            if !av.py_lex_eq(bv, vm)? {
+                return av.py_rich_compare(bv, op, vm);
+            }
+        }
+        Ok(Value::Bool(op.holds(a_len.cmp(&b_len))))
+    }
+}
+
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, Tuple> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
     fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
         true
     }
@@ -334,27 +400,6 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Tuple> {
         Ok(self.clone_item(idx, vm))
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        // A tuple equals another tuple; `tuple == namedtuple` is handled by the
-        // reflected pass via `NamedTuple::py_eq_impl`.
-        let Some(HeapReadOutput::Tuple(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        if self.get(vm.heap).items.len() != other.get(vm.heap).items.len() {
-            return Ok(Some(false));
-        }
-        let iter = self.iter(vm)?;
-        defer_drop_mut!(iter, vm);
-        while let Some((i, a)) = iter.next_with_index(vm)? {
-            let b = other.clone_item(i, vm);
-            defer_drop!(b, vm);
-            if !a.py_eq(b, vm)? {
-                return Ok(Some(false));
-            }
-        }
-        Ok(Some(true))
-    }
-
     /// Hashes the tuple as the combined hash of its elements.
     ///
     /// Identical to `NamedTuple::py_hash`, so a `Tuple` and a `NamedTuple` with
@@ -382,49 +427,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Tuple> {
         Ok(Some(hash))
     }
 
-    /// Compares tuples lexicographically, including against named tuples.
-    ///
-    /// Equality identifies the shared prefix; the first unequal pair receives
-    /// the original operator and may return any Python value. Lengths decide
-    /// only when every shared element compares equal.
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        if op.is_equality() {
-            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
-        }
-        let other = match other.read_heap(vm) {
-            Some(HeapReadOutput::Tuple(other)) => other,
-            Some(HeapReadOutput::NamedTuple(other)) => {
-                let (a, b) = (self.cloned_items(vm), other.cloned_items(vm));
-                return rich_compare_item_seqs(a, b, op, vm);
-            }
-            _ => return Ok(Value::NotImplemented),
-        };
-
-        let a_len = self.get(vm.heap).items.len();
-        let b_len = other.get(vm.heap).items.len();
-        let min_len = a_len.min(b_len);
-        let iter = self.iter(vm)?;
-        defer_drop_mut!(iter, vm);
-        while let Some((i, av)) = iter.next_with_index(vm)? {
-            if i >= min_len {
-                break;
-            }
-            let bv = other.clone_item(i, vm);
-            defer_drop!(bv, vm);
-            if !av.py_lex_eq(bv, vm)? {
-                return av.py_rich_compare(bv, op, vm);
-            }
-        }
-        Ok(Value::Bool(op.holds(a_len.cmp(&b_len))))
-    }
-
-    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
         let Some(HeapReadOutput::Tuple(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
@@ -654,12 +657,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, TupleIterator> {
         None
     }
 
-    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
-    }
-
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        let self_id = self_id.expect("heap values have an id");
+        vm.heap.inc_ref(self_id);
+        Ok(Value::Ref(self_id))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

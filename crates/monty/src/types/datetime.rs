@@ -23,7 +23,7 @@ use crate::{
     heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     types::{
-        AttrCallResult, LazyHeapSet, PyTrait, RichCmpOp, TimeDelta, TimeZone, Type,
+        AttrCallResult, LazyHeapSet, PyTrait, RichCmpOp, RichCmpVtable, TimeDelta, TimeZone, Type,
         date::{self, StrftimeArgs},
         str::{StringRepr, allocate_string, allocate_string_no_interning},
         timedelta, timezone,
@@ -750,9 +750,42 @@ impl HeapItem for DateTime {
     }
 }
 
+impl<'h> HeapObjectRead<'h, DateTime> {
+    /// Compares datetimes while preserving aware/naive equality semantics.
+    #[expect(clippy::unnecessary_wraps)]
+    fn rich_compare(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        let Some(HeapReadOutput::DateTime(other)) = other.read_heap(vm) else {
+            return Ok(Value::NotImplemented);
+        };
+        let a = self.get(vm.heap);
+        let b = other.get(vm.heap);
+        if is_aware(a) != is_aware(b) {
+            return Ok(if op.is_equality() {
+                Value::Bool(op == RichCmpOp::Ne)
+            } else {
+                Value::NotImplemented
+            });
+        }
+        let ordering = if is_aware(a) {
+            utc_micros(a).cmp(&utc_micros(b))
+        } else {
+            local_micros(a).cmp(&local_micros(b))
+        };
+        Ok(Value::Bool(op.holds(ordering)))
+    }
+}
+
 /// `HeapRead`-based dispatch for `DateTime`, enabling the `HeapReadOutput` enum to
 /// delegate `PyTrait` calls to heap-resident datetimes.
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, DateTime> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::DateTime
     }
@@ -761,51 +794,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DateTime> {
         None
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::DateTime(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        let a = self.get(vm.heap);
-        let b = other.get(vm.heap);
-        Ok(Some(if is_aware(a) != is_aware(b) {
-            false
-        } else if is_aware(a) {
-            utc_micros(a) == utc_micros(b)
-        } else {
-            local_micros(a) == local_micros(b)
-        }))
-    }
-
-    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
         self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))
-    }
-
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        if op.is_equality() {
-            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
-        }
-        let Some(HeapReadOutput::DateTime(other)) = other.read_heap(vm) else {
-            return Ok(Value::NotImplemented);
-        };
-        let a = self.get(vm.heap);
-        let b = other.get(vm.heap);
-        if is_aware(a) != is_aware(b) {
-            return Ok(Value::NotImplemented);
-        }
-        let ordering = if is_aware(a) {
-            utc_micros(a).cmp(&utc_micros(b))
-        } else {
-            local_micros(a).cmp(&local_micros(b))
-        };
-        Ok(Value::Bool(op.holds(ordering)))
     }
 
     fn py_bool(&self, _vm: &mut VM<'h>) -> RunResult<bool> {

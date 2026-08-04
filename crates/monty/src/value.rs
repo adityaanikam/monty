@@ -23,9 +23,10 @@ use crate::{
     modules::ModuleFunctions,
     resource_checks::check_pow_size,
     types::{
-        Bytes, BytesIterator, LazyHeapSet, LongInt, Property, PyTrait, RichCmpOp, StringIterator, Type,
+        Bytes, BytesIterator, LazyHeapSet, LongInt, Property, PyTrait, RichCmpOp, RichCmpVtable, StringIterator, Type,
         bytes::{bytes_contains, bytes_repr_fmt, concat_bytes, get_byte_at_index, repeat_bytes},
-        instance::{instance_dataclass_eq, instance_getattr, instance_repr_fmt, instance_str, instance_user_eq},
+        instance::{instance_getattr, instance_repr_fmt, instance_str},
+        invoke_rich_cmp_slot,
         long_int::{
             bigint_cmp_f64, bigint_cmp_i64, bigint_eq_f64, bigint_eq_i64, check_bits_str_digits_limit, i64_cmp_f64,
             repeat_count, wide_i128_into_value,
@@ -232,110 +233,17 @@ impl From<bool> for Value {
     }
 }
 
-impl<'h> PyTrait<'h> for Value {
-    fn py_type(&self, vm: &VM<'_>) -> Type {
-        match self {
-            Self::Undefined => panic!("Cannot get type of undefined value"),
-            Self::Ellipsis => Type::Ellipsis,
-            Self::NotImplemented => Type::NotImplementedType,
-            Self::None => Type::NoneType,
-            Self::Bool(_) => Type::Bool,
-            Self::Int(_) | Self::InternLongInt(_) => Type::Int,
-            Self::Float(_) => Type::Float,
-            Self::InternString(_) => Type::Str,
-            Self::InternBytes(_) => Type::Bytes,
-            Self::Builtin(c) => c.py_type(),
-            Self::ModuleFunction(_) => Type::BuiltinFunction,
-            Self::DefFunction(_) => Type::Function,
-            Self::Marker(m) => m.py_type(),
-            Self::Property(_) => Type::Property,
-            Self::Ref(id) => vm.heap.read(*id).py_type(vm),
-            #[cfg(feature = "memory-model-checks")]
-            Self::Dereferenced => panic!("Cannot access Dereferenced object"),
+impl Value {
+    /// Compares immediate values and delegates heap values through their slot tables.
+    fn rich_compare(&self, other: &Self, op: RichCmpOp, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Self> {
+        if let Self::Ref(id) = self {
+            return invoke_rich_cmp_slot(&vm.heap.read(*id), other, op, vm, Some(*id));
         }
-    }
-
-    fn py_len(&self, vm: &VM<'_>) -> Option<usize> {
-        match self {
-            // Count Unicode characters, not bytes, to match Python semantics
-            Self::InternString(string_id) => Some(vm.interns.get_str(*string_id).chars().count()),
-            Self::InternBytes(bytes_id) => Some(vm.interns.get_bytes(*bytes_id).len()),
-            Self::Ref(id) => vm.heap.read(*id).py_len(vm),
-            _ => None,
-        }
-    }
-
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<bool>> {
-        match self {
-            // `Undefined` is a sentinel and is never equal to anything.
-            Self::Undefined => Ok(Some(false)),
-
-            Self::None => Ok(matches!(other, Self::None).then_some(true)),
-            Self::Ellipsis => Ok(matches!(other, Self::Ellipsis).then_some(true)),
-            Self::NotImplemented => Ok(matches!(other, Self::NotImplemented).then_some(true)),
-            Self::Bool(b) => Ok(eq_i64(i64::from(*b), other, vm)),
-            Self::Int(a) => Ok(eq_i64(*a, other, vm)),
-            Self::Float(f) => Ok(eq_f64(*f, other, vm)),
-            // `InternLongInt` is normally materialised to a heap `LongInt` before
-            // it can be compared, but handle it directly so equality never
-            // silently diverges if one reaches here.
-            Self::InternLongInt(id) => Ok(eq_bigint(vm.interns.get_long_int(*id), other, vm)),
-            Self::InternString(id) => Ok(match other {
-                // Interned strings are deduplicated, so equal ids ⇔ equal content.
-                Self::InternString(o) => Some(id == o),
-                _ => eq_str(vm.interns.get_str(*id), other, vm),
-            }),
-            Self::InternBytes(id) => Ok(match other {
-                // Fast path for the same interned bytes; otherwise compare content
-                // (interned bytes are not deduplicated, unlike strings).
-                Self::InternBytes(o) if id == o => Some(true),
-                _ => eq_bytes(vm.interns.get_bytes(*id), other, vm),
-            }),
-            Self::Builtin(b) => Ok(match other {
-                Self::Builtin(o) => Some(b == o),
-                _ => None,
-            }),
-            Self::ModuleFunction(mf) => Ok(match other {
-                Self::ModuleFunction(o) => Some(mf == o),
-                _ => None,
-            }),
-            Self::DefFunction(f) => Ok(match other {
-                Self::DefFunction(o) => Some(f == o),
-                _ => None,
-            }),
-            Self::Marker(m) => Ok(match other {
-                Self::Marker(o) => Some(m == o),
-                _ => None,
-            }),
-            Self::Property(p) => Ok(match other {
-                Self::Property(o) => Some(p == o),
-                _ => None,
-            }),
-            Self::Ref(id) => vm.heap.read(*id).py_eq_impl(other, vm),
-            #[cfg(feature = "memory-model-checks")]
-            Self::Dereferenced => panic!("Cannot access Dereferenced object"),
-        }
-    }
-
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'_>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
         if op.is_equality() {
-            let result = self.py_rich_eq_one_side(other, vm)?;
-            if op == RichCmpOp::Eq || result.is_not_implemented() {
-                return Ok(result);
-            }
-            defer_drop!(result, vm);
-            return Ok(Self::Bool(!result.py_bool(vm)?));
+            return Ok(op.equality_result(self.eq_bool(other, vm)));
         }
 
         let interns = vm.interns;
-        // Immediate representations compare here; heap-backed left operands
-        // delegate to their concrete `PyTrait` implementation below.
         let ordering = match (self, other) {
             (Self::Int(lhs), Self::Int(rhs)) => Some(lhs.cmp(rhs)),
             (Self::Float(lhs), Self::Float(rhs)) => {
@@ -343,7 +251,6 @@ impl<'h> PyTrait<'h> for Value {
                     lhs.partial_cmp(rhs).is_some_and(|ordering| op.holds(ordering)),
                 ));
             }
-            // Int/float ordering is exact (no rounding of either operand).
             (Self::Int(lhs), Self::Float(rhs)) => {
                 return Ok(Self::Bool(
                     i64_cmp_f64(*lhs, *rhs).is_some_and(|ordering| op.holds(ordering)),
@@ -375,13 +282,11 @@ impl<'h> PyTrait<'h> for Value {
             (Self::InternLongInt(lhs), Self::InternLongInt(rhs)) => {
                 Some(interns.get_long_int(*lhs).cmp(interns.get_long_int(*rhs)))
             }
-            // Bool promotion is bounded to two calls: Bool becomes Int, which
-            // either matches an immediate arm or delegates to a heap type.
             (Self::Bool(lhs), _) => {
-                return Self::Int(i64::from(*lhs)).py_rich_compare_impl(other, op, vm, None);
+                return Self::Int(i64::from(*lhs)).rich_compare(other, op, vm, None);
             }
             (_, Self::Bool(rhs)) => {
-                return self.py_rich_compare_impl(&Self::Int(i64::from(*rhs)), op, vm, None);
+                return self.rich_compare(&Self::Int(i64::from(*rhs)), op, vm, None);
             }
             (Self::Int(lhs), Self::Ref(id)) if let HeapData::LongInt(rhs) = vm.heap.get(*id) => {
                 Some(bigint_cmp_i64(rhs.inner(), *lhs).reverse())
@@ -408,13 +313,93 @@ impl<'h> PyTrait<'h> for Value {
             (Self::InternBytes(lhs), Self::Ref(id)) if let HeapData::Bytes(rhs) = vm.heap.get(*id) => {
                 Some(interns.get_bytes(*lhs).cmp(rhs.as_slice()))
             }
-            (Self::Ref(id), _) => return vm.heap.read(*id).py_rich_compare_impl(other, op, vm, Some(*id)),
             _ => None,
         };
         Ok(match ordering {
             Some(ordering) => Self::Bool(op.holds(ordering)),
             None => Self::NotImplemented,
         })
+    }
+
+    /// Implements equality for immediate representations without protocol dispatch.
+    fn eq_bool(&self, other: &Self, vm: &VM<'_>) -> Option<bool> {
+        match self {
+            Self::Undefined => Some(false),
+            Self::None => matches!(other, Self::None).then_some(true),
+            Self::Ellipsis => matches!(other, Self::Ellipsis).then_some(true),
+            Self::NotImplemented => matches!(other, Self::NotImplemented).then_some(true),
+            Self::Bool(value) => eq_i64(i64::from(*value), other, vm),
+            Self::Int(value) => eq_i64(*value, other, vm),
+            Self::Float(value) => eq_f64(*value, other, vm),
+            Self::InternLongInt(id) => eq_bigint(vm.interns.get_long_int(*id), other, vm),
+            Self::InternString(id) => match other {
+                Self::InternString(other_id) => Some(id == other_id),
+                _ => eq_str(vm.interns.get_str(*id), other, vm),
+            },
+            Self::InternBytes(id) => match other {
+                Self::InternBytes(other_id) if id == other_id => Some(true),
+                _ => eq_bytes(vm.interns.get_bytes(*id), other, vm),
+            },
+            Self::Builtin(value) => match other {
+                Self::Builtin(other_value) => Some(value == other_value),
+                _ => None,
+            },
+            Self::ModuleFunction(value) => match other {
+                Self::ModuleFunction(other_value) => Some(value == other_value),
+                _ => None,
+            },
+            Self::DefFunction(value) => match other {
+                Self::DefFunction(other_value) => Some(value == other_value),
+                _ => None,
+            },
+            Self::Marker(value) => match other {
+                Self::Marker(other_value) => Some(value == other_value),
+                _ => None,
+            },
+            Self::Property(value) => match other {
+                Self::Property(other_value) => Some(value == other_value),
+                _ => None,
+            },
+            Self::Ref(_) => unreachable!("heap values delegate before immediate equality"),
+            #[cfg(feature = "memory-model-checks")]
+            Self::Dereferenced => panic!("Cannot access Dereferenced object"),
+        }
+    }
+}
+
+impl<'h> PyTrait<'h> for Value {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
+    fn py_type(&self, vm: &VM<'_>) -> Type {
+        match self {
+            Self::Undefined => panic!("Cannot get type of undefined value"),
+            Self::Ellipsis => Type::Ellipsis,
+            Self::NotImplemented => Type::NotImplementedType,
+            Self::None => Type::NoneType,
+            Self::Bool(_) => Type::Bool,
+            Self::Int(_) | Self::InternLongInt(_) => Type::Int,
+            Self::Float(_) => Type::Float,
+            Self::InternString(_) => Type::Str,
+            Self::InternBytes(_) => Type::Bytes,
+            Self::Builtin(c) => c.py_type(),
+            Self::ModuleFunction(_) => Type::BuiltinFunction,
+            Self::DefFunction(_) => Type::Function,
+            Self::Marker(m) => m.py_type(),
+            Self::Property(_) => Type::Property,
+            Self::Ref(id) => vm.heap.read(*id).py_type(vm),
+            #[cfg(feature = "memory-model-checks")]
+            Self::Dereferenced => panic!("Cannot access Dereferenced object"),
+        }
+    }
+
+    fn py_len(&self, vm: &VM<'_>) -> Option<usize> {
+        match self {
+            // Count Unicode characters, not bytes, to match Python semantics
+            Self::InternString(string_id) => Some(vm.interns.get_str(*string_id).chars().count()),
+            Self::InternBytes(bytes_id) => Some(vm.interns.get_bytes(*bytes_id).len()),
+            Self::Ref(id) => vm.heap.read(*id).py_len(vm),
+            _ => None,
+        }
     }
 
     fn py_bool(&self, vm: &mut VM<'_>) -> RunResult<bool> {
@@ -1519,12 +1504,12 @@ impl Value {
     /// The left operand is tried first, followed by the reflected operation on
     /// the right. Equality falls back to identity; unsupported ordering raises.
     pub(crate) fn py_rich_compare(&self, other: &Self, op: RichCmpOp, vm: &mut VM<'_>) -> RunResult<Self> {
-        let lhs_result = self.py_rich_compare_impl(other, op, vm, self.ref_id())?;
+        let lhs_result = invoke_rich_cmp_slot(self, other, op, vm, self.ref_id())?;
         if !lhs_result.is_not_implemented() {
             return Ok(lhs_result);
         }
 
-        let rhs_result = other.py_rich_compare_impl(self, op.reflected(), vm, other.ref_id())?;
+        let rhs_result = invoke_rich_cmp_slot(other, self, op.reflected(), vm, other.ref_id())?;
         if !rhs_result.is_not_implemented() {
             return Ok(rhs_result);
         }
@@ -1545,27 +1530,6 @@ impl Value {
         let result = self.py_rich_compare(other, op, vm)?;
         defer_drop!(result, vm);
         result.py_bool(vm)
-    }
-
-    /// Runs one side of rich equality, preserving arbitrary user results.
-    fn py_rich_eq_one_side(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Self> {
-        if let Self::Ref(id) = self
-            && matches!(vm.heap.get(*id), HeapData::Instance(_))
-        {
-            if let Some(result) = instance_user_eq(*id, other, vm)? {
-                Ok(result)
-            } else if self.is(other) {
-                Ok(Self::Bool(true))
-            } else if let Some(result) = instance_dataclass_eq(*id, other, vm)? {
-                Ok(Self::Bool(result))
-            } else {
-                Ok(Self::NotImplemented)
-            }
-        } else if let Some(result) = self.py_eq_impl(other, vm)? {
-            Ok(Self::Bool(result))
-        } else {
-            Ok(Self::NotImplemented)
-        }
     }
 
     /// Returns an iterator for this value using its type-specific protocol when available.
@@ -1602,7 +1566,7 @@ impl Value {
     /// Reads the heap entry this value references, or `None` if it is not a
     /// heap reference.
     ///
-    /// Used by per-type [`PyTrait::py_eq_impl`] impls to resolve the other operand
+    /// Used by per-type rich-comparison callbacks to resolve the other operand
     /// to a heap object of their own type, returning `NotImplemented` otherwise.
     pub(crate) fn read_heap<'a>(&self, vm: &VM<'a>) -> Option<HeapReadOutput<'a>> {
         match self {
@@ -2198,8 +2162,8 @@ impl Value {
 // or a heap object) against an arbitrary `other: &Value`, resolving `other`'s
 // representation as needed. They return `None` (NotImplemented) when `other`
 // is not a compatible Python type, so the reflected comparison can run. These
-// are shared by `Value::py_eq_impl` (inline operands) and
-// `HeapReadOutput::py_eq_impl` (heap operands) so the interned-vs-heap and
+// are shared by immediate and heap rich-comparison callbacks so the
+// interned-vs-heap and
 // numeric-tower logic lives once.
 // ---------------------------------------------------------------------------
 

@@ -9,7 +9,7 @@ pub use monty_types::{StringRepr, string_repr_fmt};
 use ruff_python_stdlib::{identifiers::is_identifier, keyword::is_keyword};
 use smallvec::smallvec;
 
-use super::{Bytes, PyTrait, RichCmpOp};
+use super::{Bytes, PyTrait, RichCmpOp, RichCmpVtable};
 use crate::{
     args::{ArgValues, FromArgs, StrArg},
     bytecode::{CallResult, VM},
@@ -263,7 +263,31 @@ impl ops::Deref for Str {
     }
 }
 
+impl<'h> HeapObjectRead<'h, Str> {
+    /// Compares string content across interned and heap representations.
+    #[expect(clippy::unnecessary_wraps)]
+    fn rich_compare(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(eq_str(self.get(vm.heap).as_str(), other, vm)));
+        }
+        let other = match other {
+            Value::InternString(id) => vm.interns.get_str(*id),
+            Value::Ref(id) if let HeapData::Str(other) = vm.heap.get(*id) => other.as_str(),
+            _ => return Ok(Value::NotImplemented),
+        };
+        Ok(Value::Bool(op.holds(self.get(vm.heap).as_str().cmp(other))))
+    }
+}
+
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
     fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
         true
     }
@@ -308,12 +332,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
         Ok(allocate_char(c, vm.heap))
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        // A heap string equals an interned or heap string with the same content.
-        Ok(eq_str(self.get(vm.heap).as_str(), other, vm))
-    }
-
-    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let s = self.get(vm.heap);
         if let Some(cached) = s.1.get() {
             return Ok(Some(cached));
@@ -328,24 +347,6 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
 
     fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
         Ok(!self.get(vm.heap).0.is_empty())
-    }
-
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        if op.is_equality() {
-            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
-        }
-        let other = match other {
-            Value::InternString(id) => vm.interns.get_str(*id),
-            Value::Ref(id) if let HeapData::Str(other) = vm.heap.get(*id) => other.as_str(),
-            _ => return Ok(Value::NotImplemented),
-        };
-        Ok(Value::Bool(op.holds(self.get(vm.heap).as_str().cmp(other))))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
@@ -2129,12 +2130,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, StringIterator> {
         None
     }
 
-    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
-    }
-
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        let self_id = self_id.expect("heap values have an id");
+        vm.heap.inc_ref(self_id);
+        Ok(Value::Ref(self_id))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

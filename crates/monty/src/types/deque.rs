@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, fmt::Write, mem};
 
-use super::{PyTrait, RichCmpOp, iter::collect_owned_iterable};
+use super::{PyTrait, RichCmpOp, RichCmpVtable, iter::collect_owned_iterable};
 use crate::{
     args::{ArgValues, FromArgs},
     bytecode::{CallResult, VM},
@@ -330,7 +330,66 @@ fn evict_back_if_full(deque: &mut Deque) -> Option<Value> {
     }
 }
 
+impl<'h> HeapObjectRead<'h, Deque> {
+    /// Compares only deque items; `maxlen` is not part of equality.
+    ///
+    /// A recursion guard bounds comparisons between distinct cyclic deques.
+    fn eq_bool(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let Some(HeapReadOutput::Deque(other)) = other.read_heap(vm) else {
+            return Ok(None);
+        };
+        let len = self.get(vm.heap).len();
+        if len != other.get(vm.heap).len() {
+            return Ok(Some(false));
+        }
+        let mut guard = vm.recursion_guard()?;
+        let vm = &mut *guard;
+        for i in 0..len {
+            let a = self.get(vm.heap).items[i].clone_with_heap(vm.heap);
+            defer_drop!(a, vm);
+            let b = other.get(vm.heap).items[i].clone_with_heap(vm.heap);
+            defer_drop!(b, vm);
+            if !a.py_eq(b, vm)? {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    /// Lexicographically compares two deques while bounding recursive contents.
+    fn rich_compare(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.eq_bool(other, vm)?));
+        }
+        let Some(HeapReadOutput::Deque(other)) = other.read_heap(vm) else {
+            return Ok(Value::NotImplemented);
+        };
+        let self_len = self.get(vm.heap).len();
+        let other_len = other.get(vm.heap).len();
+        let mut guard = vm.recursion_guard()?;
+        let vm = &mut *guard;
+        for i in 0..self_len.min(other_len) {
+            let a = self.get(vm.heap).items[i].clone_with_heap(vm.heap);
+            defer_drop!(a, vm);
+            let b = other.get(vm.heap).items[i].clone_with_heap(vm.heap);
+            defer_drop!(b, vm);
+            if !a.py_lex_eq(b, vm)? {
+                return a.py_rich_compare(b, op, vm);
+            }
+        }
+        Ok(Value::Bool(op.holds(self_len.cmp(&other_len))))
+    }
+}
+
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
     fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
         true
     }
@@ -400,63 +459,6 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
         // The guard drops whatever `value` holds after the swap — i.e. the old item.
         mem::swap(&mut self.get_mut(vm.heap).items[idx], value);
         Ok(())
-    }
-
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        // A deque only ever equals another deque — unlike NamedTuple/tuple, there
-        // is no cross-type equality with list. `maxlen` is not part of equality.
-        let Some(HeapReadOutput::Deque(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        let len = self.get(vm.heap).len();
-        if len != other.get(vm.heap).len() {
-            return Ok(Some(false));
-        }
-        // Charge a recursion level: two distinct cyclic deques (`a.append(a);
-        // b.append(b); a == b`) re-enter here per level and would otherwise
-        // overflow the host stack. A deque walks by index, so it charges directly.
-        let mut guard = vm.recursion_guard()?;
-        let vm = &mut *guard;
-        for i in 0..len {
-            let a = self.get(vm.heap).items[i].clone_with_heap(vm.heap);
-            defer_drop!(a, vm);
-            let b = other.get(vm.heap).items[i].clone_with_heap(vm.heap);
-            defer_drop!(b, vm);
-            if !a.py_eq(b, vm)? {
-                return Ok(Some(false));
-            }
-        }
-        Ok(Some(true))
-    }
-
-    /// Lexicographically compares two deques while bounding recursive contents.
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        if op.is_equality() {
-            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
-        }
-        let Some(HeapReadOutput::Deque(other)) = other.read_heap(vm) else {
-            return Ok(Value::NotImplemented);
-        };
-        let self_len = self.get(vm.heap).len();
-        let other_len = other.get(vm.heap).len();
-        let mut guard = vm.recursion_guard()?;
-        let vm = &mut *guard;
-        for i in 0..self_len.min(other_len) {
-            let a = self.get(vm.heap).items[i].clone_with_heap(vm.heap);
-            defer_drop!(a, vm);
-            let b = other.get(vm.heap).items[i].clone_with_heap(vm.heap);
-            defer_drop!(b, vm);
-            if !a.py_lex_eq(b, vm)? {
-                return a.py_rich_compare(b, op, vm);
-            }
-        }
-        Ok(Value::Bool(op.holds(self_len.cmp(&other_len))))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {
@@ -646,12 +648,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DequeIterator> {
         None
     }
 
-    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
-    }
-
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        let self_id = self_id.expect("heap values have an id");
+        vm.heap.inc_ref(self_id);
+        Ok(Value::Ref(self_id))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

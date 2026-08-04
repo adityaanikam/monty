@@ -26,7 +26,7 @@ use std::{
 /// named access improves usability and readability.
 use smallvec::SmallVec;
 
-use super::{PyTrait, RichCmpOp, tuple::TupleIterator};
+use super::{PyTrait, RichCmpOp, RichCmpVtable, tuple::TupleIterator};
 use crate::{
     args::{ArgValues, KwargsValues},
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
@@ -327,9 +327,55 @@ impl<'h, C: ContainsVM<'h>> DropWithContext<C> for NamedTupleIter<'_, 'h> {
     }
 }
 
-/// `PyTrait` implementation for `HeapObjectRead<NamedTuple>`, providing all Python
-/// operations on heap-allocated named tuples via short-lived borrow patterns.
+impl<'h> HeapObjectRead<'h, NamedTuple> {
+    /// Compares a named tuple with tuple-like values for the equality slots.
+    fn eq_bool(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        match other.read_heap(vm) {
+            Some(HeapReadOutput::NamedTuple(other)) => {
+                if self.get(vm.heap).len() != other.get(vm.heap).len() {
+                    return Ok(Some(false));
+                }
+                let iter = self.iter(vm)?;
+                defer_drop_mut!(iter, vm);
+                while let Some((i, a)) = iter.next_with_index(vm)? {
+                    let b = other.clone_item(i, vm);
+                    defer_drop!(b, vm);
+                    if !a.py_eq(b, vm)? {
+                        return Ok(Some(false));
+                    }
+                }
+                Ok(Some(true))
+            }
+            Some(HeapReadOutput::Tuple(other)) => Ok(Some(self.eq_tuple(&other, vm)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Compares named tuples by their elements, including against plain tuples.
+    fn rich_compare(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.eq_bool(other, vm)?));
+        }
+        let other_items = match other.read_heap(vm) {
+            Some(HeapReadOutput::NamedTuple(other)) => other.cloned_items(vm),
+            Some(HeapReadOutput::Tuple(other)) => other.cloned_items(vm),
+            _ => return Ok(Value::NotImplemented),
+        };
+        rich_compare_item_seqs(self.cloned_items(vm), other_items, op, vm)
+    }
+}
+
+/// `PyTrait` implementation for `HeapRead<NamedTuple>`, providing all Python operations
+/// on heap-allocated named tuples via short-lived borrow patterns.
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTuple> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
     fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
         true
     }
@@ -435,51 +481,6 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTuple> {
 
     fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         self.py_mul_impl(other, vm)
-    }
-
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        // A namedtuple equals another namedtuple element-wise, and also equals a
-        // plain tuple with the same elements (class name is ignored). Both
-        // directions of the tuple case are covered here, so `Tuple::py_eq_impl`
-        // need not know about namedtuples.
-        match other.read_heap(vm) {
-            Some(HeapReadOutput::NamedTuple(other)) => {
-                if self.get(vm.heap).len() != other.get(vm.heap).len() {
-                    return Ok(Some(false));
-                }
-                let iter = self.iter(vm)?;
-                defer_drop_mut!(iter, vm);
-                while let Some((i, a)) = iter.next_with_index(vm)? {
-                    let b = other.clone_item(i, vm);
-                    defer_drop!(b, vm);
-                    if !a.py_eq(b, vm)? {
-                        return Ok(Some(false));
-                    }
-                }
-                Ok(Some(true))
-            }
-            Some(HeapReadOutput::Tuple(other)) => Ok(Some(self.eq_tuple(&other, vm)?)),
-            _ => Ok(None),
-        }
-    }
-
-    /// Compares named tuples by their elements, including against plain tuples.
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        if op.is_equality() {
-            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
-        }
-        let other_items = match other.read_heap(vm) {
-            Some(HeapReadOutput::NamedTuple(other)) => other.cloned_items(vm),
-            Some(HeapReadOutput::Tuple(other)) => other.cloned_items(vm),
-            _ => return Ok(Value::NotImplemented),
-        };
-        rich_compare_item_seqs(self.cloned_items(vm), other_items, op, vm)
     }
 
     /// Hashes by element only (not by class name), matching `Tuple::py_hash`
@@ -849,13 +850,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTupleClass> {
         None
     }
 
-    fn py_eq_impl(&self, _other: &Value, _vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        // Class objects compare by identity, resolved before reaching here.
-        Ok(None)
-    }
-
-    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        Ok(Some(identity_hash(self.id())))
+    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        Ok(Some(identity_hash(self_id)))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {

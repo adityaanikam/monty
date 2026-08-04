@@ -17,8 +17,8 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
-    types::{LazyHeapSet, PyTrait, Type},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
+    types::{LazyHeapSet, PyTrait, RichCmpOp, RichCmpVtable, Type},
     value::Value,
 };
 
@@ -185,7 +185,24 @@ impl Default for Range {
     }
 }
 
+impl<'h> HeapObjectRead<'h, Range> {
+    /// Compares ranges by the sequence they produce rather than raw parameters.
+    #[expect(clippy::unnecessary_wraps)]
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+        let Some(HeapReadOutput::Range(other)) = other.read_heap(vm) else {
+            return Ok(Value::NotImplemented);
+        };
+        let a = self.get(vm.heap);
+        let b = other.get(vm.heap);
+        let len = a.len();
+        let equal = len == b.len() && (len == 0 || (a.start == b.start && (len == 1 || a.step == b.step)));
+        Ok(op.equality_result(Some(equal)))
+    }
+}
+
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::equality(Self::rich_eq);
+
     fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
         true
     }
@@ -265,31 +282,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
         Ok(Value::Int(offset_i64))
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::Range(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        let a = self.get(vm.heap);
-        let b = other.get(vm.heap);
-        // Compare ranges by their actual sequences, not parameters.
-        // Two ranges are equal if they produce the same elements.
-        let len1 = a.len();
-        let len2 = b.len();
-        Ok(Some(if len1 != len2 {
-            false
-        } else if len1 == 0 {
-            true // Both empty
-        } else if len1 == 1 {
-            // Single-element ranges are equal when their one element matches,
-            // regardless of step (e.g. range(0, 1, 1) == range(0, 2, 2)).
-            a.start == b.start
-        } else {
-            // Same length (>1) - compare first element and step.
-            a.start == b.start && a.step == b.step
-        }))
-    }
-
-    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         // Ranges are equal by the sequence they produce, so the hash must depend
         // only on what equality compares: length, then start (if non-empty), then
         // step (only if length > 1). Hashing the raw `start`/`stop`/`step` fields
@@ -369,12 +362,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, RangeIterator> {
         None
     }
 
-    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
-    }
-
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        let self_id = self_id.expect("heap values have an id");
+        vm.heap.inc_ref(self_id);
+        Ok(Value::Ref(self_id))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
