@@ -8,37 +8,36 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-/// Bytes currently charged, and the ceiling they may not exceed (`usize::MAX`
-/// until [`arm_ceiling`] lowers it). Counting starts with the process: a counter
+/// Bytes currently charged, and the limit they may not exceed (`usize::MAX`
+/// until [`set_limit`] lowers it). Counting starts with the process: a counter
 /// armed later would see `dealloc`s it never charged and underflow.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// The leanest the process has ever been at an arming point, which is the
-/// worker's own footprint. Deriving each ceiling from the *current* live total
-/// instead would let memory retained between sessions (the type checker's memo
-/// graphs) ratchet the ceiling up checkout after checkout.
+/// The leanest the process has ever been at an arming point: what the worker
+/// costs to exist, before any session ran. Deriving each limit from the
+/// *current* live total instead would let memory retained between sessions
+/// ratchet it up checkout after checkout.
 static BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// How far above `max_memory` the ceiling sits, covering what the interpreter's
-/// tracker undercounts (arena slots, capacity slack, allocator rounding) —
-/// measured at worst ~3.8× for the smallest objects, so this is a backstop.
-const CEILING_MULTIPLE: usize = 5;
-
-/// Fixed headroom for the worker's own machinery, which no `max_memory` covers:
-/// repl and frame buffers, or typeshed and salsa caches when type checking. Both
-/// are generous, since too tight a ceiling kills healthy workers.
+/// Room above the limit for machinery the session did not ask for and cannot
+/// see: buffers the worker needs to serve it at all, and the type checker's
+/// stubs and caches. Both are generous, since too tight a cap kills healthy
+/// workers, which is far worse than a limit that binds a little late.
 const BASE_HEADROOM: usize = 4 * 1024 * 1024;
 const TYPE_CHECK_HEADROOM: usize = 32 * 1024 * 1024;
 
-/// Derives the ceiling from the current session's sandbox budget, or lifts it
-/// while no session has one. Call it after every request, since a session can
-/// also arrive (or end) through a restored dump or a reset; the result depends
-/// only on the budget and the baseline, so re-deriving mid-session is a no-op.
+/// Applies a session's memory limit, or lifts it while no session has one.
+/// Call it after every request, since a session can also arrive (or end)
+/// through a restored dump or a reset; the result depends only on the limit and
+/// the baseline, so re-applying mid-session is a no-op.
 ///
-/// On a 32-bit target (wasm) a budget beyond ~800 MiB saturates the arithmetic
-/// and leaves the worker uncapped — there is no ceiling to express.
-pub fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
+/// On a 32-bit target (wasm) a limit near 4 GiB saturates the arithmetic and
+/// leaves the worker uncapped — there is no cap to express.
+// TODO: update once there's one memory-limit implementation. The interpreter
+// still meters allocations itself, so a session's limit is enforced twice and
+// whichever binds first decides how exceeding it surfaces.
+pub fn set_limit(max_memory: Option<u64>, type_check: bool) {
     let live = LIVE.load(Ordering::Relaxed);
     // `fetch_min` both reads and lowers the baseline: the first arming, on a
     // pristine worker, sets it, and a later leaner moment can only improve it.
@@ -47,11 +46,7 @@ pub fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
         Some(bytes) => {
             let headroom = if type_check { TYPE_CHECK_HEADROOM } else { BASE_HEADROOM };
             baseline
-                .saturating_add(
-                    usize::try_from(bytes)
-                        .unwrap_or(usize::MAX)
-                        .saturating_mul(CEILING_MULTIPLE),
-                )
+                .saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX))
                 .saturating_add(headroom)
         }
         None => usize::MAX,
@@ -59,8 +54,8 @@ pub fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
     LIMIT.store(limit, Ordering::Relaxed);
 }
 
-/// The system allocator, plus a live-byte count and a null check that ends the
-/// process deliberately rather than aborting.
+/// The system allocator, plus the live-byte count that enforces the memory
+/// limit and a null check that ends the process deliberately.
 pub struct LimitedAllocator;
 
 // SAFETY: every method forwards its arguments unchanged to `System` and returns
@@ -119,14 +114,14 @@ unsafe impl GlobalAlloc for LimitedAllocator {
     }
 }
 
-/// Adds `size` to the live total, exiting if that breaches the ceiling. Charges
-/// *before* allocating, so a breach is refused rather than committed; the
+/// Adds `size` to the live total, exiting if that exceeds the limit. Charges
+/// *before* allocating, so the allocation is refused rather than committed; the
 /// overcount left when an allocation then fails is moot, as both paths end here.
 #[inline]
 fn charge(size: usize) {
     if LIVE.fetch_add(size, Ordering::Relaxed).saturating_add(size) > LIMIT.load(Ordering::Relaxed) {
         out_of_memory(format_args!(
-            "monty worker: allocation of {size} bytes exceeds the memory ceiling"
+            "monty worker: allocation of {size} bytes exceeds the memory limit"
         ));
     }
 }
@@ -148,8 +143,8 @@ fn out_of_memory(reason: fmt::Arguments<'_>) -> ! {
     // A genuinely exhausted host can fail the write and re-enter: let the first
     // caller write and send any re-entrant one straight to the end.
     static REPORTING: AtomicBool = AtomicBool::new(false);
-    // Lift the ceiling first — writing to stderr allocates (the handle's lock),
-    // which under a breached ceiling would re-enter and be silenced below,
+    // Lift the limit first — writing to stderr allocates (the handle's lock),
+    // which under an exceeded limit would re-enter and be silenced below,
     // losing the message. Safe because this path never returns.
     LIMIT.store(usize::MAX, Ordering::Relaxed);
     if !REPORTING.swap(true, Ordering::Relaxed) {

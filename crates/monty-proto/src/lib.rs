@@ -20,7 +20,7 @@ pub mod worker;
 /// independently. Equals the workspace version, since every crate shares it.
 pub const MONTY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Exit code a worker uses when it breached its memory ceiling or the allocator
+/// Exit code a worker uses when it exceeded its memory limit or the allocator
 /// refused an allocation, so the parent can report `MemoryError` instead of an
 /// unclassifiable `SIGABRT`.
 ///

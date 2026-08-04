@@ -38,70 +38,68 @@ subprocess and WebAssembly runtimes do.
 - `bigint.pow(base, exp)` estimates result size as `bits(base) * exp` with
   a 4× safety multiplier to cover repeated-squaring intermediate values.
 
-## Hard memory ceiling (worker pools)
+## Exceeding `max_memory` in a worker (pools)
 
-`max_memory` is enforced by the interpreter's own tracker, so it only bounds
-allocations the interpreter remembers to account for. A worker subprocess
-therefore backstops it with a second ceiling below the interpreter, enforced in
-its own global allocator by counting live bytes. There is nothing to configure:
-setting `max_memory` on a session arms it, and the ceiling is `5 × max_memory`,
-plus the worker's own baseline footprint, plus fixed headroom (4 MiB, or 32 MiB
-when type checking) for machinery no `max_memory` covers. A session with no
-`max_memory` gets no ceiling. Divergences from every other limit documented
-here:
+A worker enforces `max_memory` in its own global allocator as well, counting
+every byte the process requests. Nothing to configure: setting `max_memory` on a
+session applies it, and a session without one is unlimited. Whichever of the two
+enforcement paths binds first decides how exceeding the limit surfaces, so both
+outcomes below are reachable for the same `max_memory`.
 
-- **It kills the worker, though it still reports `MemoryError`.** A breach fails
-  an allocation the interpreter cannot handle, so the worker exits mid-turn. The
-  host gets `PoolError::Runtime` / `MontyRuntimeError` wrapping a `MemoryError`
-  whose message names the ceiling — but unlike every other runtime error, and
-  unlike an in-sandbox `max_memory` breach, the session is gone with the worker
-  (later calls on that checkout report `Finished`; the pool itself recovers).
-  Sandboxed code cannot observe or catch it.
+<!-- TODO: update once there's one memory-limit implementation — the two paths
+below collapse into the allocator's, and only its outcome remains. -->
+
+- **The allocator's outcome kills the worker, though it still reports
+  `MemoryError`.** Exceeding the limit fails an allocation the interpreter
+  cannot handle, so the worker exits mid-turn. The host gets
+  `PoolError::Runtime` / `MontyRuntimeError` wrapping a `MemoryError` — but
+  unlike every other runtime error, and unlike the interpreter's own
+  `MemoryError`, the session is gone with the worker (later calls on that
+  checkout report `Finished`; the pool itself recovers). Sandboxed code cannot
+  observe or catch it.
+- **Which one you get depends on what the code allocated.** The interpreter
+  measures user-visible data (see the approximation note above) while the
+  allocator measures what was really requested, so the same `max_memory` binds
+  earlier for many small objects than for a few large ones. Workloads dominated
+  by small objects tend to end the worker; workloads dominated by large buffers
+  tend to raise the interpreter's catchable-by-the-host `MemoryError` and leave
+  the session alive.
 - **It binds the worker's allocator, not the process.** Only bytes requested
   from Rust's global allocator are counted, which is everything sandboxed code
   can cause to be allocated, but not memory obtained another way: thread stacks,
-  the binary's own mapped image, or a direct `mmap`. It is a backstop under the
-  interpreter's tracker, not a kernel-enforced bound on process memory — an
-  inherited `ulimit -v` or cgroup limit is the tool for that, and still applies
-  independently (a worker whose allocation the kernel then refuses reports the
-  same `MemoryError`).
+  the binary's own mapped image, or a direct `mmap`. It is not a kernel-enforced
+  bound on process memory — an inherited `ulimit -v` or cgroup limit is the tool
+  for that, and still applies independently (a worker whose allocation the
+  kernel then refuses reports the same `MemoryError`).
 - **It counts requested bytes, not resident ones.** Per-allocation overhead and
   fragmentation sit between the count and the process's real footprint, so RSS
-  runs somewhat above the ceiling.
-- **Nothing the interpreter allocates can reach it.** The multiple covers what
-  the tracker undercounts — the per-object arena slot, `Vec`/`HashMap` capacity
-  slack, allocator rounding — which is worst (~3.8×) for the smallest objects.
-  A tracked allocation therefore raises the in-sandbox `MemoryError` at
-  `max_memory` first, five times lower, leaving the worker alive; the ceiling
-  only fires for allocations outside the tracker's view.
-- **`max_memory` alone does not bound worker memory.** A tiny budget still
-  leaves the worker the fixed headroom above, which is deliberately generous:
-  too tight a ceiling kills healthy workers, most often on the first
-  type-checked feed (typeshed and salsa caches load then). Use `max_processes`
-  and an OS-level limit to bound a host, not this.
+  runs somewhat above the limit.
+- **`max_memory` alone does not bound worker memory.** Above the limit sits the
+  worker's own footprint plus fixed headroom for machinery a session never asked
+  for — a few MiB, more when type checking loads typeshed and salsa. The
+  headroom is deliberately generous: too tight a cap kills healthy workers.
+  Use `max_processes` and an OS-level limit to bound a host, not this.
 - **Per session, but against a fixed baseline.** A worker serves many checkouts
-  and re-derives the ceiling for each session's budget, always from the leanest
-  the process has been. Memory retained between sessions — the type checker
-  keeps a small pool of salsa databases alive process-wide — therefore consumes
-  the headroom instead of raising the ceiling, and a worker whose residue
-  outgrows it is killed and replaced rather than allowed to grow indefinitely.
+  and re-derives the cap for each session, always from the leanest the process
+  has been. Memory retained between sessions therefore consumes the headroom
+  rather than raising the cap, and a worker whose residue outgrows it is killed
+  and replaced rather than allowed to grow indefinitely.
 - **Restoring a dump is bounded by the checkout it lands in.** `load_session` /
   `load_snapshot` restore the dump's own limits (see
-  `limitations/pool-architecture.md`), and the ceiling is re-derived from them
-  once the session exists — but the load *itself* runs under the ceiling the
-  `checkout()` config armed. Restoring a large dump into a checkout with a much
-  smaller `max_memory` can therefore breach the ceiling while loading; pass a
-  comparable budget to `checkout()`.
-- **The wasm worker gets the same ceiling but cannot report it.** It arms the
-  same allocator against the same budget, and a breach traps the instance — but
-  a wasm module has no exit status, so the host reports `MontyCrashedError`
-  rather than the `MemoryError` a subprocess produces. Its `usize` is also 32
-  bits, so a budget beyond ~800 MiB saturates the arithmetic and leaves the
-  module uncapped.
-- WebSocket workers get no ceiling at all: they are remote processes this pool
-  does not spawn.
+  `limitations/pool-architecture.md`), and the cap is re-derived from them
+  once the session exists — but the load *itself* runs under the limit the
+  `checkout()` config applied. Restoring a large dump into a checkout with a
+  much smaller `max_memory` can therefore exceed it while loading; pass a
+  comparable limit to `checkout()`.
+- **The wasm worker enforces it but cannot report it.** It applies the same
+  limit in the same allocator, and exceeding it traps the instance — but a wasm
+  module has no exit status, so the host reports `MontyCrashedError` rather than
+  the `MemoryError` a subprocess produces. Its `usize` is also 32 bits, so a
+  limit near 4 GiB leaves the module uncapped.
+- WebSocket workers get no allocator-enforced limit at all: they are remote
+  processes this pool does not spawn.
 
-Independently of any ceiling, **any** allocation a worker's allocator refuses —
+Independently of any limit, **any** allocation a worker's allocator refuses —
 plain host OOM, or a request beyond the usable address space such as
 `' ' * (1 << 60)` — takes this same path on every platform: the worker exits and
 the host sees that `MemoryError` with its session gone. CPython raises a

@@ -146,8 +146,8 @@ impl ChildProc {
     }
 
     /// Writes a bare 200 MiB frame-length prefix — no body — and expects the
-    /// child to die buying the buffer: under the wire cap, over any ceiling a
-    /// test arms, and four bytes of writing, so the parent cannot block on a
+    /// child to die buying the buffer: under the wire cap, over any limit a
+    /// test applies, and four bytes of writing, so the parent cannot block on a
     /// pipe whose reader has already gone.
     fn oversized_prefix_expecting_death(&mut self) {
         self.writer
@@ -412,12 +412,11 @@ fn child_enforces_time_limit() {
     child.shutdown();
 }
 
-/// The ceiling a session's `max_memory` derives must be invisible to it: it is
-/// a backstop for what the sandbox tracker cannot see, not a second budget. The
-/// budget here is deliberately tiny — the headroom, not the multiple, is what
-/// keeps a small budget servable.
+/// A session's `max_memory` must not disturb work that stays inside it. The
+/// limit here is deliberately tiny: the headroom above it is what keeps a small
+/// limit servable at all.
 #[test]
-fn derived_memory_ceiling_leaves_normal_work_alone() {
+fn small_memory_limit_leaves_normal_work_alone() {
     let mut child = ChildProc::spawn();
     child.create_repl_with(configure_with_max_memory(1024));
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
@@ -426,7 +425,7 @@ fn derived_memory_ceiling_leaves_normal_work_alone() {
 
 /// A refused allocation must leave the parent something it can classify: the
 /// dedicated exit code, not the `SIGABRT` Rust's allocation-error handler would
-/// raise (which a stack overflow also produces). Needs no ceiling: 1 EiB is
+/// raise (which a stack overflow also produces). Needs no limit: 1 EiB is
 /// thousands of times the usable address space on any 64-bit host, so `mmap`
 /// fails on the address-space check before overcommit policy is consulted —
 /// deterministic, and no page is ever touched.
@@ -444,31 +443,30 @@ fn refused_allocation_exits_with_the_oom_code() {
     );
 }
 
-/// The point of the ceiling: an allocation the sandbox's `ResourceTracker`
-/// never sees must kill the process instead of growing host memory without
-/// bound. Nothing the *interpreter* allocates can reach it (a tracked
-/// allocation hits `max_memory` first, five times lower), so the breach here
-/// comes from the frame reader — a bare length prefix, under the wire cap and
-/// over the ceiling, buys a 200 MiB buffer with four bytes. Same exit code as a
-/// refused allocation; the ceiling only changes *where* refusal starts.
+/// The point of enforcing in the allocator: memory the interpreter never
+/// accounts for must still kill the process rather than grow the host without
+/// bound. The allocation here comes from the frame reader — a bare length
+/// prefix, under the wire cap and over the limit, buys a 200 MiB buffer with
+/// four bytes. Same exit code as a refused allocation; the limit only changes
+/// *where* refusal starts.
 #[test]
-fn memory_ceiling_breach_exits_with_the_oom_code() {
+fn exceeding_the_memory_limit_exits_with_the_oom_code() {
     let mut child = ChildProc::spawn_stderr_piped();
     child.create_repl_with(configure_with_max_memory(1024));
     child.oversized_prefix_expecting_death();
     let (status, stderr) = child.reap_with_stderr();
     assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
     assert!(
-        stderr.contains("allocation of 209715200 bytes exceeds the memory ceiling"),
+        stderr.contains("allocation of 209715200 bytes exceeds the memory limit"),
         "{stderr}"
     );
 }
 
-/// A dump carries its own limits, so restoring one must re-derive the ceiling
-/// from them: this `Load` lands on a child that was never configured with a
-/// budget, and the restored session's `max_memory` is all there is to bound it.
+/// A dump carries its own limits, so restoring one must re-apply them: this
+/// `Load` lands on a child that was never configured with a limit, and the
+/// restored session's `max_memory` is all there is to bound it.
 #[test]
-fn loading_a_dump_arms_the_ceiling_from_its_own_limits() {
+fn loading_a_dump_applies_its_own_memory_limit() {
     let mut source = ChildProc::spawn();
     source.create_repl_with(configure_with_max_memory(1024));
     assert_eq!(source.feed_complete("x = 1"), MontyObject::None);
@@ -487,12 +485,12 @@ fn loading_a_dump_arms_the_ceiling_from_its_own_limits() {
     let (status, stderr) = restored.reap_with_stderr();
     assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
     assert!(
-        stderr.contains("allocation of 209715200 bytes exceeds the memory ceiling"),
+        stderr.contains("allocation of 209715200 bytes exceeds the memory limit"),
         "{stderr}"
     );
 }
 
-/// A `Configure` carrying `max_memory`, which is what arms the worker's ceiling.
+/// A `Configure` carrying `max_memory`, which is what limits the worker.
 fn configure_with_max_memory(bytes: u64) -> pb::Configure {
     pb::Configure {
         script_name: "main.py".to_owned(),

@@ -1,8 +1,8 @@
-// The wasm worker's hard memory ceiling, driven in Node so it needs no browser.
+// The wasm worker's memory limit, driven in Node so it needs no browser.
 //
 // The module declares the same `monty-alloc` global allocator as the subprocess
 // worker, so a session's `maxMemory` bounds its linear memory too — but a
-// trapped module has no exit status, so a breach surfaces as a crash rather
+// trapped module has no exit status, so exceeding it surfaces as a crash rather
 // than the `MemoryError` the subprocess pool reports.
 
 import { test } from 'vitest'
@@ -13,7 +13,7 @@ import { skipIfBrowser } from './env.js'
 import { Monty } from '@pydantic/monty/wasm'
 import { MontyCrashedError, MontyRuntimeError } from '@pydantic/monty'
 
-test('a session budget leaves normal wasm work alone', async (ctx) => {
+test('a session limit leaves normal wasm work alone', async (ctx) => {
   skipIfBrowser(ctx)
   const pool = await Monty.create()
   const session = await pool.checkout({ limits: { maxMemory: 1024 * 1024 } })
@@ -22,12 +22,12 @@ test('a session budget leaves normal wasm work alone', async (ctx) => {
   await pool.close()
 })
 
-test('a tracked overrun stays an in-sandbox MemoryError', async (ctx) => {
+test('an overrun the interpreter catches leaves the instance alive', async (ctx) => {
   skipIfBrowser(ctx)
   const pool = await Monty.create()
   const session = await pool.checkout({ limits: { maxMemory: 1024 * 1024 } })
-  // five times below the ceiling, so the interpreter's own tracker fires first
-  // and the instance survives to serve the next feed
+  // a shape the interpreter accounts for closely enough to catch first, so the
+  // instance survives to serve the next feed
   const error = await t.throwsAsync(() => session.feedRun("xs = []\nwhile True:\n    xs.append('x' * 24)"), {
     instanceOf: MontyRuntimeError,
   })
@@ -36,12 +36,12 @@ test('a tracked overrun stays an in-sandbox MemoryError', async (ctx) => {
   await pool.close()
 })
 
-test('a breach of the derived ceiling kills the instance and the pool recovers', async (ctx) => {
+test('exceeding the limit kills the instance and the pool recovers', async (ctx) => {
   skipIfBrowser(ctx)
   const pool = await Monty.create()
   const session = await pool.checkout({ limits: { maxMemory: 1024 } })
-  // the fed snippet is untracked — the module buys a frame buffer for it before
-  // the interpreter sees the code — so this reaches the ceiling
+  // the fed snippet is memory the interpreter never accounts for — the module
+  // buys a frame buffer for it before it sees the code
   const error = await t.throwsAsync(() => session.feedRun('# ' + 'a'.repeat(16 * 1024 * 1024)), {
     instanceOf: MontyCrashedError,
   })

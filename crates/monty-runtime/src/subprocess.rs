@@ -36,7 +36,7 @@ pub(crate) fn run() -> ExitCode {
         match reader.read::<pb::ParentRequest>() {
             Ok(Some(request)) => {
                 let outcome = child.handle(request, &mut sink);
-                arm_memory_ceiling(&child);
+                apply_memory_limit(&child);
                 match outcome {
                     Ok(HandleOutcome::Continue) => {}
                     Ok(HandleOutcome::Shutdown) => return ExitCode::SUCCESS,
@@ -81,17 +81,17 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
-/// Re-derives the allocator's memory ceiling from whatever session the child
-/// now holds, after every request.
+/// Applies the memory limit of whatever session the child now holds, after
+/// every request.
 ///
-/// Reading the child's state rather than the request is what keeps the ceiling
+/// Reading the child's state rather than the request is what keeps the limit
 /// honest: a rejected `Configure` changes nothing, a `Load` brings the dump's
 /// own limits, and `Reset` ends the session. It lives in the shell because only
 /// a binary may own a global allocator — the same state machine also drives the
 /// wasm worker, which has none.
-fn arm_memory_ceiling(child: &Child) {
+fn apply_memory_limit(child: &Child) {
     let budget = child.session_budget();
-    monty_alloc::arm_ceiling(budget.max_memory, budget.type_check);
+    monty_alloc::set_limit(budget.max_memory, budget.type_check);
 }
 
 /// Writes framed child events to stdout.

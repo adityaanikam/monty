@@ -236,24 +236,17 @@ let result = runner2.run(vec![MontyObject::Int(41)], ResourceTracker::default(),
 assert_eq!(result, MontyObject::Int(42));
 ```
 
-## The hard memory ceiling
+## Memory limits in workers
 
-Setting `max_memory` on a session also arms a hard ceiling in the worker's own
-allocator, backstopping the in-sandbox limit for allocations the interpreter's
-tracker never sees. A breach kills the worker with a `MemoryError` — losing that
-session, though the pool replaces the worker — rather than letting it grow until
-the OS OOM killer picks a victim.
+A session's `max_memory` is enforced in the worker's own allocator as well as by
+the interpreter, so it covers every byte the process asks for. There is nothing
+to configure: set the limit, and a session that exceeds it fails. A worker that
+cannot honour the limit is killed with a `MemoryError` and replaced by the pool,
+rather than growing until the OS OOM killer picks a victim.
 
-There is nothing to configure. The ceiling sits at `5 × max_memory` above the
-worker's own baseline footprint, plus a few MiB of headroom (more when type
-checking) for machinery the budget does not cover. Nothing the interpreter allocates can
-reach it: the multiple covers what the tracker undercounts, so a tracked
-allocation raises `MemoryError` at `max_memory` first, leaving the worker alive.
-
-The allocator enforcing it is the `monty-alloc` crate, which both the
-subprocess worker and the WebAssembly one run under. See
-[`limitations/resource_limits.md`](limitations/resource_limits.md) for the
-numbers and for how a breach surfaces in each.
+See [`limitations/resource_limits.md`](limitations/resource_limits.md) for how
+exceeding a limit surfaces to a host, and `monty-alloc` for the allocator both
+the subprocess and WebAssembly workers run under.
 
 ## PydanticAI Integration
 

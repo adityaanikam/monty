@@ -61,10 +61,9 @@ test('maxCheckoutsPerWorker recycles the worker', async (ctx) => {
   await second.close()
 })
 
-test('the ceiling derived from maxMemory leaves normal work alone', async (ctx) => {
+test('maxMemory leaves normal work alone', async (ctx) => {
   skipIfBrowser(ctx)
-  // a session with a budget gets a worker ceiling derived from it; that ceiling
-  // backstops the in-sandbox limit rather than acting as a second budget
+  // a session's limit must not disturb work that stays inside it
   await using pool = await Monty.create()
   const session = await pool.checkout({ limits: { maxMemory: 1024 ** 2 } })
   t.is(await session.feedRun('1 + 1'), 2)
@@ -81,23 +80,23 @@ test('a refused allocation raises MemoryError and the pool recovers', async (ctx
   const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (1 << 60)"), {
     instanceOf: MontyRuntimeError,
   })
-  t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')
+  t.is(error.message, 'MemoryError: the worker exceeded its memory limit and was terminated')
   const next = await pool.checkout()
   t.is(await next.feedRun('1 + 1'), 2)
   await next.close()
 })
 
-test('a breach of the derived ceiling raises MemoryError and the pool recovers', async (ctx) => {
+test('exceeding maxMemory in the allocator raises MemoryError and the pool recovers', async (ctx) => {
   skipIfBrowser(ctx)
   await using pool = await Monty.create()
   const session = await pool.checkout({ limits: { maxMemory: 1024 } })
-  // the fed snippet is untracked — the worker buys a frame buffer for it before
-  // the interpreter ever sees it — so a snippet far larger than the budget
-  // breaches the ceiling derived from maxMemory rather than the tracker
+  // the fed snippet is memory the interpreter never accounts for — the worker
+  // buys a frame buffer for it before it sees the code — so a snippet far
+  // larger than the limit is caught by the allocator
   const error = await t.throwsAsync(() => session.feedRun('# ' + 'a'.repeat(16 * 1024 * 1024)), {
     instanceOf: MontyRuntimeError,
   })
-  t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')
+  t.is(error.message, 'MemoryError: the worker exceeded its memory limit and was terminated')
   const next = await pool.checkout()
   t.is(await next.feedRun('1 + 1'), 2)
   await next.close()

@@ -48,10 +48,10 @@ thread_local! {
     static CHILD: RefCell<Child> = RefCell::new(Child::new());
 }
 
-/// Bounds the module's linear memory by the session's own `max_memory` (see the
-/// `monty-alloc` crate). A wasm module may declare one because its allocator is
-/// shared with nothing; a breach traps, which is already how the host learns an
-/// instance died — it has no exit status to read.
+/// Enforces the session's `max_memory` against the module's linear memory (see
+/// the `monty-alloc` crate). A wasm module may declare one because its allocator
+/// is shared with nothing; exceeding the limit traps, which is already how the
+/// host learns an instance died — it has no exit status to read.
 #[global_allocator]
 static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 
@@ -82,11 +82,11 @@ pub extern "C" fn monty_dispatch_turn() -> i32 {
 
     let (reply, outcome) = CHILD.with_borrow_mut(|child| {
         let framed = dispatch_frame(child, &request);
-        // Re-derived from the session the child now holds, exactly as the
+        // Re-read from the session the child now holds, exactly as the
         // subprocess shell does: a dump restored by `Load` brings its own
-        // limits, and a rejected request must not disturb the ceiling.
+        // limits, and a rejected request must not disturb the limit.
         let budget = child.session_budget();
-        monty_alloc::arm_ceiling(budget.max_memory, budget.type_check);
+        monty_alloc::set_limit(budget.max_memory, budget.type_check);
         framed
     });
 

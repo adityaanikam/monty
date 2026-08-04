@@ -106,16 +106,15 @@ properties that real CPython does not provide, per the caveat above.
   bounded, and `request_timeout` applies independently. Both deadlines fire
   between the turn's polls, so decoding one maximal reply frame (~1s worst
   case) can delay enforcement by that long.
-- **`max_memory` is backstopped by a hard memory ceiling.** A session's
-  `max_memory` also caps the live bytes its worker's allocator will hand out
-  (with a multiple and headroom on top — see `limitations/resource_limits.md`);
-  a session without one gets no ceiling. The worker derives it from the session
-  it holds, so nothing travels outside the protocol, and the wasm worker applies
-  the same ceiling to its linear memory. Ignored by the WebSocket transport
-  (whose exit codes do not travel, so a remote breach degrades to
-  `Disconnected`). The exit code borrows
-  [`sysexits.h`](https://man.freebsd.org/sysexits) so a bare status is legible in
-  a log.
+- **`max_memory` is also enforced in the worker's allocator.** It caps the live
+  bytes the worker's allocator will hand out (plus headroom — see
+  `limitations/resource_limits.md`, which covers how exceeding it surfaces); a
+  session without a limit is uncapped. The worker derives it from the session it
+  holds, so nothing travels outside the protocol, and the wasm worker applies it
+  to its linear memory. Ignored by the WebSocket transport (whose exit codes do
+  not travel, so a remote failure degrades to `Disconnected`). The exit code
+  borrows [`sysexits.h`](https://man.freebsd.org/sysexits) so a bare status is
+  legible in a log.
 - **A refused allocation is the one `MemoryError` that kills the session.** The
   worker's allocator exits 65 (`EX_DATAERR` — the fed snippet asked for more than
   it may have) rather than letting Rust abort (`SIGABRT`, which a stack overflow

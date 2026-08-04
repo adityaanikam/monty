@@ -1034,7 +1034,7 @@ impl Checkout {
             // checkout is already finished, so later calls report `Finished`
             PoolError::Runtime(MontyException::new(
                 ExcType::MemoryError,
-                Some("the worker exceeded its memory ceiling and was terminated".to_owned()),
+                Some("the worker exceeded its memory limit and was terminated".to_owned()),
             ))
         } else {
             PoolError::Crashed {

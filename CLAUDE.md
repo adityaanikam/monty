@@ -137,14 +137,16 @@ subprocesses:
   with crash detection/replacement and a hard per-turn timeout. Frame reads
   are cancel-safe (partial-frame state lives in the worker, no pump task),
   and turn deadlines are tokio timers rather than a watchdog thread.
-- `crates/monty-alloc` — the `#[global_allocator]` both workers run under:
-  it counts live bytes against a ceiling derived from the session's
-  `max_memory` (via `Child::session_budget`, re-armed after every request) and
-  ends the process rather than letting Rust abort. Its `exit-code` feature
-  picks how: `monty-runtime` enables it and exits with `OOM_EXIT_CODE` for the
-  pool to classify, `monty-wasm-runtime` leaves it off and traps, having no
-  exit status to offer. Only a binary or a wasm module may declare a global
-  allocator, so the crate provides the type and each declares its own.
+- `crates/monty-alloc` — the `#[global_allocator]` both workers run under: it
+  counts live bytes against the session's `max_memory` (via
+  `Child::session_budget`, re-armed after every request) and ends the process
+  rather than letting Rust abort. Its `exit-code` feature picks how:
+  `monty-runtime` enables it and exits with `OOM_EXIT_CODE` for the pool to
+  classify, `monty-wasm-runtime` leaves it off and traps, having no exit status
+  to offer. Only a binary or a wasm module may declare a global allocator, so
+  the crate provides the type and each declares its own. TODO: the interpreter
+  meters allocations too — that second implementation is to be removed, leaving
+  this the only one.
 - `pydantic_monty.Monty` / `pydantic_monty.AsyncMonty` — the ONLY Python
   execution surface (there is no in-process Python API): sync and async pools
   of workers (`with Monty() as pool: with pool.checkout() as session:
@@ -851,8 +853,8 @@ transport differs. The pieces:
   `monty_dispatch_turn` (read a framed request from stdin, run one turn, write
   framed events to stdout). No napi, no threads, no `SharedArrayBuffer`. It
   declares the `monty-alloc` global allocator, so a session's `max_memory`
-  bounds the module's linear memory too; a breach traps, which the host already
-  reads as a dead instance.
+  bounds the module's linear memory too; exceeding it traps, which the host
+  already reads as a dead instance.
 - `crates/monty-js/ts/worker/` — the TS pool/transport that drives it
   (`createWorkerPool`): a browser `Worker` backend (`browserFactory.ts`, whose
   `Worker.terminate()` is the watchdog's hard kill), a Node `worker_threads`
@@ -864,7 +866,7 @@ transport differs. The pieces:
 Build the worker module locally with `make build-wasm` (needs the
 `wasm32-wasip1` target); it is built and tested in CI. `make test-browser` runs
 the whole suite against it in headless Chromium, and
-`__test__/wasm_ceiling.spec.ts` drives the module from Node with no browser.
+`__test__/wasm_memory_limit.spec.ts` drives the module from Node with no browser.
 
 ## Limitations documentation (`./limitations/`)
 

@@ -1027,7 +1027,7 @@ async fn hard_child_crash_does_not_harm_the_pool() {
     if let PoolError::Runtime(exc) = &err {
         assert_ne!(
             exc.message(),
-            Some("the worker exceeded its memory ceiling and was terminated")
+            Some("the worker exceeded its memory limit and was terminated")
         );
     }
 
@@ -1103,10 +1103,9 @@ async fn child_resource_limits_do_not_kill_the_worker() {
     assert_eq!(pool.idle_workers(), 1);
 }
 
-/// The ceiling a session's `max_memory` derives must not disturb it: it is a
-/// backstop for what the sandbox tracker cannot see, not a second budget.
+/// A session's `max_memory` must not disturb work that stays inside it.
 #[tokio::test]
-async fn ceiling_derived_from_max_memory_leaves_normal_work_alone() {
+async fn max_memory_leaves_normal_work_alone() {
     let pool = Pool::new(config()).await.unwrap();
     let repl_config = ReplConfig {
         limits: Some(ResourceLimits::default().max_memory(1024 * 1024)),
@@ -1155,7 +1154,7 @@ async fn unrecognised_exit_code_stays_an_opaque_death() {
 /// A refused allocation is the one `Runtime` error whose worker is already
 /// dead: it reports `MemoryError` (the worker's dedicated exit code, not an
 /// unclassifiable `SIGABRT`), the checkout is finished, and the pool recovers.
-/// Needs no ceiling: 1 EiB dwarfs the usable address space on any 64-bit host,
+/// Needs no limit: 1 EiB dwarfs the usable address space on any 64-bit host,
 /// so the allocator refuses it regardless of overcommit policy.
 #[tokio::test]
 async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
@@ -1172,7 +1171,7 @@ async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
     assert_eq!(exc.exc_type().to_string(), "MemoryError");
     assert_eq!(
         exc.message(),
-        Some("the worker exceeded its memory ceiling and was terminated")
+        Some("the worker exceeded its memory limit and was terminated")
     );
     // unlike an in-sandbox exception, the worker is gone with it
     assert!(matches!(session.finish().await, Err(PoolError::Finished)));
