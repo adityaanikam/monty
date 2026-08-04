@@ -19,7 +19,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 monty-proto = { workspace = true, features = ["worker"] }
-prost = { workspace = true }
+monty-types = { workspace = true }
 wit-bindgen = "0.46"
 
 [lints]

@@ -5,39 +5,31 @@
 import { WASIShim } from '@bytecodealliance/preview2-shim/instantiation'
 
 import { instantiate } from './component/monty.component.js'
+import type {
+  DispatchResult as ComponentDispatchResult,
+  Request as ComponentRequest,
+} from './component/monty.component.js'
 
 /** Core modules emitted by Jco for one transpiled WebAssembly component. */
 export type ComponentModules = Readonly<Record<string, WebAssembly.Module>>
 
-/** Status codes exposed to the transport drive loop. */
-export const TurnStatus = {
-  Continue: 0,
-  Shutdown: 1,
-} as const
+/** Semantic request accepted by the Rust component. */
+export type DispatchRequest = ComponentRequest
 
-/** One protobuf event envelope decoded by the Rust component. */
-export interface DecodedChildEvent {
-  kind: number
-  bytes: Uint8Array
-}
+/** Semantic events and worker status returned by the Rust component. */
+export type DispatchResult = ComponentDispatchResult
 
-/** Result returned by a worker component dispatch. */
-export interface DispatchResult {
-  status: number
-  events: DecodedChildEvent[]
-}
-
-/** Sends one framed request to a persistent component instance. */
-export type Dispatcher = (requestFrame: Uint8Array) => Promise<DispatchResult>
+/** Sends one semantic request to a persistent component instance. */
+export type Dispatcher = (request: DispatchRequest) => Promise<DispatchResult>
 
 /** Adapts a synchronous in-process [`WasmHost`] to the async [`Dispatcher`]. */
 export function inProcessDispatcher(host: WasmHost): Dispatcher {
-  return (requestFrame) => Promise.resolve(host.dispatch(requestFrame))
+  return (request) => Promise.resolve(host.dispatch(request))
 }
 
 /** One instantiated Monty component, retaining its child across turns. */
 export class WasmHost {
-  private constructor(private readonly dispatchComponent: (request: Uint8Array) => ComponentDispatchResult) {}
+  private constructor(private readonly dispatchComponent: (request: DispatchRequest) => DispatchResult) {}
 
   /** Instantiates all core modules and links their capability-limited WASI imports. */
   static async create(modules: ComponentModules): Promise<WasmHost> {
@@ -45,19 +37,10 @@ export class WasmHost {
     return new WasmHost(component.worker.dispatch)
   }
 
-  /** Runs one turn and returns semantic event envelopes produced by Rust. */
-  dispatch(requestFrame: Uint8Array): DispatchResult {
-    const result = this.dispatchComponent(requestFrame)
-    return {
-      status: result.status === 'continue' ? TurnStatus.Continue : TurnStatus.Shutdown,
-      events: result.events.map(({ kind, payload }) => ({ kind, bytes: payload })),
-    }
+  /** Runs one turn entirely through the semantic component interface. */
+  dispatch(request: DispatchRequest): DispatchResult {
+    return this.dispatchComponent(request)
   }
-}
-
-interface ComponentDispatchResult {
-  status: 'continue' | 'shutdown'
-  events: Array<{ kind: number; payload: Uint8Array }>
 }
 
 /** Creates isolated WASI imports with no host filesystem, environment, or network. */

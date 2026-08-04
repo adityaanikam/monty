@@ -1,8 +1,8 @@
 // The worker-side dispatch loop, shared by every environment's worker entry.
 //
 // Runs inside the worker thread/context: owns one component instance and
-// answers each `DispatchRequest` by running one turn and posting its decoded
-// event envelopes back. The environment-specific entry
+// answers each `DispatchRequest` by running one turn and posting its semantic
+// events back. The environment-specific entry
 // (Node `worker_threads`, browser `Worker`) only wires its message primitives
 // to `post`/`subscribe`.
 
@@ -20,7 +20,7 @@ export async function serveDispatch(
 ): Promise<void> {
   const host = await WasmHost.create(modules)
   subscribe((request) => {
-    const { status, events } = host.dispatch(request.frame)
+    const { status, events } = host.dispatch(request.request)
     post({ id: request.id, status, events })
   })
 }

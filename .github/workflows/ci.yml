@@ -1010,8 +1010,8 @@ jobs:
         run: npm install
         working-directory: crates/monty-js
 
-      - name: Build wasm package assets
-        run: make build-wasm
+      - name: Build wasm package assets and verify generated declarations
+        run: make check-wasm-types
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

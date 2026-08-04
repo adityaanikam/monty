@@ -4,14 +4,14 @@ The monty type checker, compiler, and interpreter should run in a separate
 process, except in environments where that's not possible (like wasm), so
 that sandbox crashes that cannot be fully prevented — stack overflow aborts
 and allocator aborts — kill only the worker. The Python package
-(`pydantic_monty`) and the JS package (`@pydantic/monty`) both do this: they
-run everything in workers driven over a protobuf protocol
-(`crates/monty-proto`) and expose no in-process execution API. By default the
-worker is a local `monty subprocess` child; the Python package additionally
-offers `pydantic_monty.AsyncMontyWebsocket`, which reaches a remote child over
-a WebSocket instead (the JS package is subprocess-only). For a `monty subprocess`
-worker the language semantics are identical to embedding the interpreter directly
-(it is the same interpreter), and the notes below are about the *host API* surface.
+(`pydantic_monty`) and Node JS package (`@pydantic/monty`) drive subprocesses
+over the `monty-proto` protobuf protocol. Browsers instead drive the same Rust
+child state machine in a Web Worker through a semantic WIT component interface;
+protobuf never crosses into JavaScript. The Python package additionally offers
+`pydantic_monty.AsyncMontyWebsocket`, which reaches a remote child over a
+WebSocket. For a `monty subprocess` worker the language semantics are identical
+to embedding the interpreter directly (it is the same interpreter), and the
+notes below are about the *host API* surface.
 
 A WebSocket worker is whatever the relay bridges to, and need not be a Monty
 sandbox at all: a remote child may run the snippet in **real CPython with no
@@ -122,11 +122,13 @@ properties that real CPython does not provide, per the caveat above.
 
 ## Values crossing the process boundary
 
-- Values are encoded as protobuf (`proto/monty/v1/monty.proto`); every
-  `MontyObject` variant round-trips, but nesting depth is bounded by prost's
-  decode recursion limit. The exact bound depends on container shape: roughly
-  48 nested list-like containers, 32 nested dicts, or 24 nested dataclasses.
-  Deeper values fail the protocol turn rather than crossing the boundary.
+- Process/WebSocket transports encode values as protobuf
+  (`proto/monty/v1/monty.proto`). The browser component instead uses semantic
+  flat node arenas because WIT cannot express recursive types. Every
+  `MontyObject` variant round-trips through either representation, with the
+  same nesting bound: roughly 48 nested list-like containers, 32 nested dicts,
+  or 24 nested dataclasses. Deeper values fail the turn rather than crossing
+  the boundary.
 - `Cycle` markers (self-referential containers) can be *received* from a
   worker but are rejected as inputs.
 - A single value whose encoded form would exceed the wire frame limit
@@ -141,8 +143,8 @@ properties that real CPython does not provide, per the caveat above.
   (heap plus any retained suspension payload) exceeds 256 MiB cannot be
   dumped. The call raises a `RuntimeError` and the session is unaffected — a
   suspended session stays suspended and resumable.
-- Independently of the wire-byte limit, a frame is rejected if the values it
-  decodes into would exceed a **per-frame host-memory budget** — a hard,
+- On protobuf transports, independently of the wire-byte limit, a frame is
+  rejected if the values it decodes into would exceed a **per-frame host-memory budget** — a hard,
   non-configurable limit of 1 GiB of *resident* decoded bytes. The wire cap
   bounds bytes, but the cheapest elements (e.g. `None` in a list, ~4 wire bytes)
   materialize into 88-byte `MontyObject`s — a ~22× blow-up that a ≤256 MiB frame
@@ -154,9 +156,11 @@ properties that real CPython does not provide, per the caveat above.
   limit. Every payload — containers and function/OS-call args & kwargs alike —
   decodes straight into its final type with no intermediate copy, so the
   worst-case host *peak* is ~1× the budget plus the ≤256 MiB frame buffer, and
-  the bound applies per concurrent worker.
-- Semantic validation of wire values (date ranges, timedelta normalization,
-  exception/type/builtin names) happens *while decoding* the frame. A frame
+  the bound applies per concurrent worker. The browser component applies the
+  same expanded-value budget before lifting a semantic event into JavaScript.
+- Semantic validation of protobuf values (date ranges, timedelta normalization,
+  exception/type/builtin names) happens *while decoding* the frame; the browser
+  component applies the same checks while converting its WIT value arena. A frame
   carrying an invalid value therefore fails the whole protocol turn: a parent
   receiving one discards the worker with a protocol error; a worker receiving
   one answers with a `RuntimeError("protocol violation: malformed request:

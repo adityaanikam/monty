@@ -2224,7 +2224,7 @@ name = "monty-wasm-runtime"
 version = "0.0.19"
 dependencies = [
  "monty-proto",
- "prost",
+ "monty-types",
  "wit-bindgen",
 ]
 

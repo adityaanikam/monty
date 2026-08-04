@@ -55,6 +55,12 @@ dev-py-release: ## Install the python package for development with a release bui
 build-wasm: install-js ## Build the WASI 0.2 worker component (requires the wasm32-wasip1 target)
 	cd crates/monty-js && npm run build:wasm && npm run build:ts
 
+.PHONY: check-wasm-types
+check-wasm-types: build-wasm ## Verify checked-in component declarations match the WIT interface
+	git diff --exit-code -- crates/monty-js/ts/worker/component
+	@untracked=$$(git ls-files --others --exclude-standard -- crates/monty-js/ts/worker/component); \
+		test -z "$$untracked" || { echo "Untracked generated component declarations:"; echo "$$untracked"; exit 1; }
+
 .PHONY: test-browser
 test-browser: install-js ## Browser (Vitest) test of the wasm path in a real headless browser
 	cd crates/monty-js && npm run build:wasm && npm run build:ts && npx playwright install chromium && npm run test:browser
