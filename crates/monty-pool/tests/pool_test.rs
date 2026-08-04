@@ -1103,14 +1103,16 @@ async fn child_resource_limits_do_not_kill_the_worker() {
     assert_eq!(pool.idle_workers(), 1);
 }
 
-/// A ceiling generous enough for the interpreter must not disturb ordinary
-/// sessions: it is a backstop, not a second sandbox budget.
+/// The ceiling a session's `max_memory` derives must not disturb it: it is a
+/// backstop for what the sandbox tracker cannot see, not a second budget.
 #[tokio::test]
-async fn worker_hard_memory_limit_leaves_normal_work_alone() {
-    let mut config = config();
-    config.worker_hard_memory_limit = Some(2 * 1024 * 1024 * 1024); // 2 GiB
-    let pool = Pool::new(config).await.unwrap();
-    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+async fn ceiling_derived_from_max_memory_leaves_normal_work_alone() {
+    let pool = Pool::new(config()).await.unwrap();
+    let repl_config = ReplConfig {
+        limits: Some(ResourceLimits::default().max_memory(1024 * 1024)),
+        ..ReplConfig::default()
+    };
+    let mut session = pool.checkout(&repl_config).await.unwrap();
     assert_eq!(
         expect_complete(
             session
@@ -1174,44 +1176,6 @@ async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
     );
     // unlike an in-sandbox exception, the worker is gone with it
     assert!(matches!(session.finish().await, Err(PoolError::Finished)));
-
-    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
-    assert_eq!(
-        expect_complete(
-            session
-                .feed("3 + 3", vec![], vec![], false, &mut no_print)
-                .await
-                .unwrap()
-        ),
-        MontyObject::Int(6)
-    );
-    session.finish().await.unwrap();
-}
-
-/// The ceiling only changes *where* allocations start being refused, so a breach
-/// reports the same `MemoryError` — the divergence that matters is from the
-/// in-sandbox `max_memory` limit, which leaves the worker alive (see
-/// `child_resource_limits_do_not_kill_the_worker`).
-#[tokio::test]
-async fn worker_hard_memory_breach_is_a_memory_error() {
-    let mut config = config();
-    config.worker_hard_memory_limit = Some(1024 * 1024 * 1024); // 1 GiB
-    let pool = Pool::new(config).await.unwrap();
-    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
-    let err = session
-        .feed(
-            "x = ' ' * (4 * 1024 * 1024 * 1024)",
-            vec![],
-            vec![],
-            false,
-            &mut no_print,
-        )
-        .await
-        .unwrap_err();
-    let PoolError::Runtime(exc) = err else {
-        panic!("expected Runtime, got {err:?}");
-    };
-    assert_eq!(exc.exc_type().to_string(), "MemoryError");
 
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     assert_eq!(

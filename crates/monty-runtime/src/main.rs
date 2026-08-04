@@ -16,14 +16,14 @@ use monty_types::{
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-mod oom_exit;
+mod allocator;
 mod subprocess;
 
 /// Classifies allocation failure as an exit code rather than an abort, so the
 /// pool can report `MemoryError`. Declared here because only a binary may:
-/// see [`oom_exit`]. Applies to every mode, `subprocess` and CLI alike.
+/// see [`allocator`]. Applies to every mode, `subprocess` and CLI alike.
 #[global_allocator]
-static ALLOC: oom_exit::OomExitAlloc = oom_exit::OomExitAlloc;
+static ALLOC: allocator::LimitedAllocator = allocator::LimitedAllocator;
 
 /// ANSI escape code for dim/gray text.
 const DIM: &str = "\x1b[2m";
@@ -95,14 +95,7 @@ enum Command {
     /// Run as a protocol child: read framed protobuf requests on stdin and
     /// write framed events on stdout (see the monty-proto crate). Intended to
     /// be driven by a parent process such as monty-pool, not by hand.
-    Subprocess {
-        /// Hard ceiling in bytes on this process's live allocations, armed
-        /// before any request is served; a breach kills the worker, backstopping
-        /// the sandbox's own `max_memory`. Counts what the process asked the
-        /// allocator for, so leave headroom for the worker's own footprint.
-        #[arg(long)]
-        hard_memory_limit: Option<u64>,
-    },
+    Subprocess,
 }
 
 impl Cli {
@@ -170,14 +163,10 @@ const EXT_FUNCTIONS: bool = false;
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Some(Command::Subprocess { hard_memory_limit }) = cli.subcommand {
+    if let Some(Command::Subprocess) = cli.subcommand {
         if let Some(flag) = cli.subprocess_conflict() {
             eprintln!("{BOLD_RED}error{RESET}: `subprocess` cannot be combined with {flag}");
             return ExitCode::FAILURE;
-        }
-        // Armed before serving anything, so no request can run uncapped.
-        if let Some(bytes) = hard_memory_limit {
-            oom_exit::set_limit(bytes);
         }
         return subprocess::run();
     }

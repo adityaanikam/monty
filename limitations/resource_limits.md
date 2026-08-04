@@ -41,13 +41,14 @@ subprocess and WebAssembly runtimes do.
 ## Hard memory ceiling (worker pools)
 
 `max_memory` is enforced by the interpreter's own tracker, so it only bounds
-allocations the interpreter remembers to account for. Hosts that spawn worker
-subprocesses can set a second, independent ceiling below the interpreter —
-`PoolConfig::worker_hard_memory_limit` in Rust,
-`Monty(worker_hard_memory_limit=...)` in Python, `workerHardMemoryLimit` in
-JavaScript — which the worker enforces in its own global allocator, counting
-live bytes, before serving any request. Divergences from every other limit
-documented here:
+allocations the interpreter remembers to account for. A worker subprocess
+therefore backstops it with a second ceiling below the interpreter, enforced in
+its own global allocator by counting live bytes. There is nothing to configure:
+setting `max_memory` on a session arms it, and the ceiling is
+`5 × max_memory`, plus what the worker had already allocated when the session
+was configured, plus fixed headroom (4 MiB, or 32 MiB when type checking) for
+machinery no `max_memory` covers. A session with no `max_memory` gets no
+ceiling. Divergences from every other limit documented here:
 
 - **It kills the worker, though it still reports `MemoryError`.** A breach fails
   an allocation the interpreter cannot handle, so the worker exits mid-turn. The
@@ -66,20 +67,32 @@ documented here:
   same `MemoryError`).
 - **It counts requested bytes, not resident ones.** Per-allocation overhead and
   fragmentation sit between the count and the process's real footprint, so RSS
-  runs somewhat above the ceiling. It must also sit above the `max_memory` budget
-  it backstops by the worker's own heap (see the README for the headroom to add,
-  and `scripts/hard_memory_sweep.py` to measure it for a given build). Too tight
-  a ceiling kills healthy workers, most likely on the first type-checked feed
-  (typeshed and salsa caches load then).
-- **Per process, not per session.** The ceiling is fixed at pool creation and
-  never re-derived, so a recycled worker's ceiling still covers whatever residue
-  earlier sessions left behind.
-- **Armed once, never lifted.** The ceiling is set before the worker serves
-  anything and nothing in the process can raise it afterwards. A ceiling below
-  what the worker has already allocated is refused at once, rather than becoming
-  an arbitrary allocation failing mid-turn.
-- Only the subprocess transport applies it: WebSocket workers are remote
-  processes this pool does not spawn/
+  runs somewhat above the ceiling.
+- **Nothing the interpreter allocates can reach it.** The multiple covers what
+  the tracker undercounts — the per-object arena slot, `Vec`/`HashMap` capacity
+  slack, allocator rounding — which is worst (~3.8×) for the smallest objects.
+  A tracked allocation therefore raises the in-sandbox `MemoryError` at
+  `max_memory` first, five times lower, leaving the worker alive; the ceiling
+  only fires for allocations outside the tracker's view.
+- **`max_memory` alone does not bound worker memory.** A tiny budget still
+  leaves the worker the fixed headroom above, which is deliberately generous:
+  too tight a ceiling kills healthy workers, most often on the first
+  type-checked feed (typeshed and salsa caches load then). Use `max_processes`
+  and an OS-level limit to bound a host, not this.
+- **Per session, and it moves with the baseline.** A worker serves many
+  checkouts; each `Configure` re-derives the ceiling from that session's budget
+  and from the bytes then live, so a worker carrying residue from earlier
+  sessions gets a correspondingly higher ceiling rather than an unservable one.
+- **A restored dump can disagree with its ceiling.** `load_session` /
+  `load_snapshot` restore the dump's own limits and ignore the `checkout()`
+  ones (see `limitations/pool-architecture.md`), but the ceiling is derived from
+  the checkout's. Restoring a dump whose `max_memory` is larger than the
+  checkout's therefore reinstates the ordering above the wrong way round: the
+  session can breach the ceiling before its tracker fires. Pass the dump's
+  budget to `checkout()` as well when restoring.
+- Only worker subprocesses apply it: WebSocket workers are remote processes this
+  pool does not spawn, and the wasm worker (a module, not a binary) declares no
+  allocator of its own.
 
 Independently of any ceiling, **any** allocation a worker's allocator refuses —
 plain host OOM, or a request beyond the usable address space such as

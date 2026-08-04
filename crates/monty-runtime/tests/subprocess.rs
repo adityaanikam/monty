@@ -21,26 +21,21 @@ struct ChildProc {
 }
 
 impl ChildProc {
+    /// Spawns the child with its stderr inherited, so diagnostics show up in
+    /// the test output.
     fn spawn() -> Self {
-        Self::spawn_with_args(&[])
-    }
-
-    /// Spawns the child with extra `subprocess` flags appended, leaving its
-    /// stderr inherited so diagnostics show up in the test output.
-    fn spawn_with_args(args: &[&str]) -> Self {
-        Self::spawn_with(args, Stdio::inherit())
+        Self::spawn_with(Stdio::inherit())
     }
 
     /// Spawns the child with its stderr captured, for tests asserting on the
     /// diagnostics it prints before dying (see [`Self::reap_with_stderr`]).
-    fn spawn_stderr_piped(args: &[&str]) -> Self {
-        Self::spawn_with(args, Stdio::piped())
+    fn spawn_stderr_piped() -> Self {
+        Self::spawn_with(Stdio::piped())
     }
 
-    fn spawn_with(args: &[&str], stderr: Stdio) -> Self {
+    fn spawn_with(stderr: Stdio) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_monty"))
             .arg("subprocess")
-            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -403,12 +398,14 @@ fn child_enforces_time_limit() {
     child.shutdown();
 }
 
-/// A ceiling generous enough for the interpreter must be invisible: it is a
-/// backstop, not a second sandbox budget.
+/// The ceiling a session's `max_memory` derives must be invisible to it: it is
+/// a backstop for what the sandbox tracker cannot see, not a second budget. The
+/// budget here is deliberately tiny — the headroom, not the multiple, is what
+/// keeps a small budget servable.
 #[test]
-fn hard_memory_limit_leaves_normal_work_alone() {
-    let mut child = ChildProc::spawn_with_args(&["--hard-memory-limit", "2147483648"]); // 2 GiB
-    child.create_repl();
+fn derived_memory_ceiling_leaves_normal_work_alone() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024));
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
 }
@@ -421,7 +418,7 @@ fn hard_memory_limit_leaves_normal_work_alone() {
 /// deterministic, and no page is ever touched.
 #[test]
 fn refused_allocation_exits_with_the_oom_code() {
-    let mut child = ChildProc::spawn_stderr_piped(&[]);
+    let mut child = ChildProc::spawn_stderr_piped();
     child.create_repl();
     // no `max_memory`, so the sandbox tracker permits this outright
     child.feed_expecting_death("x = ' ' * (1 << 60)");
@@ -434,21 +431,45 @@ fn refused_allocation_exits_with_the_oom_code() {
 }
 
 /// The point of the ceiling: an allocation the sandbox's `ResourceTracker`
-/// waves through (no `max_memory` here, and `str.repeat` allocates through
-/// infallible `String` growth) must kill the process instead of growing host
-/// memory without bound. Same exit code — the ceiling only changes *where* the
-/// allocator starts refusing.
+/// never sees must kill the process instead of growing host memory without
+/// bound. Nothing the *interpreter* allocates can reach it (a tracked
+/// allocation hits `max_memory` first, five times lower), so the breach here
+/// comes from the frame reader — a bare length prefix, under the wire cap and
+/// over the ceiling, buys a 200 MiB buffer with four bytes. Same exit code as a
+/// refused allocation; the ceiling only changes *where* refusal starts.
 #[test]
-fn hard_memory_breach_exits_with_the_oom_code() {
-    let mut child = ChildProc::spawn_stderr_piped(&["--hard-memory-limit", "1073741824"]); // 1 GiB
-    child.create_repl();
-    child.feed_expecting_death("x = ' ' * (4 * 1024 * 1024 * 1024)");
+fn memory_ceiling_breach_exits_with_the_oom_code() {
+    let mut child = ChildProc::spawn_stderr_piped();
+    child.create_repl_with(configure_with_max_memory(1024));
+    child
+        .writer
+        .write_all(&(200u32 * 1024 * 1024).to_le_bytes())
+        .expect("failed to write length prefix");
+    match child.reader.read::<pb::ChildEvent>() {
+        Ok(None) | Err(_) => {}
+        Ok(Some(event)) => panic!("expected the child to die, got {:?}", event.kind),
+    }
     let (status, stderr) = child.reap_with_stderr();
     assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
     assert!(
-        stderr.contains("allocation of 4294967296 bytes exceeds the memory ceiling"),
+        stderr.contains("allocation of 209715200 bytes exceeds the memory ceiling"),
         "{stderr}"
     );
+}
+
+/// A `Configure` carrying `max_memory`, which is what arms the worker's ceiling.
+fn configure_with_max_memory(bytes: u64) -> pb::Configure {
+    pb::Configure {
+        script_name: "main.py".to_owned(),
+        limits: Some(pb::ResourceLimits {
+            max_memory_bytes: Some(bytes),
+            ..Default::default()
+        }),
+        type_check: false,
+        type_check_stubs: None,
+        monty_version: env!("CARGO_PKG_VERSION").to_owned(),
+        assert_message_annotations: None,
+    }
 }
 
 #[test]

@@ -106,14 +106,15 @@ properties that real CPython does not provide, per the caveat above.
   bounded, and `request_timeout` applies independently. Both deadlines fire
   between the turn's polls, so decoding one maximal reply frame (~1s worst
   case) can delay enforcement by that long.
-- **`max_memory` can be backstopped by a hard memory ceiling.**
-  `worker_hard_memory_limit` / `workerHardMemoryLimit` at pool creation caps the
-  live bytes each worker's allocator will hand out. Off by default. Ignored by
-  the WebSocket transport (whose exit codes do not travel, so a remote breach
-  degrades to `Disconnected`). It is the only worker configuration the parent
-  passes outside the protocol, as a `subprocess` CLI flag. The exit code borrows
+- **`max_memory` is backstopped by a hard memory ceiling.** A session's
+  `max_memory` also caps the live bytes its worker's allocator will hand out
+  (with a multiple and headroom on top — see `limitations/resource_limits.md`);
+  a session without one gets no ceiling. The worker derives it from the
+  `Configure` it is sent, so nothing travels outside the protocol. Ignored by the
+  WebSocket transport (whose exit codes do not travel, so a remote breach
+  degrades to `Disconnected`). The exit code borrows
   [`sysexits.h`](https://man.freebsd.org/sysexits) so a bare status is legible in
-  a log. See `limitations/resource_limits.md`.
+  a log.
 - **A refused allocation is the one `MemoryError` that kills the session.** The
   worker's allocator exits 65 (`EX_DATAERR` — the fed snippet asked for more than
   it may have) rather than letting Rust abort (`SIGABRT`, which a stack overflow

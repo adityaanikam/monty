@@ -236,23 +236,20 @@ let result = runner2.run(vec![MontyObject::Int(41)], ResourceTracker::default(),
 assert_eq!(result, MontyObject::Int(42));
 ```
 
-## Configuring the hard memory limit
+## The hard memory ceiling
 
-`worker_hard_memory_limit` (`workerHardMemoryLimit` in JavaScript,
-`PoolConfig::worker_hard_memory_limit` in Rust) is a hard ceiling on the live
-bytes each worker's allocator will hand out, backstopping the in-sandbox
-`max_memory` for allocations its tracker never sees. A breach kills the worker
-with a `MemoryError` — losing that session, though the pool replaces the worker —
-rather than letting it grow until the OS OOM killer picks a victim.
+Setting `max_memory` on a session also arms a hard ceiling in the worker's own
+allocator, backstopping the in-sandbox limit for allocations the interpreter's
+tracker never sees. A breach kills the worker with a `MemoryError` — losing that
+session, though the pool replaces the worker — rather than letting it grow until
+the OS OOM killer picks a victim.
 
-Set it to **`max_memory` + 4MB**, or **+ 16MB if you use type checking**. The same
-numbers are roughly the floor: below them no worker gets far, whatever
-`max_memory` says.
-
-Those are rounded up from what a worker's own heap really costs — about 1 MiB, or
-10 MiB once typeshed and salsa load — so the interpreter can grow without anyone
-having to revisit their configuration. `scripts/hard_memory_sweep.py` in the
-repository root measures the numbers for a given build in a few seconds.
+There is nothing to configure. The ceiling sits at `5 × max_memory` above what
+the worker had already allocated, plus a few MiB of headroom (more when type
+checking) for the worker's own machinery. Nothing the interpreter allocates can
+reach it: the multiple covers what the tracker undercounts, so a tracked
+allocation raises `MemoryError` at `max_memory` first, leaving the worker alive.
+See [`limitations/resource_limits.md`](limitations/resource_limits.md).
 
 ## PydanticAI Integration
 

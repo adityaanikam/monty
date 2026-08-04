@@ -122,11 +122,11 @@ def test_request_timeout_kills_hung_worker():
             assert session.feed_run('2 + 2') == snapshot(4)
 
 
-def test_worker_hard_memory_limit_leaves_normal_work_alone():
-    # a ceiling generous enough for the interpreter is invisible; it backstops
-    # the sandbox `limits`, it is not a second budget
-    with Monty(worker_hard_memory_limit=2 * 1024**3) as pool:
-        with pool.checkout() as session:
+def test_ceiling_derived_from_max_memory_leaves_normal_work_alone():
+    # a session with a budget gets a worker ceiling derived from it; that
+    # ceiling backstops the sandbox `limits`, it is not a second budget
+    with Monty() as pool:
+        with pool.checkout(limits={'max_memory': 1024**2}) as session:
             assert session.feed_run('1 + 1') == snapshot(2)
 
 
@@ -144,17 +144,6 @@ def test_refused_allocation_raises_memory_error():
             assert isinstance(exc_info.value.exception(), MemoryError)
         # unlike an in-sandbox exception this took the worker with it, but the
         # pool replaces it for the next checkout
-        with pool.checkout() as session:
-            assert session.feed_run('1 + 1') == snapshot(2)
-
-
-def test_worker_hard_memory_breach_raises_memory_error():
-    # the ceiling only changes where allocations start being refused
-    with Monty(worker_hard_memory_limit=1024**3) as pool:
-        with pool.checkout() as session:
-            with pytest.raises(MontyRuntimeError) as exc_info:
-                session.feed_run("x = ' ' * (4 * 1024 * 1024 * 1024)")
-            assert isinstance(exc_info.value.exception(), MemoryError)
         with pool.checkout() as session:
             assert session.feed_run('1 + 1') == snapshot(2)
 

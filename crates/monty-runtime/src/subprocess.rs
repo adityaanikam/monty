@@ -21,6 +21,8 @@ use monty_proto::{
     write_frame,
 };
 
+use crate::allocator;
+
 /// BSD `sysexits.h` "remote error in protocol" — the frame stream desynchronized, or
 /// an event too large to frame left the response unsendable.
 const EX_PROTOCOL: u8 = 76;
@@ -34,26 +36,29 @@ pub(crate) fn run() -> ExitCode {
 
     loop {
         match reader.read::<pb::ParentRequest>() {
-            Ok(Some(request)) => match child.handle(request, &mut sink) {
-                Ok(HandleOutcome::Continue) => {}
-                Ok(HandleOutcome::Shutdown) => return ExitCode::SUCCESS,
-                // the child emitted a FatalError (e.g. version skew) and cannot
-                // keep serving — exit non-zero so the parent sees a clean cause
-                Ok(HandleOutcome::Fatal) => return ExitCode::from(4),
-                // an oversize event was rejected before any bytes hit the
-                // wire, so the stream is still in sync and the parent can
-                // receive a parseable last gasp
-                Err(FrameError::FrameTooLarge { len, max }) => {
-                    fatal(
-                        &child,
-                        &mut sink,
-                        &format!("response frame of {len} bytes exceeds maximum of {max} bytes"),
-                    );
-                    return ExitCode::from(EX_PROTOCOL);
+            Ok(Some(request)) => {
+                arm_memory_ceiling(&request);
+                match child.handle(request, &mut sink) {
+                    Ok(HandleOutcome::Continue) => {}
+                    Ok(HandleOutcome::Shutdown) => return ExitCode::SUCCESS,
+                    // the child emitted a FatalError (e.g. version skew) and cannot
+                    // keep serving — exit non-zero so the parent sees a clean cause
+                    Ok(HandleOutcome::Fatal) => return ExitCode::from(4),
+                    // an oversize event was rejected before any bytes hit the
+                    // wire, so the stream is still in sync and the parent can
+                    // receive a parseable last gasp
+                    Err(FrameError::FrameTooLarge { len, max }) => {
+                        fatal(
+                            &child,
+                            &mut sink,
+                            &format!("response frame of {len} bytes exceeds maximum of {max} bytes"),
+                        );
+                        return ExitCode::from(EX_PROTOCOL);
+                    }
+                    // writing to stdout failed: the parent is gone, nothing left to do
+                    Err(_) => return ExitCode::from(3),
                 }
-                // writing to stdout failed: the parent is gone, nothing left to do
-                Err(_) => return ExitCode::from(3),
-            },
+            }
             // clean EOF at a frame boundary: the parent closed stdin
             Ok(None) => return ExitCode::SUCCESS,
             // the frame arrived intact but its payload didn't decode — this
@@ -74,6 +79,20 @@ pub(crate) fn run() -> ExitCode {
                 return ExitCode::from(EX_PROTOCOL);
             }
         }
+    }
+}
+
+/// Derives the allocator's memory ceiling from each session's sandbox limits.
+///
+/// Lives in the shell rather than in [`Child`] because only a binary may own a
+/// global allocator — the same state machine also drives the wasm worker, which
+/// has none. `Configure` is the first request of every checkout, so the ceiling
+/// is armed before the session runs anything, and re-derived for the next
+/// session on a reused worker.
+fn arm_memory_ceiling(request: &pb::ParentRequest) {
+    if let Some(pb::parent_request::Kind::Configure(configure)) = &request.kind {
+        let max_memory = configure.limits.as_ref().and_then(|limits| limits.max_memory_bytes);
+        allocator::arm_ceiling(max_memory, configure.type_check);
     }
 }
 

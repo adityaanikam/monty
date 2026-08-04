@@ -61,12 +61,12 @@ test('maxCheckoutsPerWorker recycles the worker', async (ctx) => {
   await second.close()
 })
 
-test('workerHardMemoryLimit leaves normal work alone', async (ctx) => {
+test('the ceiling derived from maxMemory leaves normal work alone', async (ctx) => {
   skipIfBrowser(ctx)
-  // a ceiling generous enough for the interpreter is invisible; it backstops
-  // the in-sandbox limits rather than acting as a second budget
-  await using pool = await Monty.create({ workerHardMemoryLimit: 2 * 1024 ** 3 })
-  const session = await pool.checkout()
+  // a session with a budget gets a worker ceiling derived from it; that ceiling
+  // backstops the in-sandbox limit rather than acting as a second budget
+  await using pool = await Monty.create()
+  const session = await pool.checkout({ limits: { maxMemory: 1024 ** 2 } })
   t.is(await session.feedRun('1 + 1'), 2)
   await session.close()
 })
@@ -79,19 +79,6 @@ test('a refused allocation raises MemoryError and the pool recovers', async (ctx
   // refused below the interpreter, killing the worker but still reporting
   // MemoryError rather than an unclassifiable crash
   const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (1 << 60)"), {
-    instanceOf: MontyRuntimeError,
-  })
-  t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')
-  const next = await pool.checkout()
-  t.is(await next.feedRun('1 + 1'), 2)
-  await next.close()
-})
-
-test('workerHardMemoryLimit breach raises MemoryError', async (ctx) => {
-  skipIfBrowser(ctx)
-  await using pool = await Monty.create({ workerHardMemoryLimit: 1024 ** 3 })
-  const session = await pool.checkout()
-  const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (4 * 1024 * 1024 * 1024)"), {
     instanceOf: MontyRuntimeError,
   })
   t.is(error.message, 'MemoryError: the worker exceeded its memory ceiling and was terminated')

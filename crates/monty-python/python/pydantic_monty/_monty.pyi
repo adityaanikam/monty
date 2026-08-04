@@ -376,7 +376,6 @@ class Monty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
-        worker_hard_memory_limit: int | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `with`.
@@ -395,12 +394,6 @@ class Monty:
                 exceeds it is killed and the call raises `MontyCrashedError`
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
-            worker_hard_memory_limit: Hard ceiling in bytes on each worker
-                process's live allocations. A breach raises `MontyRuntimeError`
-                wrapping `MemoryError`, but takes the worker (and so the
-                session) with it. The worker enforces it in its own allocator,
-                so leave headroom above `limits['max_memory']` for the worker's
-                own footprint.
         """
 
     def __enter__(self) -> Self: ...
@@ -664,7 +657,6 @@ class AsyncMonty:
         checkout_timeout: float | None = None,
         request_timeout: float | None = None,
         max_checkouts_per_worker: int | None = None,
-        worker_hard_memory_limit: int | None = None,
     ) -> Self:
         """
         Configure a worker pool; the workers are spawned by `async with`.

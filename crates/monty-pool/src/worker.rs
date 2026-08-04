@@ -81,7 +81,7 @@ struct WebSocketWorker {
 impl Worker {
     pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
         match &config.transport {
-            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path, config.worker_hard_memory_limit),
+            MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path),
             // Bound the dial by `request_timeout` (see `websocket`); a missing
             // one falls back to a generous fixed budget.
             MontyTransport::Websocket(url) => {
@@ -94,9 +94,8 @@ impl Worker {
     ///
     /// There is no spawn-time handshake: a wrong or broken binary surfaces as
     /// an error on the first request the worker serves (typically the
-    /// `Configure` of its first checkout). That includes a child that refuses to
-    /// start because it could not apply `hard_memory_limit`.
-    fn subprocess(binary_path: &PathBuf, hard_memory_limit: Option<u64>) -> Result<Self, PoolError> {
+    /// `Configure` of its first checkout).
+    fn subprocess(binary_path: &PathBuf) -> Result<Self, PoolError> {
         let mut command = Command::new(binary_path);
         command
             .arg("subprocess")
@@ -107,11 +106,6 @@ impl Worker {
             // the pool must never leak a live sandbox: an abandoned handle
             // kills the child even when no explicit teardown ran
             .kill_on_drop(true);
-        // The child arms the ceiling in its own allocator, so it travels as a
-        // flag rather than as anything the parent could set on its behalf.
-        if let Some(bytes) = hard_memory_limit {
-            command.arg("--hard-memory-limit").arg(bytes.to_string());
-        }
         // Windows processes misbehave without SystemRoot (CRT and WinAPI
         // lookups); it names the OS install directory and is not sensitive.
         if cfg!(windows)

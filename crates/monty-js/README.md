@@ -317,17 +317,16 @@ const pool = await Monty.create({
   requestTimeout: 30, // hard per-turn deadline (seconds)
   durationLimitGrace: 1, // maxDurationSecs backstop grace (seconds, null disables)
   maxCheckoutsPerWorker: 100, // recycle workers after this many sessions
-  workerHardMemoryLimit: 2 * 1024 ** 3, // hard per-worker memory ceiling
   binaryPath: '/path/to/monty', // explicit binary (default: auto-resolved)
 })
 ```
 
-`workerHardMemoryLimit` backstops the in-sandbox `maxMemory` limit instead of
-letting the worker grow the host without bound. It caps the worker's live
-allocations, so leave headroom above `maxMemory` for the worker's own footprint.
-A breach raises `MontyRuntimeError` wrapping
-`MemoryError` — but unlike other runtime errors it takes the worker with it, so
-the session is finished (the pool recovers).
+A session's `maxMemory` also arms a hard ceiling in the worker's own allocator
+(several times the budget, plus headroom), backstopping the in-sandbox limit for
+allocations its tracker never sees instead of letting the worker grow the host
+without bound. A breach raises `MontyRuntimeError` wrapping `MemoryError` — but
+unlike other runtime errors it takes the worker with it, so the session is
+finished (the pool recovers).
 
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo
