@@ -342,8 +342,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
         Ok(CmpOrder::Ordered(self.get(vm.heap).0.cmp(&other.get(vm.heap).0)))
     }
 
-    fn py_bool(&self, vm: &mut VM<'h>) -> bool {
-        !self.get(vm.heap).0.is_empty()
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(!self.get(vm.heap).0.is_empty())
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
@@ -1523,9 +1523,9 @@ fn parse_bytes_splitlines_args(args: ArgValues, vm: &mut VM<'_>) -> RunResult<bo
     let result = match keepends {
         None => false,
         Some(v) => {
-            let r = v.py_bool(vm);
+            let result = v.py_bool(vm);
             v.drop_with(vm.heap);
-            r
+            result?
         }
     };
     Ok(result)

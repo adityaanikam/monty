@@ -51,6 +51,24 @@ assert Point(1, 2) != Point(1, 3)
 assert not (Point(1, 2) == Point(2, 1)), 'field order matters'
 
 
+# Python 3.14 generates direct field comparisons rather than tuple comparison.
+# Tuple comparison accepts identical elements before calling `__eq__`, while two
+# distinct dataclass instances still invoke their shared field's `__eq__`.
+class NeverEqual:
+    def __eq__(self, other: object) -> bool:
+        return False
+
+
+@dataclass
+class IdentityField:
+    value: object
+
+
+shared_never_equal = NeverEqual()
+assert (shared_never_equal,) == (shared_never_equal,)
+assert (IdentityField(shared_never_equal) == IdentityField(shared_never_equal)) is False
+
+
 # === Equality across types / non-dataclasses is False ===
 assert Point(1, 2) != Other(1, 2)
 assert Point(1, 2) != (1, 2)
@@ -143,6 +161,62 @@ right = Node(None)
 left.x = right
 right.x = left
 assert repr(left) == 'Node(x=Node(x=...))'
+
+# Comparing two *distinct* cyclic dataclasses re-enters the field walk once per
+# level; CPython raises RecursionError, and Monty must bound it rather than
+# overflowing the host stack. Only the type is asserted, never the message:
+# CPython picks between its depth counter ('maximum recursion depth exceeded')
+# and its C-stack guard ('Stack overflow (used N kB) in comparison') by platform.
+cyc_a = Node(None)
+cyc_b = Node(None)
+cyc_a.x = cyc_a
+cyc_b.x = cyc_b
+try:
+    cyc_a == cyc_b
+    assert False, 'expected RecursionError from cyclic dataclass equality'
+except RecursionError:
+    pass
+# Mutually cyclic dataclasses recurse the same way.
+try:
+    left == cyc_a
+    assert False, 'expected RecursionError from mutually cyclic dataclasses'
+except RecursionError:
+    pass
+# A cycle reached through a container recurses through that container's guard,
+# whichever container it is.
+box_a = Node(None)
+box_b = Node(None)
+box_a.x = [box_a]
+box_b.x = [box_b]
+try:
+    box_a == box_b
+    assert False, 'expected RecursionError from a cycle through a list field'
+except RecursionError:
+    pass
+
+dict_a = Node(None)
+dict_b = Node(None)
+dict_a.x = {'k': dict_a}
+dict_b.x = {'k': dict_b}
+try:
+    dict_a == dict_b
+    assert False, 'expected RecursionError from a cycle through a dict field'
+except RecursionError:
+    pass
+
+tuple_a = Node(None)
+tuple_b = Node(None)
+tuple_a.x = (tuple_a,)
+tuple_b.x = (tuple_b,)
+try:
+    tuple_a == tuple_b
+    assert False, 'expected RecursionError from a cycle through a tuple field'
+except RecursionError:
+    pass
+# The identity shortcut still resolves a cyclic dataclass against itself.
+assert cyc_a == cyc_a
+# The guard releases its level on the way out, so later comparisons still run.
+assert Node(1) == Node(1)
 
 # The comparison chain short-circuits, so an earlier unequal field is reported
 # before the uninitialized one is ever read; and identity wins outright, since

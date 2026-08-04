@@ -11,7 +11,7 @@ const MAGIC: &[u8; 6] = b"MONTY\0";
 ///
 /// Bump this whenever a serialized discriminant can shift, so older dumps are
 /// rejected instead of decoding as their neighbour.
-pub(crate) const VERSION: u16 = 2;
+pub(crate) const VERSION: u16 = 3;
 
 /// Number of bytes before the postcard payload.
 const HEADER_LEN: usize = MAGIC.len() + size_of::<u16>() + size_of::<u8>();
@@ -75,12 +75,12 @@ mod tests {
     fn serialized_components_match_dump_version() {
         assert_eq!(
             opcode_fingerprint(),
-            0xb1a3_02e5_6343_c49f,
+            0x0d57_34dd_be07_19ac,
             "opcodes changed for dump version {VERSION}"
         );
         assert_eq!(
             static_strings_fingerprint(),
-            0xe5b3_ea21_91a5_e7a8,
+            0x239c_c721_30be_eba3,
             "static strings changed for dump version {VERSION}"
         );
         assert_eq!(
