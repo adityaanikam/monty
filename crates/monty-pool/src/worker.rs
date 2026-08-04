@@ -107,8 +107,8 @@ impl Worker {
             // the pool must never leak a live sandbox: an abandoned handle
             // kills the child even when no explicit teardown ran
             .kill_on_drop(true);
-        // The child applies the ceiling to itself: `setrlimit` is inherited
-        // across exec, so a pre-exec hook would need unsafe code for no gain.
+        // The child arms the ceiling in its own allocator, so it travels as a
+        // flag rather than as anything the parent could set on its behalf.
         if let Some(bytes) = hard_memory_limit {
             command.arg("--hard-memory-limit").arg(bytes.to_string());
         }

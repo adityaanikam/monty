@@ -1029,29 +1029,6 @@ impl Checkout {
             PoolError::Disconnected {
                 context: context.to_owned(),
             }
-        } else if self.pool.config.worker_hard_memory_limit.is_some()
-            && status.and_then(|status| status.code()) == Some(monty_proto::LIMIT_UNAVAILABLE_EXIT_CODE)
-        {
-            // The worker was told to cap its memory and could not, so it declined
-            // to serve; its own account beats "it vanished". Only trusted when a
-            // ceiling was actually configured: blaming a limit nobody asked for
-            // would send the reader hunting for a setting that is not set, and
-            // nothing stops another binary from returning this code. A subprocess
-            // worker runs on this host, so `cfg!` distinguishes the two causes:
-            // on Linux the rlimit exists and something else (a seccomp filter, a
-            // container policy) refused it, which is a configuration failure, not
-            // a missing platform feature.
-            let reason = if cfg!(target_os = "linux") {
-                "Hard memory limit could not be applied, see the worker's stderr"
-            } else {
-                "Hard memory limit is invalid on this platform, requires Linux"
-            };
-            PoolError::Crashed {
-                status,
-                cause: CrashCause::Announced {
-                    reason: reason.to_owned(),
-                },
-            }
         } else if status.and_then(|status| status.code()) == Some(monty_proto::OOM_EXIT_CODE) {
             // the worker is gone, unlike every other `Runtime` error — the
             // checkout is already finished, so later calls report `Finished`

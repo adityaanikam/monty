@@ -45,15 +45,12 @@ export interface MontyOptions {
   /** Recycle a worker (kill and replace) after serving this many sessions. */
   maxCheckoutsPerWorker?: number
   /**
-   * Hard memory ceiling in bytes for each worker process, set as `RLIMIT_AS`,
+   * Hard ceiling in bytes on each worker process's live allocations,
    * backstopping the in-sandbox `maxMemory`: an allocation its tracker never saw
    * is refused, raising `MontyRuntimeError`/`MemoryError` and taking the worker
    * (and its session) with it, instead of growing the host until the OS OOM
-   * killer intervenes. `RLIMIT_AS` bounds virtual address space, so leave
-   * headroom. **Linux only**, and fatal elsewhere: rather than run a worker you
-   * believe is capped, the worker exits and the session fails with a crash
-   * naming the reason — so setting this on macOS or Windows yields no usable
-   * workers.
+   * killer intervenes. The worker enforces it in its own allocator, so leave
+   * headroom above `maxMemory` for the worker's own footprint.
    */
   workerHardMemoryLimit?: number
 }

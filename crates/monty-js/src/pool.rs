@@ -98,8 +98,8 @@ pub struct NativePoolOptions {
     pub duration_limit_grace_ms: Option<f64>,
     /// Recycle a worker after serving this many checkouts.
     pub max_checkouts_per_worker: Option<u32>,
-    /// Linux-only hard memory ceiling in bytes for each worker, set as
-    /// `RLIMIT_AS`. A breach kills the worker and reports `MemoryError`.
+    /// Hard ceiling in bytes on each worker's live allocations. A breach kills
+    /// the worker and reports `MemoryError`.
     pub worker_hard_memory_limit: Option<f64>,
 }
 

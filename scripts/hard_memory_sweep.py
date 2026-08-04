@@ -1,17 +1,17 @@
 """
 Measure what `worker_hard_memory_limit` actually costs, to derive guidance.
 
-The ceiling is `RLIMIT_AS`, so it bounds *virtual* address space: the worker's
-own mappings, allocator arenas, thread stacks and (with type checking) typeshed
-plus salsa all count against it. That makes the usable floor a property of the
-build and the machine, not something we can state once in a doc — hence this
-sweep. Run it on Linux; elsewhere the ceiling cannot be applied at all.
+The ceiling counts live allocated bytes, so the floor is whatever heap the
+worker itself holds — the session machinery, and (with type checking) typeshed
+plus salsa. That is far steadier than it was under `RLIMIT_AS`, where the
+binary's own mapped text and every thread stack counted too, but it is still
+measured per build rather than asserted — hence this sweep.
 
     make dev-py && uv run scripts/hard_memory_sweep.py
 
 Thresholds are bisected, so this spawns a few hundred workers over a few minutes.
-Lines like `monty worker: allocation of N bytes failed` are the worker's own
-stderr, which the pool inherits — expected here, not an error. Output is
+Lines like `monty worker: allocation of N bytes exceeds the memory ceiling` are
+the worker's own stderr, which the pool inherits — expected here, not an error. Output is
 deliberately narrow, for pasting back into an issue or PR.
 """
 
@@ -74,10 +74,6 @@ def classify(exc: BaseException) -> Outcome:
         return Outcome(SOFT, message)
     if 'exceeded its memory ceiling' in message:
         return Outcome(HARD, message)
-    # the pool words this two ways: unsupported off Linux, refused (seccomp, a
-    # container policy) on it — both mean the worker declined to serve
-    if 'Hard memory limit' in message:
-        return Outcome(NO_START, message)
     return Outcome(OTHER, f'{type(exc).__name__}: {message}')
 
 
@@ -133,18 +129,22 @@ def fill() -> str:
     Sequence repeat is *pre-checked* against the tracker above 100 KB, so one
     huge `' ' * n` never reaches the allocator once `max_memory` is set and would
     measure nothing about the ceiling. Pieces under that threshold take the
-    ordinary tracked path, so allocator cost (capacity slack, arenas,
-    fragmentation) lands against `RLIMIT_AS` as a real workload's would.
+    ordinary tracked path, so the gap between tracked bytes and allocated ones
+    (capacity slack, per-object overhead) lands against the ceiling as a real
+    workload's would.
     """
     return "xs = []\nwhile True:\n    xs.append(' ' * (64 * 1024))"
 
 
 def worker_vm(type_check: bool) -> str:
-    """Reads the worker's own VA/RSS from /proc, the number the floor comes from.
+    """Reads the worker's own VA/RSS from /proc, for context on the floor below.
 
-    Measured with no ceiling, after one feed, so it reflects a worker that has
-    done real work — and with `type_check` it includes typeshed and salsa.
+    The ceiling counts requested bytes while these count mapped and resident
+    pages, so they never match exactly — allocator overhead, fragmentation and
+    the binary's own image sit between them. Linux only, since it reads /proc.
     """
+    if sys.platform != 'linux':
+        return 'unavailable: needs /proc'
     with Monty() as pool:
         with pool.checkout(type_check=type_check) as session:
             session.feed_run('x: int = 1' if type_check else '1 + 1')
@@ -187,7 +187,7 @@ def bisect_min(works: Callable[[int], bool]) -> int | None:
 
 
 def probe_baseline() -> None:
-    """What a worker actually occupies — the source of any floor guidance."""
+    """What a worker actually occupies, for context on the measured floor."""
     print('== worker footprint (no ceiling) ==')
     for type_check in TYPE_CHECK_MODES:
         label = 'type_check=True ' if type_check else 'type_check=False'
@@ -199,8 +199,8 @@ def probe_floor() -> None:
     """The smallest ceiling under which a worker can serve a trivial feed at all.
 
     This is the number below which the knob yields no usable workers, whatever
-    `max_memory` says — it is the worker's own address space, nothing to do with
-    the sandbox budget.
+    `max_memory` says — it is the worker's own heap, nothing to do with the
+    sandbox budget.
     """
     print('== floor: smallest ceiling that serves a trivial feed ==')
     for type_check in TYPE_CHECK_MODES:
@@ -241,8 +241,8 @@ def probe_headroom() -> None:
 def probe_ceiling_per_alloc() -> None:
     """Smallest ceiling that survives a single allocation of N MiB, no `max_memory`.
 
-    With no budget the tracker never intervenes, so this isolates the kernel's
-    boundary: the result should be roughly the worker's own address space plus N,
+    With no budget the tracker never intervenes, so this isolates the allocator's
+    boundary: the result should be roughly the worker's own heap plus N,
     which is what makes the guidance a sum rather than a percentage.
     """
     for type_check in TYPE_CHECK_MODES:
@@ -262,19 +262,15 @@ def probe_ceiling_per_alloc() -> None:
 def main() -> int:
     print(f'platform    {platform.platform()}')
     print(f'python      {sys.version.split()[0]}')
-    print(f'cpus        {os.cpu_count()} (rayon thread stacks count toward RLIMIT_AS)')
-    # the binary's own mapped text dominates the floor, so a debug build (tens of
-    # MiB larger) shifts every threshold below — always report which one ran
+    print(f'cpus        {os.cpu_count()}')
+    # a debug build allocates differently (and type-checks far more slowly), so
+    # always report which binary produced the numbers
     try:
         binary = find_monty_binary()
         print(f'binary      {binary} ({os.path.getsize(binary) / MIB:.0f} MiB)')
     except Exception as exc:
         print(f'binary      unresolved: {exc}')
     print()
-    if sys.platform != 'linux':
-        print('This sweep needs Linux: RLIMIT_AS cannot be set elsewhere, so every')
-        print('cell would report `no-start`. Run it in a Linux container or codespace.')
-        return 1
 
     started = time.monotonic()
     probe_baseline()

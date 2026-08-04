@@ -395,15 +395,12 @@ class Monty:
                 exceeds it is killed and the call raises `MontyCrashedError`
                 with `timed_out=True`. Backstops the sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
-            worker_hard_memory_limit: Hard memory ceiling in bytes for each
-                worker process, set as `RLIMIT_AS`. A breach raises
-                `MontyRuntimeError` wrapping `MemoryError`, but takes the worker
-                (and so the session) with it. `RLIMIT_AS` bounds *virtual*
-                address space, so leave headroom above `limits['max_memory']`.
-                Linux only, and fatal elsewhere: rather than run a worker you
-                believe is capped, the worker exits and the session raises
-                `MontyCrashedError`, so setting this on macOS or Windows yields
-                no usable workers.
+            worker_hard_memory_limit: Hard ceiling in bytes on each worker
+                process's live allocations. A breach raises `MontyRuntimeError`
+                wrapping `MemoryError`, but takes the worker (and so the
+                session) with it. The worker enforces it in its own allocator,
+                so leave headroom above `limits['max_memory']` for the worker's
+                own footprint.
         """
 
     def __enter__(self) -> Self: ...

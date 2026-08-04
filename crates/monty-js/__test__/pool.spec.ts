@@ -63,33 +63,12 @@ test('maxCheckoutsPerWorker recycles the worker', async (ctx) => {
 
 test('workerHardMemoryLimit leaves normal work alone', async (ctx) => {
   skipIfBrowser(ctx)
-  // RLIMIT_AS is only settable on Linux
-  if (process.platform !== 'linux') {
-    ctx.skip()
-  }
   // a ceiling generous enough for the interpreter is invisible; it backstops
   // the in-sandbox limits rather than acting as a second budget
   await using pool = await Monty.create({ workerHardMemoryLimit: 2 * 1024 ** 3 })
   const session = await pool.checkout()
   t.is(await session.feedRun('1 + 1'), 2)
   await session.close()
-})
-
-test('an unappliable workerHardMemoryLimit crashes rather than running uncapped', async (ctx) => {
-  skipIfBrowser(ctx)
-  if (process.platform === 'linux') {
-    ctx.skip()
-  }
-  await using pool = await Monty.create({ workerHardMemoryLimit: 2 * 1024 ** 3 })
-  // There is no spawn-time handshake, so the refusal surfaces on the first
-  // request — the `checkout()` Configure, not the feed. Checkout-time pool
-  // errors reach JS as a plain `Error` rather than `MontyCrashedError` (the
-  // typed mapping only covers turn results), so assert on the message.
-  const error = await t.throwsAsync(async () => {
-    const session = await pool.checkout()
-    await session.feedRun('1 + 1')
-  })
-  t.true(error.message.includes('Hard memory limit is invalid on this platform, requires Linux'), error.message)
 })
 
 test('a refused allocation raises MemoryError and the pool recovers', async (ctx) => {
@@ -110,10 +89,6 @@ test('a refused allocation raises MemoryError and the pool recovers', async (ctx
 
 test('workerHardMemoryLimit breach raises MemoryError', async (ctx) => {
   skipIfBrowser(ctx)
-  // RLIMIT_AS is only settable on Linux
-  if (process.platform !== 'linux') {
-    ctx.skip()
-  }
   await using pool = await Monty.create({ workerHardMemoryLimit: 1024 ** 3 })
   const session = await pool.checkout()
   const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (4 * 1024 * 1024 * 1024)"), {

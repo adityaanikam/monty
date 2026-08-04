@@ -38,15 +38,16 @@ subprocess and WebAssembly runtimes do.
 - `bigint.pow(base, exp)` estimates result size as `bits(base) * exp` with
   a 4× safety multiplier to cover repeated-squaring intermediate values.
 
-## Hard memory ceiling (worker pools, Linux only)
+## Hard memory ceiling (worker pools)
 
 `max_memory` is enforced by the interpreter's own tracker, so it only bounds
 allocations the interpreter remembers to account for. Hosts that spawn worker
 subprocesses can set a second, independent ceiling below the interpreter —
 `PoolConfig::worker_hard_memory_limit` in Rust,
 `Monty(worker_hard_memory_limit=...)` in Python, `workerHardMemoryLimit` in
-JavaScript — which the worker applies to itself as `RLIMIT_AS` before serving
-any request. Divergences from every other limit documented here:
+JavaScript — which the worker enforces in its own global allocator, counting
+live bytes, before serving any request. Divergences from every other limit
+documented here:
 
 - **It kills the worker, though it still reports `MemoryError`.** A breach fails
   an allocation the interpreter cannot handle, so the worker exits mid-turn. The
@@ -55,33 +56,30 @@ any request. Divergences from every other limit documented here:
   unlike an in-sandbox `max_memory` breach, the session is gone with the worker
   (later calls on that checkout report `Finished`; the pool itself recovers).
   Sandboxed code cannot observe or catch it.
-- **The ceiling is Linux only, and setting it elsewhere is fatal.** Darwin
-  refuses to set `RLIMIT_AS` (aliased onto `RLIMIT_RSS`) or `RLIMIT_DATA` at all,
-  and Windows has no rlimits. Rather than run a worker the host believes is
-  capped, such a worker exits immediately on a dedicated code and the pool
-  reports a crash naming the reason. So the knob is not portable: setting it on
-  macOS or Windows yields **no usable workers**, by design — silently ignoring it
-  would leave a host that asked to be capped running uncapped. There is no
-  spawn-time handshake, so the refusal surfaces on the session's first request
-  (the `Configure` inside `checkout`), not at pool construction. A Linux worker
-  whose `setrlimit` is refused by policy (seccomp, container) declines to serve
-  the same way, reporting that the ceiling could not be applied rather than that
-  the platform lacks it. Only the *reporting* below is cross-platform.
-- **It bounds virtual address space, not live heap.** Thread stacks, allocator
-  arena reservations and file mappings all count against it, so it must sit
-  above the `max_memory` budget it backstops by the worker's own footprint (see
-  the README for the headroom to add, and `scripts/hard_memory_sweep.py` to
-  measure it for a given build and host). Too tight a ceiling kills healthy
-  workers, most likely on the first type-checked feed (typeshed and salsa
-  caches load then).
+- **It binds the worker's allocator, not the process.** Only bytes requested
+  from Rust's global allocator are counted, which is everything sandboxed code
+  can cause to be allocated, but not memory obtained another way: thread stacks,
+  the binary's own mapped image, or a direct `mmap`. It is a backstop under the
+  interpreter's tracker, not a kernel-enforced bound on process memory — an
+  inherited `ulimit -v` or cgroup limit is the tool for that, and still applies
+  independently (a worker whose allocation the kernel then refuses reports the
+  same `MemoryError`).
+- **It counts requested bytes, not resident ones.** Per-allocation overhead and
+  fragmentation sit between the count and the process's real footprint, so RSS
+  runs somewhat above the ceiling. It must also sit above the `max_memory` budget
+  it backstops by the worker's own heap (see the README for the headroom to add,
+  and `scripts/hard_memory_sweep.py` to measure it for a given build). Too tight
+  a ceiling kills healthy workers, most likely on the first type-checked feed
+  (typeshed and salsa caches load then).
 - **Per process, not per session.** The ceiling is fixed at pool creation and
   never re-derived, so a recycled worker's ceiling still covers whatever residue
   earlier sessions left behind.
-- **Never raised.** The requested value is clamped down to any lower limit
-  already inherited (container, `ulimit -v`), and both the soft and hard limits
-  are set, so nothing in the process can lift it afterwards.
+- **Armed once, never lifted.** The ceiling is set before the worker serves
+  anything and nothing in the process can raise it afterwards. A ceiling below
+  what the worker has already allocated is refused at once, rather than becoming
+  an arbitrary allocation failing mid-turn.
 - Only the subprocess transport applies it: WebSocket workers are remote
-  processes this pool does not spawn, and the wasm worker has no rlimits.
+  processes this pool does not spawn/
 
 Independently of any ceiling, **any** allocation a worker's allocator refuses —
 plain host OOM, or a request beyond the usable address space such as

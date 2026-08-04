@@ -1,8 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    borrow::Cow,
-    fmt, fs, process,
+    fmt, fs,
     process::ExitCode,
     time::{Duration, Instant},
 };
@@ -18,7 +17,6 @@ use monty_types::{
 use rustyline::{DefaultEditor, error::ReadlineError};
 
 mod oom_exit;
-mod rlimit;
 mod subprocess;
 
 /// Classifies allocation failure as an exit code rather than an abort, so the
@@ -98,11 +96,10 @@ enum Command {
     /// write framed events on stdout (see the monty-proto crate). Intended to
     /// be driven by a parent process such as monty-pool, not by hand.
     Subprocess {
-        /// Hard memory ceiling in bytes for this process, set as `RLIMIT_AS`
+        /// Hard ceiling in bytes on this process's live allocations, armed
         /// before any request is served; a breach kills the worker, backstopping
-        /// the sandbox's own `max_memory`. `RLIMIT_AS` bounds virtual address
-        /// space, so leave headroom. Linux only — elsewhere the worker refuses
-        /// to serve rather than run without the ceiling.
+        /// the sandbox's own `max_memory`. Counts what the process asked the
+        /// allocator for, so leave headroom for the worker's own footprint.
         #[arg(long)]
         hard_memory_limit: Option<u64>,
     },
@@ -178,22 +175,9 @@ fn main() -> ExitCode {
             eprintln!("{BOLD_RED}error{RESET}: `subprocess` cannot be combined with {flag}");
             return ExitCode::FAILURE;
         }
-        // A host that asked for a memory ceiling must never silently get a worker
-        // without one, so a ceiling we cannot apply refuses to serve. Exiting on
-        // a dedicated code (rather than returning `ExitCode`) lets the parent
-        // report the cause instead of an opaque death.
+        // Armed before serving anything, so no request can run uncapped.
         if let Some(bytes) = hard_memory_limit {
-            let reason = match rlimit::apply(bytes) {
-                Ok(Some(_)) => None,
-                Ok(None) => Some(Cow::Borrowed(
-                    "Hard memory limit is invalid on this platform, requires Linux.",
-                )),
-                Err(err) => Some(Cow::Owned(err)),
-            };
-            if let Some(reason) = reason {
-                eprintln!("{BOLD_RED}error{RESET}: {reason}");
-                process::exit(monty_proto::LIMIT_UNAVAILABLE_EXIT_CODE);
-            }
+            oom_exit::set_limit(bytes);
         }
         return subprocess::run();
     }

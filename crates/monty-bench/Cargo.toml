@@ -8,6 +8,11 @@ authors = { workspace = true }
 description = "Benchmarks for the Monty interpreter — compares Monty vs CPython"
 publish = false
 
+[features]
+# Runs the `main` bench under the worker's global allocator instead of `System`,
+# to price the hard memory ceiling on real workloads (see `BenchAlloc`).
+worker-alloc = []
+
 [dependencies]
 monty = { workspace = true, features = ["test-hooks"] }
 monty-types = { workspace = true }

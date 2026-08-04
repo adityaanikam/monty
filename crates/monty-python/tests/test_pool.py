@@ -122,24 +122,12 @@ def test_request_timeout_kills_hung_worker():
             assert session.feed_run('2 + 2') == snapshot(4)
 
 
-@pytest.mark.skipif(sys.platform != 'linux', reason='RLIMIT_AS is only settable on Linux')
 def test_worker_hard_memory_limit_leaves_normal_work_alone():
     # a ceiling generous enough for the interpreter is invisible; it backstops
     # the sandbox `limits`, it is not a second budget
     with Monty(worker_hard_memory_limit=2 * 1024**3) as pool:
         with pool.checkout() as session:
             assert session.feed_run('1 + 1') == snapshot(2)
-
-
-@pytest.mark.skipif(sys.platform == 'linux', reason='Linux can apply the ceiling')
-def test_unappliable_worker_hard_memory_limit_crashes():
-    # asking to be capped where that is impossible must fail loudly rather than
-    # hand back an uncapped worker
-    with Monty(worker_hard_memory_limit=2 * 1024**3) as pool:
-        with pytest.raises(MontyCrashedError) as exc_info:
-            with pool.checkout() as session:
-                session.feed_run('1 + 1')
-        assert 'Hard memory limit is invalid on this platform, requires Linux' in str(exc_info.value)
 
 
 def test_refused_allocation_raises_memory_error():
@@ -160,7 +148,6 @@ def test_refused_allocation_raises_memory_error():
             assert session.feed_run('1 + 1') == snapshot(2)
 
 
-@pytest.mark.skipif(sys.platform != 'linux', reason='RLIMIT_AS is only settable on Linux')
 def test_worker_hard_memory_breach_raises_memory_error():
     # the ceiling only changes where allocations start being refused
     with Monty(worker_hard_memory_limit=1024**3) as pool:

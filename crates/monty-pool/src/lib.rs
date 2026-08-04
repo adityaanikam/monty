@@ -71,12 +71,13 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
-    /// Linux-only hard memory ceiling in bytes for each spawned worker, set as
-    /// `RLIMIT_AS`: a breach kills the worker and reports `MemoryError`
-    /// ([`PoolError::Runtime`]) instead of growing the host without bound. Leave
-    /// headroom above the sandbox's `max_memory` — `RLIMIT_AS` bounds *virtual*
-    /// address space. On non-Linux hosts the worker refuses to serve at all
-    /// rather than run uncapped, so setting this there yields no usable workers.
+    /// Hard ceiling in bytes on each spawned worker's live allocations: a
+    /// breach kills the worker and reports `MemoryError`
+    /// ([`PoolError::Runtime`]) instead of growing the host without bound. The
+    /// worker enforces it in its own allocator, so it covers every allocation
+    /// the interpreter's `max_memory` tracker misses, but not memory obtained
+    /// outside that allocator. Leave headroom above `max_memory` for the
+    /// worker's own footprint (typeshed and salsa, if type checking).
     /// Ignored by the WebSocket transport, whose children this pool cannot spawn.
     pub worker_hard_memory_limit: Option<u64>,
 }

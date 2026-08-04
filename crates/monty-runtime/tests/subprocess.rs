@@ -406,31 +406,11 @@ fn child_enforces_time_limit() {
 /// A ceiling generous enough for the interpreter must be invisible: it is a
 /// backstop, not a second sandbox budget.
 #[test]
-#[cfg(target_os = "linux")]
 fn hard_memory_limit_leaves_normal_work_alone() {
     let mut child = ChildProc::spawn_with_args(&["--hard-memory-limit", "2147483648"]); // 2 GiB
     child.create_repl();
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
-}
-
-/// Where the ceiling cannot be applied the worker must refuse to serve on its
-/// own exit code, never run unbounded: a host that asked to be capped would
-/// otherwise get an uncapped worker and no way to know.
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn unappliable_hard_memory_limit_refuses_to_serve() {
-    let mut child = ChildProc::spawn_stderr_piped(&["--hard-memory-limit", "2147483648"]);
-    let (status, stderr) = child.reap_with_stderr();
-    assert_eq!(
-        status.code(),
-        Some(monty_proto::LIMIT_UNAVAILABLE_EXIT_CODE),
-        "got {status:?}"
-    );
-    assert!(
-        stderr.contains("Hard memory limit is invalid on this platform, requires Linux."),
-        "{stderr}"
-    );
 }
 
 /// A refused allocation must leave the parent something it can classify: the
@@ -458,7 +438,6 @@ fn refused_allocation_exits_with_the_oom_code() {
 /// infallible `String` growth) must kill the process instead of growing host
 /// memory without bound. Same exit code — the ceiling only changes *where* the
 /// allocator starts refusing.
-#[cfg(target_os = "linux")]
 #[test]
 fn hard_memory_breach_exits_with_the_oom_code() {
     let mut child = ChildProc::spawn_stderr_piped(&["--hard-memory-limit", "1073741824"]); // 1 GiB
@@ -466,7 +445,10 @@ fn hard_memory_breach_exits_with_the_oom_code() {
     child.feed_expecting_death("x = ' ' * (4 * 1024 * 1024 * 1024)");
     let (status, stderr) = child.reap_with_stderr();
     assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
-    assert!(stderr.contains("allocation of 4294967296 bytes failed"), "{stderr}");
+    assert!(
+        stderr.contains("allocation of 4294967296 bytes exceeds the memory ceiling"),
+        "{stderr}"
+    );
 }
 
 #[test]

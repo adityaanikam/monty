@@ -1,6 +1,13 @@
 // Use codspeed-criterion-compat when running on CodSpeed (CI), real criterion otherwise (for flamegraphs)
 #[cfg(not(codspeed))]
 use std::ffi::CString;
+#[cfg(feature = "worker-alloc")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "worker-alloc")]
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    process,
+};
 
 #[cfg(codspeed)]
 use codspeed_criterion_compat::{Bencher, Criterion, black_box, criterion_group, criterion_main};
@@ -13,6 +20,91 @@ use pprof::criterion::{Output, PProfProfiler};
 // CPython benchmarks are only run locally, not on CodSpeed CI (requires Python + pyo3 setup)
 #[cfg(not(codspeed))]
 use pyo3::prelude::*;
+
+// The worker's global allocator, replicated so the interpreter benchmarks can
+// price it: `cargo bench -p monty-bench --bench main --features worker-alloc`
+// against a plain run measures what the ceiling costs on real workloads.
+// `monty-runtime` is a binary crate, so its copy cannot be imported — keep the
+// two in step.
+#[cfg(feature = "worker-alloc")]
+#[global_allocator]
+static ALLOC: BenchAlloc = BenchAlloc;
+
+/// Live bytes charged by [`BenchAlloc`], and the ceiling they may not exceed.
+/// Left at `usize::MAX` here: the cost is in the counting, not the comparison.
+#[cfg(feature = "worker-alloc")]
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "worker-alloc")]
+static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// `System`, plus the live-byte count and null check the worker runs.
+#[cfg(feature = "worker-alloc")]
+struct BenchAlloc;
+
+// SAFETY: every method forwards its arguments unchanged to `System`, whose
+// `GlobalAlloc` contract is identical to this one, and returns what `System`
+// returned (or diverges). No pointer is fabricated, aliased, or freed here.
+#[cfg(feature = "worker-alloc")]
+unsafe impl GlobalAlloc for BenchAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        charge(layout.size());
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { System.alloc(layout) };
+        if ptr.is_null() {
+            oom_exit();
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: `ptr` was returned by our `alloc`/`realloc`, i.e. by `System`,
+        // with this same `layout` — precisely `System`'s requirement.
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        charge(layout.size());
+        // SAFETY: `layout` comes from the caller and is forwarded unchanged.
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if ptr.is_null() {
+            oom_exit();
+        }
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if new_size >= layout.size() {
+            charge(new_size - layout.size());
+        } else {
+            LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+        }
+        // SAFETY: `ptr`/`layout` describe a live block from this allocator and
+        // `new_size` is the caller's, all forwarded unchanged.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if new_ptr.is_null() {
+            oom_exit();
+        }
+        new_ptr
+    }
+}
+
+/// Adds `size` to the live total, exiting if that would breach the ceiling.
+#[cfg(feature = "worker-alloc")]
+#[inline]
+fn charge(size: usize) {
+    if LIVE.fetch_add(size, Ordering::Relaxed).saturating_add(size) > LIMIT.load(Ordering::Relaxed) {
+        oom_exit();
+    }
+}
+
+/// A benchmark that trips either check has stopped measuring what it claims to.
+#[cfg(feature = "worker-alloc")]
+#[cold]
+#[inline(never)]
+fn oom_exit() -> ! {
+    process::exit(70)
+}
 
 /// Runs a benchmark using the Monty interpreter.
 /// Parses once, then benchmarks repeated execution.
