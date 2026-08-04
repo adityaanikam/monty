@@ -80,7 +80,8 @@ and restored later — including on a different worker or machine — with `Chec
 - **Worker recycling** — `max_checkouts_per_worker` recycles long-lived children to bound
   the impact of any slow leak.
 - **Hard memory ceiling** — a session's `max_memory` also caps the worker's live
-  allocations, enforced in the worker's own global allocator with generous headroom,
+  allocations, enforced in the worker's own global allocator
+  ([`monty-alloc`](https://crates.io/crates/monty-alloc)) with generous headroom,
   backstopping the sandbox tracker for allocations it never sees rather than growing the
   host until the OOM killer intervenes. A breach or a refused allocation exits the worker
   with a dedicated code so it surfaces as `PoolError::Runtime`/`MemoryError` instead of an

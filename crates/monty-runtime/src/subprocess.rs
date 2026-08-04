@@ -21,8 +21,6 @@ use monty_proto::{
     write_frame,
 };
 
-use crate::allocator;
-
 /// BSD `sysexits.h` "remote error in protocol" — the frame stream desynchronized, or
 /// an event too large to frame left the response unsendable.
 const EX_PROTOCOL: u8 = 76;
@@ -93,7 +91,7 @@ pub(crate) fn run() -> ExitCode {
 /// wasm worker, which has none.
 fn arm_memory_ceiling(child: &Child) {
     let budget = child.session_budget();
-    allocator::arm_ceiling(budget.max_memory, budget.type_check);
+    monty_alloc::arm_ceiling(budget.max_memory, budget.type_check);
 }
 
 /// Writes framed child events to stdout.

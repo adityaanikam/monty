@@ -322,11 +322,14 @@ const pool = await Monty.create({
 ```
 
 A session's `maxMemory` also arms a hard ceiling in the worker's own allocator
-(several times the budget, plus headroom), backstopping the in-sandbox limit for
+(the [`monty-alloc`](https://crates.io/crates/monty-alloc) crate: several times
+the budget, plus headroom), backstopping the in-sandbox limit for
 allocations its tracker never sees instead of letting the worker grow the host
 without bound. A breach raises `MontyRuntimeError` wrapping `MemoryError` — but
 unlike other runtime errors it takes the worker with it, so the session is
-finished (the pool recovers).
+finished (the pool recovers). The wasm worker arms the same ceiling against its
+linear memory, but a trapped module has no exit status to classify, so there a
+breach raises `MontyCrashedError`.
 
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo

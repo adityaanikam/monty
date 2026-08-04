@@ -109,10 +109,11 @@ properties that real CPython does not provide, per the caveat above.
 - **`max_memory` is backstopped by a hard memory ceiling.** A session's
   `max_memory` also caps the live bytes its worker's allocator will hand out
   (with a multiple and headroom on top — see `limitations/resource_limits.md`);
-  a session without one gets no ceiling. The worker derives it from the
-  `Configure` it is sent, so nothing travels outside the protocol. Ignored by the
-  WebSocket transport (whose exit codes do not travel, so a remote breach
-  degrades to `Disconnected`). The exit code borrows
+  a session without one gets no ceiling. The worker derives it from the session
+  it holds, so nothing travels outside the protocol, and the wasm worker applies
+  the same ceiling to its linear memory. Ignored by the WebSocket transport
+  (whose exit codes do not travel, so a remote breach degrades to
+  `Disconnected`). The exit code borrows
   [`sysexits.h`](https://man.freebsd.org/sysexits) so a bare status is legible in
   a log.
 - **A refused allocation is the one `MemoryError` that kills the session.** The
@@ -124,7 +125,9 @@ properties that real CPython does not provide, per the caveat above.
   dead and later calls on that checkout report `Finished`. An ordinary in-sandbox
   exception leaves the session usable; a failed `load_session` / `load_snapshot`
   is the other `MontyRuntimeError` that does not (see below). Applies on all
-  platforms, with or without a ceiling configured.
+  platforms, with or without a session budget — except in the wasm worker, which
+  has no exit status to carry the distinction and so reports `MontyCrashedError`
+  for both.
 - **Workers are spawned with an empty environment** (on Windows only
   `SystemRoot` is kept, which CRT/WinAPI lookups need): host secrets are
   never in a worker's memory, where a sandbox escape or memory disclosure

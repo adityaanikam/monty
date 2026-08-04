@@ -249,7 +249,11 @@ worker's own baseline footprint, plus a few MiB of headroom (more when type
 checking) for machinery the budget does not cover. Nothing the interpreter allocates can
 reach it: the multiple covers what the tracker undercounts, so a tracked
 allocation raises `MemoryError` at `max_memory` first, leaving the worker alive.
-See [`limitations/resource_limits.md`](limitations/resource_limits.md).
+
+The allocator enforcing it is the `monty-alloc` crate, which both the
+subprocess worker and the WebAssembly one run under. See
+[`limitations/resource_limits.md`](limitations/resource_limits.md) for the
+numbers and for how a breach surfaces in each.
 
 ## PydanticAI Integration
 

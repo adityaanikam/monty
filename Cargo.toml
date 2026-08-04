@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/monty",
     "crates/monty-types",
+    "crates/monty-alloc",
     "crates/monty-fs",
     "crates/monty-runtime",
     "crates/monty-proto",
@@ -59,6 +60,7 @@ strip = false
 # RELEASING.md.
 monty = { path = "crates/monty", version = "0.0.19" }
 monty-types = { path = "crates/monty-types", version = "0.0.19" }
+monty-alloc = { path = "crates/monty-alloc", version = "0.0.19" }
 monty-fs = { path = "crates/monty-fs", version = "0.0.19" }
 monty-macros = { path = "crates/monty-macros", version = "0.0.19" }
 monty-proto = { path = "crates/monty-proto", version = "0.0.19" }

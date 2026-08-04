@@ -20,6 +20,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 monty = { workspace = true }
 monty-fs = { workspace = true }
+monty-alloc = { workspace = true, features = ["exit-code"] }
 monty-proto = { workspace = true, features = ["worker"] }
 monty-type-checking = { workspace = true }
 monty-types = { workspace = true }

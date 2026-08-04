@@ -92,9 +92,14 @@ here:
   `checkout()` config armed. Restoring a large dump into a checkout with a much
   smaller `max_memory` can therefore breach the ceiling while loading; pass a
   comparable budget to `checkout()`.
-- Only worker subprocesses apply it: WebSocket workers are remote processes this
-  pool does not spawn, and the wasm worker (a module, not a binary) declares no
-  allocator of its own.
+- **The wasm worker gets the same ceiling but cannot report it.** It arms the
+  same allocator against the same budget, and a breach traps the instance — but
+  a wasm module has no exit status, so the host reports `MontyCrashedError`
+  rather than the `MemoryError` a subprocess produces. Its `usize` is also 32
+  bits, so a budget beyond ~800 MiB saturates the arithmetic and leaves the
+  module uncapped.
+- WebSocket workers get no ceiling at all: they are remote processes this pool
+  does not spawn.
 
 Independently of any ceiling, **any** allocation a worker's allocator refuses —
 plain host OOM, or a request beyond the usable address space such as

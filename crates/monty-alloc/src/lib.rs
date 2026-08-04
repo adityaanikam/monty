@@ -1,8 +1,4 @@
-//! The worker's global allocator: it counts live bytes against a ceiling (see
-//! [`arm_ceiling`]) and exits with [`OOM_EXIT_CODE`] rather than aborting, as
-//! `SIGABRT` is indistinguishable from a stack overflow. Counting beats
-//! `RLIMIT_AS` — portable, and it bounds requested bytes rather than address
-//! space — but binds only what reaches here. Only binaries may declare one.
+#![doc = include_str!("../README.md")]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -11,8 +7,6 @@ use std::{
     process,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-
-use monty_proto::OOM_EXIT_CODE;
 
 /// Bytes currently charged, and the ceiling they may not exceed (`usize::MAX`
 /// until [`arm_ceiling`] lowers it). Counting starts with the process: a counter
@@ -38,10 +32,13 @@ const BASE_HEADROOM: usize = 4 * 1024 * 1024;
 const TYPE_CHECK_HEADROOM: usize = 32 * 1024 * 1024;
 
 /// Derives the ceiling from the current session's sandbox budget, or lifts it
-/// while no session has one. Called after every request, since a session can
-/// also arrive (or end) through `Load` and `Reset`; the result depends only on
-/// the budget and the baseline, so re-deriving mid-session is a no-op.
-pub(crate) fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
+/// while no session has one. Call it after every request, since a session can
+/// also arrive (or end) through a restored dump or a reset; the result depends
+/// only on the budget and the baseline, so re-deriving mid-session is a no-op.
+///
+/// On a 32-bit target (wasm) a budget beyond ~800 MiB saturates the arithmetic
+/// and leaves the worker uncapped — there is no ceiling to express.
+pub fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
     let live = LIVE.load(Ordering::Relaxed);
     // `fetch_min` both reads and lowers the baseline: the first arming, on a
     // pristine worker, sets it, and a later leaner moment can only improve it.
@@ -62,9 +59,9 @@ pub(crate) fn arm_ceiling(max_memory: Option<u64>, type_check: bool) {
     LIMIT.store(limit, Ordering::Relaxed);
 }
 
-/// The system allocator, plus a live-byte count and a null check that exits
-/// rather than aborts.
-pub(crate) struct LimitedAllocator;
+/// The system allocator, plus a live-byte count and a null check that ends the
+/// process deliberately rather than aborting.
+pub struct LimitedAllocator;
 
 // SAFETY: every method forwards its arguments unchanged to `System` and returns
 // what `System` returned (or diverges). No pointer is fabricated, aliased or
@@ -75,7 +72,7 @@ unsafe impl GlobalAlloc for LimitedAllocator {
         // SAFETY: `layout` comes from the caller and is forwarded unchanged.
         let ptr = unsafe { System.alloc(layout) };
         if ptr.is_null() {
-            oom_exit(format_args!(
+            out_of_memory(format_args!(
                 "monty worker: allocation of {} bytes failed",
                 layout.size()
             ));
@@ -96,7 +93,7 @@ unsafe impl GlobalAlloc for LimitedAllocator {
         // SAFETY: `layout` comes from the caller and is forwarded unchanged.
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if ptr.is_null() {
-            oom_exit(format_args!(
+            out_of_memory(format_args!(
                 "monty worker: allocation of {} bytes failed",
                 layout.size()
             ));
@@ -116,7 +113,7 @@ unsafe impl GlobalAlloc for LimitedAllocator {
         // `new_size` is the caller's — all forwarded unchanged.
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if new_ptr.is_null() {
-            oom_exit(format_args!("monty worker: allocation of {new_size} bytes failed"));
+            out_of_memory(format_args!("monty worker: allocation of {new_size} bytes failed"));
         }
         new_ptr
     }
@@ -124,11 +121,11 @@ unsafe impl GlobalAlloc for LimitedAllocator {
 
 /// Adds `size` to the live total, exiting if that breaches the ceiling. Charges
 /// *before* allocating, so a breach is refused rather than committed; the
-/// overcount left when an allocation then fails is moot, as both paths exit.
+/// overcount left when an allocation then fails is moot, as both paths end here.
 #[inline]
 fn charge(size: usize) {
     if LIVE.fetch_add(size, Ordering::Relaxed).saturating_add(size) > LIMIT.load(Ordering::Relaxed) {
-        oom_exit(format_args!(
+        out_of_memory(format_args!(
             "monty worker: allocation of {size} bytes exceeds the memory ceiling"
         ));
     }
@@ -141,22 +138,25 @@ fn refund(size: usize) {
     LIVE.fetch_sub(size, Ordering::Relaxed);
 }
 
-/// Reports why memory ran out and exits with [`OOM_EXIT_CODE`] — not a panic
-/// (that machinery allocates) and not an abort (a stack overflow looks the
-/// same). Skipping destructors can leave a partial frame on stdout, which the
-/// parent already treats as a dead worker.
+/// Reports why memory ran out and ends the process — never by panicking, whose
+/// machinery allocates. How it ends is the `exit-code` feature's choice; see the
+/// crate docs. Skipping destructors can leave a partial frame on the transport,
+/// which the host already treats as a dead worker.
 #[cold]
 #[inline(never)]
-fn oom_exit(reason: fmt::Arguments<'_>) -> ! {
+fn out_of_memory(reason: fmt::Arguments<'_>) -> ! {
     // A genuinely exhausted host can fail the write and re-enter: let the first
-    // caller write and send any re-entrant one straight to `exit`.
+    // caller write and send any re-entrant one straight to the end.
     static REPORTING: AtomicBool = AtomicBool::new(false);
     // Lift the ceiling first — writing to stderr allocates (the handle's lock),
     // which under a breached ceiling would re-enter and be silenced below,
-    // losing the message. Safe because this path always ends in `exit`.
+    // losing the message. Safe because this path never returns.
     LIMIT.store(usize::MAX, Ordering::Relaxed);
     if !REPORTING.swap(true, Ordering::Relaxed) {
         let _ = writeln!(io::stderr(), "{reason}");
     }
-    process::exit(OOM_EXIT_CODE)
+    #[cfg(feature = "exit-code")]
+    process::exit(monty_proto::OOM_EXIT_CODE);
+    #[cfg(not(feature = "exit-code"))]
+    process::abort();
 }

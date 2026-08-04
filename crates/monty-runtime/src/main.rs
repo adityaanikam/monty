@@ -16,14 +16,14 @@ use monty_types::{
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 
-mod allocator;
 mod subprocess;
 
-/// Classifies allocation failure as an exit code rather than an abort, so the
-/// pool can report `MemoryError`. Declared here because only a binary may:
-/// see [`allocator`]. Applies to every mode, `subprocess` and CLI alike.
+/// Bounds worker memory and classifies allocation failure as an exit code
+/// rather than an abort, so the pool can report `MemoryError`. Declared here
+/// because only a binary may; see the `monty-alloc` crate. Applies to every
+/// mode, `subprocess` and CLI alike.
 #[global_allocator]
-static ALLOC: allocator::LimitedAllocator = allocator::LimitedAllocator;
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 
 /// ANSI escape code for dim/gray text.
 const DIM: &str = "\x1b[2m";
