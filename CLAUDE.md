@@ -333,6 +333,7 @@ make lint-js              Lint JS code with oxlint
 make test-js              Test the JS package (builds the monty binary the workers run)
 make dev-py-release       Install the python package for development with a release build
 make build-wasm           Build the lean wasm worker module (requires the wasm32-wasip1 target)
+make test-wasm            Test the wasm worker module from node, with no browser
 make test-browser         Browser (Vitest) test of the wasm path in a real headless browser
 make dev-py-pgo           Install the python package for development with profile-guided optimization
 make format-rs            Format Rust code with fmt
@@ -795,8 +796,9 @@ recovery, framing and value conversion all live in Rust.
   `.node` library *and* the `monty` binary (`@pydantic/monty-<platform>`,
   selected via optionalDependencies; `napi create-npm-dirs` +
   `scripts/create-platform-packages.mjs`)
-- `crates/monty-js/__test__/` - Tests using ava (`wasm_*.spec.ts` drive the
-  wasm worker pool/transport without the napi build)
+- `crates/monty-js/__test__/` - Tests using vitest (`wasm_*.spec.ts` drive the
+  wasm worker pool/transport without the napi build, and need `make build-wasm`
+  first — `npm test` excludes them, `npm run test:wasm` runs them)
 
 ### Current API
 
@@ -825,7 +827,7 @@ See `crates/monty-js/README.md` for full API documentation.
 ```bash
 make install-js   # npm install
 make build-js     # napi debug build + compile TypeScript
-make test-js      # builds the napi binding + debug monty binary, then runs ava
+make test-js      # builds the napi binding + debug monty binary, then runs vitest
 make lint-js      # oxlint
 make format-js    # prettier
 make smoke-test-js  # packs + installs the package and platform binary package
@@ -837,7 +839,7 @@ Tests run straight from `ts/` via `@oxc-node/core` against the locally built
 
 ### JavaScript Test Guidelines
 
-- Tests use [ava](https://github.com/avajs/ava) and live in `crates/monty-js/__test__/`
+- Tests use [vitest](https://vitest.dev) and live in `crates/monty-js/__test__/`
 - Tests are written in TypeScript; use the `setupPool` helper from `__test__/helpers.ts`
 - Follow the existing test style in the `__test__/` directory
 
@@ -865,8 +867,10 @@ transport differs. The pieces:
 
 Build the worker module locally with `make build-wasm` (needs the
 `wasm32-wasip1` target); it is built and tested in CI. `make test-browser` runs
-the whole suite against it in headless Chromium, and
-`__test__/wasm_memory_limit.spec.ts` drives the module from Node with no browser.
+the whole suite against it in headless Chromium, and `make test-wasm` drives it
+from Node with no browser (`__test__/wasm_*.spec.ts`, run by their own
+`vitest.wasm.config.ts` — `npm test` excludes them, since it does not build the
+module).
 
 ## Limitations documentation (`./limitations/`)
 

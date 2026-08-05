@@ -55,6 +55,10 @@ test-js: build-js ## Test the JS package (builds the monty binary the workers ru
 build-wasm: install-js ## Build the lean wasm worker module (requires the wasm32-wasip1 target)
 	cd crates/monty-js && npm run build:wasm && npm run build:ts
 
+.PHONY: test-wasm
+test-wasm: install-js ## Test the wasm worker module from node, with no browser
+	cd crates/monty-js && npm run build:wasm && npm run build:ts && npm run test:wasm
+
 .PHONY: test-browser
 test-browser: install-js ## Browser (Vitest) test of the wasm path in a real headless browser
 	cd crates/monty-js && npm run build:wasm && npm run build:ts && npx playwright install chromium && npm run test:browser
