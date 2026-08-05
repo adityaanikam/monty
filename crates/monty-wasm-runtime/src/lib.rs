@@ -27,6 +27,7 @@
 //! Exactly as in the subprocess model, a turn that ends *without* a turn-ending
 //! event means the instance trapped (stack overflow, allocator abort) and the
 //! host must discard it. A graceful turn always emits one terminating event.
+#![expect(unsafe_code, reason = "Host entry points must be exported with unsafe nomangle/name")]
 
 use std::{
     cell::RefCell,

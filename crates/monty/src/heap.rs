@@ -1,3 +1,8 @@
+#![expect(
+    unsafe_code,
+    reason = "Paged arena hands out typed, aliasable views into UnsafeCell entries"
+)]
+
 #[cfg(feature = "ref-count-return")]
 use std::collections::HashSet;
 use std::{
@@ -420,7 +425,10 @@ macro_rules! heap_read_ref_as_field {
         // SAFETY: (DH)
         //  - `std::mem::offset_of!` guarantees there is a field at fixed offset
         //  - `type_hint` guarantees that the field is of type `U` for the safety contract
-        unsafe { $crate::heap::cast_as_member_ref_type_hinted($heap_read, offset, type_hint) }
+        #[expect(unsafe_code)]
+        unsafe {
+            $crate::heap::cast_as_member_ref_type_hinted($heap_read, offset, type_hint)
+        }
     }};
 }
 
@@ -465,7 +473,10 @@ macro_rules! heap_read_ref_as_field_mut {
         // SAFETY: (DH)
         //  - `std::mem::offset_of!` guarantees there is a field at fixed offset
         //  - `type_hint` guarantees that the field is of type `U` for the safety contract
-        unsafe { $crate::heap::cast_as_member_ref_mut_type_hinted($heap_read, offset, type_hint) }
+        #[expect(unsafe_code)]
+        unsafe {
+            $crate::heap::cast_as_member_ref_mut_type_hinted($heap_read, offset, type_hint)
+        }
     }};
 }
 

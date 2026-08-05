@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![expect(unsafe_code, reason = "Custom allocator is unsafe, the logic we add is all safe")]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
