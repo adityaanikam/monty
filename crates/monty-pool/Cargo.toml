@@ -34,6 +34,8 @@ futures-util = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]
+# Snapshots of the error messages the pool reports to a host.
+insta = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # The mock WebSocket child servers in tests stay synchronous, on plain threads.

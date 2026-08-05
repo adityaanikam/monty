@@ -16,6 +16,9 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
+// only the unix-gated exit-code test snapshots a message
+#[cfg(unix)]
+use insta::assert_snapshot;
 use monty_pool::{
     MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig, ResumeValue, TurnEvent,
     on_print_sync,
@@ -1131,7 +1134,9 @@ async fn max_memory_leaves_normal_work_alone() {
 async fn unrecognised_exit_code_stays_an_opaque_death() {
     let dir = tempfile::tempdir().unwrap();
     let fake = dir.path().join("monty");
-    fs::write(&fake, "#!/bin/sh\nexit 64\n").unwrap();
+    // outlives the parent's first write, so the death is always observed while
+    // waiting for the reply rather than racing with `sending a request`
+    fs::write(&fake, "#!/bin/sh\nsleep 0.2\nexit 64\n").unwrap();
     fs::set_permissions(&fake, PermissionsExt::from_mode(0o755)).unwrap();
 
     let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
@@ -1149,6 +1154,9 @@ async fn unrecognised_exit_code_stays_an_opaque_death() {
         matches!(cause, monty_pool::CrashCause::Vanished { .. }),
         "an unrecognised exit code must not be classified, got {cause:?}"
     );
+    // the message says only what the pool was doing and what it reaped — no
+    // memory wording, which is what `OOM_EXIT_CODE` alone earns
+    assert_snapshot!(err.to_string(), @"monty worker crashed while waiting for a reply (exit status: 64)");
 }
 
 /// A refused allocation is the one `Runtime` error whose worker is already
