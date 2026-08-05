@@ -158,6 +158,7 @@ def test_exceeding_max_memory_in_the_allocator_raises_memory_error():
             assert str(exc_info.value) == snapshot(
                 'MemoryError: the worker exceeded its memory limit and was terminated'
             )
+            assert isinstance(exc_info.value.exception(), MemoryError)
         # this outcome takes the worker with it; the pool replaces it
         with pool.checkout() as session:
             assert session.feed_run('1 + 1') == snapshot(2)

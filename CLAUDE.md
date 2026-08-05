@@ -855,7 +855,7 @@ transport differs. The pieces:
   `monty_dispatch_turn` (read a framed request from stdin, run one turn, write
   framed events to stdout). No napi, no threads, no `SharedArrayBuffer`. It
   declares the `monty-alloc` global allocator, so a session's `max_memory`
-  bounds the module's linear memory too; exceeding it traps, which the host
+  bounds what the module allocates too; exceeding it traps, which the host
   already reads as a dead instance.
 - `crates/monty-js/ts/worker/` — the TS pool/transport that drives it
   (`createWorkerPool`): a browser `Worker` backend (`browserFactory.ts`, whose

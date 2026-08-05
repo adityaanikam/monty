@@ -327,7 +327,7 @@ byte the worker asks for instead of letting it grow the host without bound. A
 worker that cannot honour the limit raises `MontyRuntimeError` wrapping
 `MemoryError` — but unlike other runtime errors it takes the worker with it, so
 the session is finished (the pool recovers). The wasm worker applies the same
-limit to its linear memory, but a trapped module has no exit status to classify,
+limit to what it allocates, but a trapped module has no exit status to classify,
 so there it raises `MontyCrashedError`.
 
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`

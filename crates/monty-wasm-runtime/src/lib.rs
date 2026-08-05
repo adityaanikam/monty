@@ -48,9 +48,10 @@ thread_local! {
     static CHILD: RefCell<Child> = RefCell::new(Child::new());
 }
 
-/// Enforces the session's `max_memory` against the module's linear memory (see
-/// the `monty-alloc` crate). A wasm module may declare one because its allocator
-/// is shared with nothing; exceeding the limit traps, which is already how the
+/// Counts the bytes the module asks for against the session's `max_memory`
+/// (see the `monty-alloc` crate) — not the linear memory it has grown to, which
+/// never shrinks. A wasm module may declare an allocator because its own is
+/// shared with nothing; exceeding the limit traps, which is already how the
 /// host learns an instance died — it has no exit status to read.
 #[global_allocator]
 static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
