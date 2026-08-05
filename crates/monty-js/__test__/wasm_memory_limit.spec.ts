@@ -10,8 +10,10 @@ import { test } from 'vitest'
 import { t } from './assertions.js'
 import { skipIfBrowser } from './env.js'
 
-import { Monty } from '@pydantic/monty/wasm'
-import { MontyCrashedError, MontyRuntimeError } from '@pydantic/monty'
+// everything comes from `/wasm`, which re-exports the error classes: importing
+// them from `@pydantic/monty` would pull in the napi loader, and this suite
+// runs where only the wasm module has been built
+import { Monty, MontyCrashedError, MontyRuntimeError } from '@pydantic/monty/wasm'
 
 test('a session limit leaves normal wasm work alone', async (ctx) => {
   skipIfBrowser(ctx)
