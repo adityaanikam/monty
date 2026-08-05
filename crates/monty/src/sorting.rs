@@ -8,6 +8,8 @@
 //! This module provides [`sort_indices`] for the comparison step and
 //! [`apply_permutation`] for the in-place rearrangement step.
 
+use smallvec::SmallVec;
+
 use crate::{
     args::{ArgValues, FromArgs, LaxBool},
     bytecode::VM,
@@ -16,6 +18,9 @@ use crate::{
     types::RichCmpOp,
     value::Value,
 };
+
+/// Maximum index-buffer length sorted without a scratch allocation.
+const INSERTION_SORT_THRESHOLD: usize = 8;
 
 /// Argument shape for `list.sort(*, key=None, reverse=False)` and, by
 /// extension, the kwargs accepted by the `sorted()` builtin. Both fields
@@ -52,12 +57,15 @@ pub fn parse_and_sort(items: &mut [Value], args: ArgValues, vm: &mut VM<'_>) -> 
 
 /// Sorts a vector of values, with optional key function.
 pub fn sort_values(values: &mut [Value], key_fn: Option<&Value>, reverse: bool, vm: &mut VM<'_>) -> RunResult<()> {
-    if let Some(f) = key_fn {
+    let keys = Vec::new();
+
+    defer_drop_mut!(keys, vm);
+    let mut indices = (0..values.len()).collect::<SmallVec<[usize; INSERTION_SORT_THRESHOLD]>>();
+
+    let compare_values = if let Some(f) = key_fn {
         // Sort by key function: compute all the keys, sort an index buffer, then
         // rearrange the original values in-place according to the sorted indices.
-        let mut indices = (0..values.len()).collect::<Vec<_>>();
-        let keys: Vec<Value> = Vec::with_capacity(values.len());
-        defer_drop_mut!(keys, vm);
+        keys.reserve(values.len());
 
         // Each key call re-enters `run()` with a fresh dispatch countdown, so a
         // short key reaches no checkpoint: this is the pass's only clock poll.
@@ -67,19 +75,14 @@ pub fn sort_values(values: &mut [Value], key_fn: Option<&Value>, reverse: bool, 
             keys.push(vm.evaluate_function("sorted() key argument", f, ArgValues::One(item))?);
         }
 
-        // 2. Sort indices by comparing key values (or values themselves if no key)
-        sort_indices(&mut indices, keys, reverse, vm)?;
-
-        // 3. Rearrange values in-place in the detached buffer.
-        apply_permutation(values, &mut indices);
-
-        Ok(())
+        keys.as_slice()
     } else {
-        let mut indices = (0..values.len()).collect::<Vec<_>>();
-        sort_indices(&mut indices, values, reverse, vm)?;
-        apply_permutation(values, &mut indices);
-        Ok(())
-    }
+        &*values
+    };
+
+    sort_indices(&mut indices, compare_values, reverse, vm)?;
+    apply_permutation(values, &mut indices);
+    Ok(())
 }
 
 /// Sorts a vector of indices by comparing items at those positions.
@@ -90,6 +93,10 @@ pub fn sort_values(values: &mut [Value], key_fn: Option<&Value>, reverse: bool, 
 /// The `values` slice is typically either the items themselves (no key function)
 /// or the pre-computed key values.
 pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> Result<(), RunError> {
+    if indices.len() <= INSERTION_SORT_THRESHOLD {
+        return insertion_sort_indices(indices, values, reverse, vm);
+    }
+
     let mut scratch = indices.to_vec();
     let mut width = 1;
     while width < indices.len() {
@@ -101,6 +108,18 @@ pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: 
         }
         indices.copy_from_slice(&scratch);
         width = stride;
+    }
+    Ok(())
+}
+
+/// Stably insertion-sorts a small index buffer using Python's `<` predicate.
+fn insertion_sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> RunResult<()> {
+    for unsorted in 1..indices.len() {
+        let mut current = unsorted;
+        while current > 0 && comes_before(&values[indices[current]], &values[indices[current - 1]], reverse, vm)? {
+            indices.swap(current, current - 1);
+            current -= 1;
+        }
     }
     Ok(())
 }
