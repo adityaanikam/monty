@@ -39,11 +39,8 @@ struct SetEntry {
 #[derive(Debug, Default)]
 pub(crate) struct SetStorage {
     /// Maps hash to index in entries vector. Derived data: never serialized,
-    /// rebuilt lazily by `ensure_indices`.
+    /// rebuilt lazily by `ensure_indices` (empty with entries present ⇒ stale).
     indices: HashTable<usize>,
-    /// True when `indices`/entry hashes need a rebuild (set by deserialize
-    /// and `from_entries`, cleared by `ensure_indices`).
-    stale: bool,
     /// Dense vector of entries maintaining insertion order.
     entries: Vec<SetEntry>,
 }
@@ -58,17 +55,20 @@ impl SetStorage {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             indices: HashTable::with_capacity(capacity),
-            stale: false,
             entries: Vec::with_capacity(capacity),
         }
     }
 
-    /// True when `indices` (and the per-entry hash cells) must be rebuilt —
-    /// set by deserialization and [`SetStorage::from_entries`].
-    /// Rebuild via `ensure_indices` before consulting `indices`.
+    /// True when `indices` (and the per-entry hashes) must be rebuilt — after
+    /// deserialization or [`SetStorage::from_entries`], both of which leave the
+    /// table empty while entries remain.
+    ///
+    /// Derived, not flagged: a `stale` bool would pad `SetStorage` by 8 bytes,
+    /// costing `HeapData` its niche. Only `remove` empties a built table, and it
+    /// refills it under the same `&mut`.
     #[inline]
     fn indices_stale(&self) -> bool {
-        self.stale
+        self.indices.is_empty() && !self.entries.is_empty()
     }
 
     /// Creates a SetStorage from a vector of values (assumed already deduplicated,
@@ -81,7 +81,6 @@ impl SetStorage {
     fn from_entries(values: Vec<Value>) -> Self {
         Self {
             indices: HashTable::new(),
-            stale: !values.is_empty(),
             entries: values.into_iter().map(|value| SetEntry { value, hash: 0 }).collect(),
         }
     }
@@ -151,7 +150,6 @@ impl SetStorage {
         for (idx, e) in entries.iter().enumerate() {
             indices.insert_unique(e.hash, idx, |&i| entries[i].hash);
         }
-        self.stale = false;
         Ok(())
     }
 }
@@ -251,7 +249,6 @@ impl SetStorage {
     fn clone_with_heap(&self, heap: &impl ContainsHeap) -> Self {
         Self {
             indices: self.indices.clone(),
-            stale: self.stale,
             entries: self
                 .entries
                 .iter()
@@ -319,7 +316,6 @@ impl<'h> HeapRead<'h, SetStorage> {
         for (idx, e) in entries.iter().enumerate() {
             indices.insert_unique(e.hash, idx, |&i| entries[i].hash);
         }
-        storage.stale = false;
         Ok(())
     }
 }
@@ -1575,11 +1571,8 @@ impl serde::Serialize for SetStorage {
 impl<'de> serde::Deserialize<'de> for SetStorage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let entries: Vec<SetEntry> = serde::Deserialize::deserialize(deserializer)?;
-        // `stale` marks the empty indices (and zeroed entry hashes) for the
-        // lazy rebuild on first keyed access.
         Ok(Self {
             indices: HashTable::new(),
-            stale: !entries.is_empty(),
             entries,
         })
     }
