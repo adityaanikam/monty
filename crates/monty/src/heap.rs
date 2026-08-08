@@ -32,10 +32,10 @@ use crate::{
     heap_data::{CellValue, Closure, FunctionDefaults},
     modules::dataclasses::DataclassField,
     types::{
-        BoundMethod, Bytes, BytesIterator, Class, Dataclass, Deque, Dict, DictItemIterator, DictItemsView,
-        DictKeyIterator, DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, Instance,
-        ItertoolsIter, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, Range, RangeIterator,
-        ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, TimeZone, Tuple, TupleIterator,
+        BoundMethod, Bytes, BytesIterator, Class, Deque, Dict, DictItemIterator, DictItemsView, DictKeyIterator,
+        DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, HostClass, Instance, ItertoolsIter,
+        List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, Range, RangeIterator, ReMatch, RePattern,
+        Set, SetIterator, Slice, Str, StringIterator, TimeZone, Tuple, TupleIterator,
         callable_iterator::CallableIterator, date, datetime, deque::DequeIterator, list::ListIterator, timedelta,
         timezone,
     },
@@ -240,7 +240,7 @@ pub enum HeapReadOutput<'a> {
     Range(HeapRead<'a, Range>),
     Slice(HeapRead<'a, Slice>),
     Exception(HeapRead<'a, SimpleException>),
-    Dataclass(HeapRead<'a, Dataclass>),
+    HostClass(HeapRead<'a, HostClass>),
     Class(HeapRead<'a, Class>),
     Instance(HeapRead<'a, Instance>),
     BoundMethod(HeapRead<'a, BoundMethod>),
@@ -666,7 +666,7 @@ impl<'a> HeapPtr<'a> {
             HeapData::Exception(simple_exception) => {
                 HeapReadOutput::Exception(heap_read(base, simple_exception, readers))
             }
-            HeapData::Dataclass(dataclass) => HeapReadOutput::Dataclass(heap_read_boxed(base, dataclass, readers)),
+            HeapData::HostClass(dataclass) => HeapReadOutput::HostClass(heap_read_boxed(base, dataclass, readers)),
             HeapData::Class(class) => HeapReadOutput::Class(heap_read_boxed(base, class, readers)),
             HeapData::Instance(instance) => HeapReadOutput::Instance(heap_read_boxed(base, instance, readers)),
             HeapData::BoundMethod(bound_method) => HeapReadOutput::BoundMethod(heap_read(base, bound_method, readers)),
@@ -1697,8 +1697,8 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
                 on_child(*id);
             }
         }
-        HeapData::Dataclass(dc) => {
-            // Dataclass attrs are stored in a Dict - iterate through entries
+        HeapData::HostClass(dc) => {
+            // HostClass attrs are stored in a Dict - iterate through entries
             for (k, v) in dc.attrs() {
                 if let Value::Ref(id) = k {
                     on_child(*id);
@@ -1889,7 +1889,7 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
             }
         }
         HeapData::Cell(cell) => cell.0.py_dec_ref_ids(stack),
-        HeapData::Dataclass(dc) => dc.py_dec_ref_ids(stack),
+        HeapData::HostClass(dc) => dc.py_dec_ref_ids(stack),
         HeapData::Class(class) => class.py_dec_ref_ids(stack),
         HeapData::Instance(instance) => instance.py_dec_ref_ids(stack),
         HeapData::BoundMethod(bm) => bm.py_dec_ref_ids(stack),

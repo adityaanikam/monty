@@ -342,7 +342,8 @@ export class WorkerTransport {
           args: call.args,
           kwargs: call.kwargs,
           callId: call.callId,
-          methodCall: call.methodCall,
+          // null (not undefined) for plain calls, matching the napi turn shape
+          instanceId: call.instanceId ?? null,
         }
       }
       case Ev.OsCall: {
@@ -357,8 +358,10 @@ export class WorkerTransport {
           callId: call.callId,
         }
       }
-      case Ev.NameLookup:
-        return { kind: 'nameLookup', name: decodeSingleString(event.bytes) }
+      case Ev.NameLookup: {
+        const lookup = decodeNameLookup(event.bytes)
+        return { kind: 'nameLookup', name: lookup.name, instanceId: lookup.instanceId ?? null }
+      }
       case Ev.ResolveFutures:
         return { kind: 'resolveFutures', pendingCallIds: decodeResolveFutures(event.bytes) }
       case Ev.FatalError:
@@ -425,13 +428,14 @@ interface DecodedCall {
   args: unknown[]
   kwargs: [unknown, unknown][]
   callId: number
-  methodCall: boolean
+  /** `FunctionCall.instance_id`: set for method calls on a host instance. */
+  instanceId?: bigint
 }
 
 /** Decodes a `FunctionCall`. */
 function decodeCall(bytes: Uint8Array): DecodedCall {
   const reader = new Reader(bytes)
-  const call: DecodedCall = { functionName: '', args: [], kwargs: [], callId: 0, methodCall: false }
+  const call: DecodedCall = { functionName: '', args: [], kwargs: [], callId: 0 }
   while (!reader.done) {
     const f = reader.next()
     switch (f.field) {
@@ -448,11 +452,23 @@ function decodeCall(bytes: Uint8Array): DecodedCall {
         call.callId = Number(f.value)
         break
       case 5:
-        call.methodCall = f.value !== 0n
+        call.instanceId = f.value // optional uint64 -> BigInt
         break
     }
   }
   return call
+}
+
+/** Decodes a `NameLookup`: `name = 1`, `optional uint64 instance_id = 2`. */
+function decodeNameLookup(bytes: Uint8Array): { name: string; instanceId?: bigint } {
+  const reader = new Reader(bytes)
+  const lookup: { name: string; instanceId?: bigint } = { name: '' }
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) lookup.name = decodeString(f.bytes)
+    else if (f.field === 2) lookup.instanceId = f.value
+  }
+  return lookup
 }
 
 // `OsCall.call` oneof field numbers (see monty.proto).

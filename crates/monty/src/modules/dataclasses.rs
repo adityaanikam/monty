@@ -23,7 +23,7 @@ use crate::{
     modules::ModuleFunctions,
     types::{
         Class, Dict, Instance, LazyHeapSet, Module,
-        dataclass::write_dataclass_repr,
+        host_class::write_dataclass_repr,
         instance::{class_name, instance_attr},
     },
     value::Value,
@@ -630,6 +630,9 @@ fn is_dataclass(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         Value::Ref(id) => match vm.heap.get(*id) {
             HeapData::Class(_) => is_dataclass_class(*id, vm),
             HeapData::Instance(instance) => is_dataclass_class(instance.class(), vm),
+            // Host-backed instances carry dataclass-ness as a flag set by the
+            // host when the value crossed the wire.
+            HeapData::HostClass(hc) => hc.is_dataclass(),
             _ => false,
         },
         _ => false,

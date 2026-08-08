@@ -19,10 +19,10 @@ use crate::{
     intern::FunctionId,
     modules::{collections::defaultdict::defaultdict_missing, dataclasses::DataclassField},
     types::{
-        BoundMethod, Bytes, BytesIterator, Class, Dataclass, Deque, Dict, DictItemIterator, DictItemsView,
-        DictKeyIterator, DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, Instance,
-        ItertoolsIter, LazyHeapSet, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, PyTrait, Range,
-        RangeIterator, ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, Tuple, TupleIterator, Type,
+        BoundMethod, Bytes, BytesIterator, Class, Deque, Dict, DictItemIterator, DictItemsView, DictKeyIterator,
+        DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, HostClass, Instance, ItertoolsIter,
+        LazyHeapSet, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, PyTrait, Range, RangeIterator,
+        ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, Tuple, TupleIterator, Type,
         callable_iterator::CallableIterator, date, datetime, deque::DequeIterator, list::ListIterator,
         str::allocate_string, timedelta, timezone,
     },
@@ -80,11 +80,12 @@ pub(crate) enum HeapData {
     /// Stored on the heap to keep `Value` enum small (16 bytes). Exceptions
     /// are created when exception types are called or when `raise` is executed.
     Exception(SimpleException),
-    /// A dataclass instance with fields and method references.
+    /// A host-backed class instance (the heap form of the wire `ClassInstance`).
     ///
-    /// Contains a class name, a Dict of field name -> value mappings, and a set
-    /// of method names that trigger external function calls when invoked.
-    Dataclass(Box<Dataclass>),
+    /// Holds the class name, the host identities (`instance_id`/`type_id`) and
+    /// the eagerly-sent attrs; missing public names suspend back to the host
+    /// as method calls or lazy attribute lookups.
+    HostClass(Box<HostClass>),
     /// A user-defined class object created by `class Foo: ...`.
     ///
     /// Holds the class name and a namespace of methods + class variables. Its own
@@ -223,7 +224,7 @@ impl HeapData {
             | Self::Closure(_)
             | Self::FunctionDefaults(_)
             | Self::Cell(_)
-            | Self::Dataclass(_)
+            | Self::HostClass(_)
             | Self::Class(_)
             | Self::Instance(_)
             | Self::BoundMethod(_)
@@ -300,7 +301,7 @@ impl HeapData {
             Self::Range(_) => Type::Range,
             Self::Slice(_) => Type::Slice,
             Self::Exception(e) => Type::Exception(e.exc_type()),
-            Self::Dataclass(_) => Type::Dataclass,
+            Self::HostClass(_) => Type::HostClass,
             // A class object's type is `type`; an instance's carries its class id.
             Self::Class(_) => Type::Type,
             Self::Instance(instance) => Type::Instance(instance.class()),
@@ -498,7 +499,7 @@ macro_rules! heap_read_output_py_trait_forward {
             Self::FrozenSet($value) => $body,
             Self::Range($value) => $body,
             Self::Slice($value) => $body,
-            Self::Dataclass($value) => $body,
+            Self::HostClass($value) => $body,
             Self::Class($value) => $body,
             Self::Instance($value) => $body,
             Self::BoundMethod($value) => $body,
@@ -994,7 +995,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::FrozenSet(value) => value.py_iter(self_id, vm),
             Self::Range(value) => value.py_iter(self_id, vm),
             Self::Slice(value) => value.py_iter(self_id, vm),
-            Self::Dataclass(value) => value.py_iter(self_id, vm),
+            Self::HostClass(value) => value.py_iter(self_id, vm),
             Self::Class(value) => value.py_iter(self_id, vm),
             Self::Instance(value) => value.py_iter(self_id, vm),
             Self::BoundMethod(value) => value.py_iter(self_id, vm),
@@ -1050,7 +1051,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::FrozenSet(value) => value.py_next(self_id, vm),
             Self::Range(value) => value.py_next(self_id, vm),
             Self::Slice(value) => value.py_next(self_id, vm),
-            Self::Dataclass(value) => value.py_next(self_id, vm),
+            Self::HostClass(value) => value.py_next(self_id, vm),
             Self::Class(value) => value.py_next(self_id, vm),
             Self::Instance(value) => value.py_next(self_id, vm),
             Self::BoundMethod(value) => value.py_next(self_id, vm),

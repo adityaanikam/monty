@@ -8,8 +8,8 @@
 // lists and `__monty_type__` marks types with no JS equivalent.
 //
 // Scope: scalars, containers, the datetime family, named tuples (→ plain
-// tuple), dataclasses, file handles, function values (→ name), and the marker
-// types. See `convert.rs` for the full mapping.
+// tuple), class instances, file handles, function values (→ name), and the
+// marker types. See `convert.rs` for the full mapping.
 
 import { MontyFileHandle, canonicalFileMode, validateFilePosition } from '../types.js'
 import { Reader, Writer, bitsToDouble, readInt32, unzigzag } from './proto.js'
@@ -39,7 +39,7 @@ const Tag = {
   BuiltinFunction: 21,
   Path: 22,
   FileHandle: 23,
-  Dataclass: 24,
+  ClassInstance: 24,
   Function: 25,
   Repr: 26,
   Cycle: 27,
@@ -131,8 +131,8 @@ function writeMarked(w: Writer, obj: Record<string, unknown>): void {
     case 'Exception':
       w.lengthDelimited(Tag.Exception, encodeExceptionValue(obj))
       break
-    case 'Dataclass':
-      w.lengthDelimited(Tag.Dataclass, encodeDataclass(obj))
+    case 'ClassInstance':
+      w.lengthDelimited(Tag.ClassInstance, encodeClassInstance(obj))
       break
     case 'FileHandle':
       w.lengthDelimited(Tag.FileHandle, encodeFileHandle(obj))
@@ -168,24 +168,40 @@ function encodeFunction(value: { name?: string }): Uint8Array {
   return w.finish()
 }
 
-function encodeDataclass(obj: Record<string, unknown>): Uint8Array {
+/**
+ * Encodes a `ClassInstance` marker (same shape the napi path produces:
+ * `attrs` as ordered `[name, value]` pairs, ids as BigInt). Validation
+ * messages mirror napi's so both transports fail malformed markers alike.
+ */
+function encodeClassInstance(obj: Record<string, unknown>): Uint8Array {
+  if (typeof obj.instanceId !== 'bigint') {
+    throw new TypeError(
+      `Object property 'instanceId' type mismatch. Expect value to be BigInt, but received ${jsType(obj.instanceId)}`,
+    )
+  }
   if (typeof obj.typeId !== 'bigint') {
     throw new TypeError(
       `Object property 'typeId' type mismatch. Expect value to be BigInt, but received ${jsType(obj.typeId)}`,
     )
   }
-  if (!Array.isArray(obj.fieldNames)) {
+  if (!Array.isArray(obj.attrs)) {
     throw new TypeError(
-      `Object property 'fieldNames' type mismatch. Expect value to be Array, but received ${jsType(obj.fieldNames)}`,
+      `Object property 'attrs' type mismatch. Expect value to be Array, but received ${jsType(obj.attrs)}`,
     )
   }
+  const pairs: [unknown, unknown][] = []
+  for (const pair of obj.attrs as unknown[]) {
+    if (!Array.isArray(pair)) throw new TypeError('ClassInstance attrs entries must be [name, value] pairs')
+    if (typeof pair[0] !== 'string') throw new TypeError('ClassInstance attr name must be a string')
+    pairs.push([pair[0], pair[1]])
+  }
   const w = new Writer()
-  w.string(1, String(obj.name)) // Dataclass.name
-  w.uint(2, obj.typeId) // Dataclass.type_id
-  for (const fieldName of obj.fieldNames) w.string(3, String(fieldName)) // Dataclass.field_names
-  const fields = (obj.fields ?? {}) as Record<string, unknown>
-  w.lengthDelimited(4, encodeDict(Object.entries(fields))) // Dataclass.attrs
-  if (obj.frozen) w.bool(5, true) // Dataclass.frozen
+  w.string(1, String(obj.name)) // ClassInstance.name
+  w.uint(2, obj.instanceId) // ClassInstance.instance_id
+  w.uint(3, obj.typeId) // ClassInstance.type_id
+  w.lengthDelimited(4, encodeDict(pairs)) // ClassInstance.attrs
+  if (obj.frozen) w.bool(5, true) // ClassInstance.frozen
+  if (obj.isDataclass) w.bool(6, true) // ClassInstance.is_dataclass
   return w.finish()
 }
 
@@ -320,8 +336,8 @@ export function decodeMontyObject(bytes: Uint8Array): unknown {
       return decodeException(f.bytes)
     case Tag.FileHandle:
       return decodeFileHandle(f.bytes)
-    case Tag.Dataclass:
-      return decodeDataclass(f.bytes)
+    case Tag.ClassInstance:
+      return decodeClassInstance(f.bytes)
     case Tag.Type:
       return { [TYPE_MARKER]: 'Type', value: decodeString(f.bytes) }
     case Tag.BuiltinFunction:
@@ -362,44 +378,50 @@ function decodeNamedTupleValues(bytes: Uint8Array): unknown[] {
   return values
 }
 
-function decodeDataclass(bytes: Uint8Array): MarkedValue {
-  const dataclass: MarkedValue = {
-    [TYPE_MARKER]: 'Dataclass',
+/**
+ * Decodes a `ClassInstance` message into the same marker object shape the
+ * napi path produces: `attrs` as ordered `[name, value]` pairs (non-string
+ * keys skipped, matching convert.rs) and ids as BigInt. The session layer
+ * (`restore`) maps the marker to the original host object or a proxy.
+ */
+function decodeClassInstance(bytes: Uint8Array): MarkedValue {
+  const instance: MarkedValue = {
+    [TYPE_MARKER]: 'ClassInstance',
     name: '',
+    instanceId: 0n,
     typeId: 0n,
-    fieldNames: [] as string[],
-    fields: {} as Record<string, unknown>,
+    attrs: [] as [string, unknown][],
     frozen: false,
+    isDataclass: false,
   }
-  const fieldNames = dataclass.fieldNames as string[]
-  const fields = dataclass.fields as Record<string, unknown>
+  const attrs = instance.attrs as [string, unknown][]
   const reader = new Reader(bytes)
   while (!reader.done) {
     const f = reader.next()
     switch (f.field) {
       case 1:
-        dataclass.name = decodeString(f.bytes)
+        instance.name = decodeString(f.bytes)
         break
       case 2:
-        dataclass.typeId = f.value // uint64 -> BigInt
+        instance.instanceId = f.value // uint64 -> BigInt
         break
       case 3:
-        fieldNames.push(decodeString(f.bytes))
+        instance.typeId = f.value // uint64 -> BigInt
         break
       case 4:
         for (const [key, value] of decodeDict(f.bytes)) {
-          // defineProperty (not assignment) so a "__proto__" field can't pollute
-          if (typeof key === 'string') {
-            Object.defineProperty(fields, key, { value, enumerable: true, writable: true, configurable: true })
-          }
+          if (typeof key === 'string') attrs.push([key, value])
         }
         break
       case 5:
-        dataclass.frozen = f.value !== 0n
+        instance.frozen = f.value !== 0n
+        break
+      case 6:
+        instance.isDataclass = f.value !== 0n
         break
     }
   }
-  return dataclass
+  return instance
 }
 
 function decodeStringField(bytes: Uint8Array, field: number): string {

@@ -420,6 +420,13 @@ impl Executor {
                     let err = ExcType::name_error(name);
                     frame_exit_result = vm.resume_with_exception(err.into());
                 }
+                // No host to serve a lazy attribute lookup — raise the
+                // AttributeError an unanswered lookup would produce, through
+                // the VM so the traceback is captured.
+                Ok(FrameExit::AttrLookup { name, class_name, .. }) => {
+                    let err = ExcType::attribute_error(&class_name, name.as_str(&self.interns));
+                    frame_exit_result = vm.resume_with_exception(err);
+                }
                 Ok(FrameExit::ExternalCall {
                     function_name,
                     args,
@@ -604,6 +611,9 @@ pub(crate) fn frame_exit_to_object(frame_exit_result: RunResult<FrameExit>, vm: 
         FrameExit::NameLookup { name_id, .. } => {
             let name = vm.interns.get_str(name_id);
             Err(ExcType::name_error(name).into())
+        }
+        FrameExit::AttrLookup { name, class_name, .. } => {
+            Err(ExcType::attribute_error(&class_name, name.as_str(vm.interns)))
         }
     }
 }
