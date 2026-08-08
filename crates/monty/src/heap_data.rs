@@ -20,9 +20,9 @@ use crate::{
     modules::{collections::defaultdict::defaultdict_missing, dataclasses::DataclassField},
     types::{
         BoundMethod, Bytes, BytesIterator, Class, Deque, Dict, DictItemIterator, DictItemsView, DictKeyIterator,
-        DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, HostClass, Instance, ItertoolsIter,
-        LazyHeapSet, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, PyTrait, Range, RangeIterator,
-        ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, Tuple, TupleIterator, Type,
+        DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, HostClass, HostClassType, Instance,
+        ItertoolsIter, LazyHeapSet, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, PyTrait, Range,
+        RangeIterator, ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, Tuple, TupleIterator, Type,
         callable_iterator::CallableIterator, date, datetime, deque::DequeIterator, list::ListIterator,
         str::allocate_string, timedelta, timezone,
     },
@@ -86,6 +86,10 @@ pub(crate) enum HeapData {
     /// the eagerly-sent attrs; missing public names suspend back to the host
     /// as method calls or lazy attribute lookups.
     HostClass(Box<HostClass>),
+    /// The lightweight type object `type(x)` materializes for a [`HostClass`]
+    /// instance — the real class lives on the host, so this is a named
+    /// stand-in (see `HostClassType`).
+    HostClassType(HostClassType),
     /// A user-defined class object created by `class Foo: ...`.
     ///
     /// Holds the class name and a namespace of methods + class variables. Its own
@@ -257,6 +261,7 @@ impl HeapData {
             | Self::RePattern(_)
             | Self::ReMatch(_)
             | Self::ExtFunction(_)
+            | Self::HostClassType(_)
             | Self::Date(_)
             | Self::DateTime(_)
             | Self::TimeDelta(_)
@@ -302,6 +307,7 @@ impl HeapData {
             Self::Slice(_) => Type::Slice,
             Self::Exception(e) => Type::Exception(e.exc_type()),
             Self::HostClass(_) => Type::HostClass,
+            Self::HostClassType(_) => Type::Type,
             // A class object's type is `type`; an instance's carries its class id.
             Self::Class(_) => Type::Type,
             Self::Instance(instance) => Type::Instance(instance.class()),
@@ -500,6 +506,7 @@ macro_rules! heap_read_output_py_trait_forward {
             Self::Range($value) => $body,
             Self::Slice($value) => $body,
             Self::HostClass($value) => $body,
+            Self::HostClassType($value) => $body,
             Self::Class($value) => $body,
             Self::Instance($value) => $body,
             Self::BoundMethod($value) => $body,
@@ -996,6 +1003,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::Range(value) => value.py_iter(self_id, vm),
             Self::Slice(value) => value.py_iter(self_id, vm),
             Self::HostClass(value) => value.py_iter(self_id, vm),
+            Self::HostClassType(value) => value.py_iter(self_id, vm),
             Self::Class(value) => value.py_iter(self_id, vm),
             Self::Instance(value) => value.py_iter(self_id, vm),
             Self::BoundMethod(value) => value.py_iter(self_id, vm),
@@ -1052,6 +1060,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::Range(value) => value.py_next(self_id, vm),
             Self::Slice(value) => value.py_next(self_id, vm),
             Self::HostClass(value) => value.py_next(self_id, vm),
+            Self::HostClassType(value) => value.py_next(self_id, vm),
             Self::Class(value) => value.py_next(self_id, vm),
             Self::Instance(value) => value.py_next(self_id, vm),
             Self::BoundMethod(value) => value.py_next(self_id, vm),

@@ -33,9 +33,9 @@ use crate::{
     modules::dataclasses::DataclassField,
     types::{
         BoundMethod, Bytes, BytesIterator, Class, Deque, Dict, DictItemIterator, DictItemsView, DictKeyIterator,
-        DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, HostClass, Instance, ItertoolsIter,
-        List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, Range, RangeIterator, ReMatch, RePattern,
-        Set, SetIterator, Slice, Str, StringIterator, TimeZone, Tuple, TupleIterator,
+        DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, HostClass, HostClassType, Instance,
+        ItertoolsIter, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, Range, RangeIterator,
+        ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, TimeZone, Tuple, TupleIterator,
         callable_iterator::CallableIterator, date, datetime, deque::DequeIterator, list::ListIterator, timedelta,
         timezone,
     },
@@ -241,6 +241,7 @@ pub enum HeapReadOutput<'a> {
     Slice(HeapRead<'a, Slice>),
     Exception(HeapRead<'a, SimpleException>),
     HostClass(HeapRead<'a, HostClass>),
+    HostClassType(HeapRead<'a, HostClassType>),
     Class(HeapRead<'a, Class>),
     Instance(HeapRead<'a, Instance>),
     BoundMethod(HeapRead<'a, BoundMethod>),
@@ -667,6 +668,7 @@ impl<'a> HeapPtr<'a> {
                 HeapReadOutput::Exception(heap_read(base, simple_exception, readers))
             }
             HeapData::HostClass(dataclass) => HeapReadOutput::HostClass(heap_read_boxed(base, dataclass, readers)),
+            HeapData::HostClassType(ty) => HeapReadOutput::HostClassType(heap_read(base, ty, readers)),
             HeapData::Class(class) => HeapReadOutput::Class(heap_read_boxed(base, class, readers)),
             HeapData::Instance(instance) => HeapReadOutput::Instance(heap_read_boxed(base, instance, readers)),
             HeapData::BoundMethod(bound_method) => HeapReadOutput::BoundMethod(heap_read(base, bound_method, readers)),
