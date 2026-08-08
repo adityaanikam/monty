@@ -13,6 +13,8 @@
 //! transport gets the same property for free — partial-message state lives
 //! inside the `WebSocketStream`, and `Stream::poll_next` is cancel-safe.
 
+#[cfg(feature = "telemetry-adapter")]
+use std::time::Instant;
 use std::{
     env,
     path::PathBuf,
@@ -39,7 +41,11 @@ use tokio_tungstenite::{
 
 use crate::{MontyTransport, PoolConfig, PoolError};
 #[cfg(feature = "telemetry-adapter")]
-use crate::{telemetry::Recorder, telemetry_adapter::TelemetryContext};
+use crate::{
+    metrics::{TurnMetrics, outcome},
+    telemetry::Recorder,
+    telemetry_adapter::TelemetryContext,
+};
 
 /// The async WebSocket stream type for a remote worker.
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -54,6 +60,10 @@ pub(crate) struct Worker {
     /// Records an adapter checkout's protocol turns, created only while needed.
     #[cfg(feature = "telemetry-adapter")]
     recorder: Option<Box<Recorder>>,
+    /// Records aggregate turn metrics, for every checkout this worker serves
+    /// rather than only the traced ones.
+    #[cfg(feature = "telemetry-adapter")]
+    metrics: Option<Box<TurnMetrics>>,
 }
 
 /// The two transports a worker can speak the protocol over. Both variants are
@@ -86,14 +96,34 @@ struct WebSocketWorker {
 impl Worker {
     /// Creates a worker for `config`'s transport.
     pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
-        match &config.transport {
+        #[cfg(feature = "telemetry-adapter")]
+        let started = Instant::now();
+        let worker = match &config.transport {
             MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path),
             // Bound the dial by `request_timeout` (see `websocket`); a missing
             // one falls back to a generous fixed budget.
             MontyTransport::Websocket(url) => {
                 Self::websocket(url, config.request_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT)).await
             }
+        };
+        #[cfg(feature = "telemetry-adapter")]
+        let worker = worker.map(|mut worker| {
+            worker.metrics = config
+                .metrics
+                .clone()
+                .map(|metrics| Box::new(TurnMetrics::new(metrics)));
+            worker
+        });
+        #[cfg(feature = "telemetry-adapter")]
+        if let Some(metrics) = &config.metrics {
+            let transport = if config.transport.is_websocket() {
+                "websocket"
+            } else {
+                "subprocess"
+            };
+            metrics.worker_spawn(started.elapsed(), transport, outcome(worker.is_ok()));
         }
+        worker
     }
 
     /// Spawns a local `monty subprocess` child with framed pipes.
@@ -136,6 +166,8 @@ impl Worker {
             checkouts_served: 0,
             #[cfg(feature = "telemetry-adapter")]
             recorder: None,
+            #[cfg(feature = "telemetry-adapter")]
+            metrics: None,
         })
     }
 
@@ -162,6 +194,8 @@ impl Worker {
             checkouts_served: 0,
             #[cfg(feature = "telemetry-adapter")]
             recorder: None,
+            #[cfg(feature = "telemetry-adapter")]
+            metrics: None,
         })
     }
 
@@ -177,18 +211,21 @@ impl Worker {
                 // no flush
                 encode_framed_into(request, &mut w.send_buf)?;
                 w.stdin.write_all(&w.send_buf).await?;
+                let len = w.send_buf.len();
                 // don't let one huge frame pin its capacity for the worker's life
                 if w.send_buf.capacity() > RETAIN_BUF_MAX {
                     w.send_buf = Vec::with_capacity(SEND_BUF_CAPACITY);
                 }
-                Ok(())
+                Ok(len)
             }
             WorkerKind::WebSocket(w) => {
                 let body = encode_to_capped_vec(request)?;
+                let len = body.len();
                 match &mut w.stream {
                     Some(stream) => stream
                         .send(Message::Binary(body.into()))
                         .await
+                        .map(|()| len)
                         .map_err(ws_to_frame_error),
                     None => Err(FrameError::Truncated),
                 }
@@ -197,9 +234,13 @@ impl Worker {
         // record only requests that hit the wire: a rejected oversize frame
         // leaves the turn (and any pending suspension) exactly where it was
         #[cfg(feature = "telemetry-adapter")]
-        if result.is_ok() {
+        if let Ok(len) = result {
             if let Some(recorder) = &mut self.recorder {
                 recorder.begin_turn(request);
+            }
+            if let Some(metrics) = &mut self.metrics {
+                metrics.frame("sent", len);
+                metrics.begin_turn(request);
             }
             if matches!(
                 request.kind,
@@ -208,7 +249,7 @@ impl Worker {
                 self.recorder = None;
             }
         }
-        result
+        result.map(drop)
     }
 
     /// Assigns propagated host context before this worker starts a checkout.
@@ -227,9 +268,9 @@ impl Worker {
     /// module docs), which is what lets `Checkout` race a turn against its
     /// deadline.
     pub(crate) async fn recv(&mut self) -> Result<pb::ChildEvent, FrameError> {
-        let event = match &mut self.kind {
+        let (event, len) = match &mut self.kind {
             WorkerKind::Subprocess(w) => match w.recv.recv().await? {
-                Some(event) => Ok(event),
+                Some(framed) => Ok(framed),
                 None => Err(FrameError::Truncated), // clean EOF mid-checkout is still a vanished peer
             },
             WorkerKind::WebSocket(w) => {
@@ -253,7 +294,7 @@ impl Worker {
                         Some(Err(_)) => return Err(FrameError::Truncated),
                     }
                 };
-                decode_event(&data)
+                decode_event(&data).map(|event| (event, data.len()))
             }
         }?;
         // only after a complete decode, so a `recv` future dropped mid-frame
@@ -262,6 +303,13 @@ impl Worker {
         if let Some(recorder) = &mut self.recorder {
             recorder.event(&event);
         }
+        #[cfg(feature = "telemetry-adapter")]
+        if let Some(metrics) = &mut self.metrics {
+            metrics.frame("received", len);
+            metrics.event(&event);
+        }
+        #[cfg(not(feature = "telemetry-adapter"))]
+        let _ = len;
         Ok(event)
     }
 
@@ -370,11 +418,11 @@ impl FrameRecv {
         }
     }
 
-    /// Reads and decodes one frame, enforcing [`MAX_FRAME_LEN`] before growing
-    /// the buffer to the announced size. `Ok(None)` on EOF at a frame boundary
-    /// — the peer closed between messages; EOF inside a frame is
-    /// [`FrameError::Truncated`].
-    async fn recv(&mut self) -> Result<Option<pb::ChildEvent>, FrameError> {
+    /// Reads and decodes one frame, returning it with its body size, and
+    /// enforcing [`MAX_FRAME_LEN`] before growing the buffer to the announced
+    /// size. `Ok(None)` on EOF at a frame boundary — the peer closed between
+    /// messages; EOF inside a frame is [`FrameError::Truncated`].
+    async fn recv(&mut self) -> Result<Option<(pb::ChildEvent, usize)>, FrameError> {
         // move leftover bytes from a previous coalesced read to the front so
         // the parse below always works from offset 0
         if self.consumed > 0 {
@@ -402,7 +450,7 @@ impl FrameRecv {
                         self.consumed = 0;
                         self.filled = 0;
                     }
-                    return Ok(Some(event));
+                    return Ok(Some((event, len as usize)));
                 }
                 // Growth is validated against MAX_FRAME_LEN above, keeping
                 // byzantine peers bounded to one frame buffer per worker.

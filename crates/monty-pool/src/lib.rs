@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 
 mod checkout;
+#[cfg(feature = "telemetry-adapter")]
+mod metrics;
 mod pool;
 #[cfg(feature = "telemetry-adapter")]
 mod telemetry;
@@ -15,6 +17,8 @@ use std::{borrow::Cow, error, fmt, io, num::NonZero, path::PathBuf, process::Exi
 pub use monty_proto::{MAX_VALUE_DEPTH, exceeds_max_value_depth};
 use monty_types::MontyException;
 
+#[cfg(feature = "telemetry-adapter")]
+pub use crate::metrics::Metrics;
 pub use crate::{
     checkout::{
         Checkout, MountSpec, MountSpecMode, OnPrint, OnRawEvent, PrintFuture, ReplConfig, ResumeValue, TurnEvent,
@@ -79,6 +83,12 @@ pub struct PoolConfig {
     /// Recycle (kill and respawn) a worker after this many checkouts, to
     /// bound the impact of any slow leak in a long-lived child.
     pub max_checkouts_per_worker: Option<u32>,
+    /// Where pool and turn metrics are recorded, from
+    /// [`TelemetryAdapterHandle::metrics`](telemetry_adapter::TelemetryAdapterHandle::metrics).
+    /// `None` records nothing at all. Independent of tracing: metrics cover
+    /// every checkout, traced or not.
+    #[cfg(feature = "telemetry-adapter")]
+    pub metrics: Option<Metrics>,
 }
 
 impl PoolConfig {
@@ -107,6 +117,8 @@ impl PoolConfig {
             request_timeout: None,
             duration_limit_grace: Some(Duration::from_secs(1)),
             max_checkouts_per_worker: None,
+            #[cfg(feature = "telemetry-adapter")]
+            metrics: None,
         }
     }
 }

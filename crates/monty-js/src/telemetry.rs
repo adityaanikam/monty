@@ -9,7 +9,8 @@ use std::{
 };
 
 use monty_pool::telemetry_adapter::{
-    configure_telemetry_adapter, TelemetryAdapter, TelemetryAdapterHandle, TELEMETRY_ADAPTER_VERSION,
+    configure_telemetry_adapter, Measurement, MetricKind, MetricValue, TelemetryAdapter, TelemetryAdapterHandle,
+    TELEMETRY_ADAPTER_VERSION,
 };
 use napi::{
     bindgen_prelude::{spawn, FnArgs, Function},
@@ -154,6 +155,29 @@ impl TelemetryAdapter for JsBridge {
                 "attributes": attributes,
             }),
         )
+    }
+
+    fn record_metric(&self, measurement: &Measurement<'_>) {
+        let kind = match measurement.kind {
+            MetricKind::Counter => "counter",
+            MetricKind::Gauge => "gauge",
+            MetricKind::Histogram => "histogram",
+        };
+        let value = match measurement.value {
+            MetricValue::I64(value) => JsonValue::from(value),
+            MetricValue::F64(value) => JsonValue::from(value),
+        };
+        // measurements carry no span context, so an adapter that does not know
+        // the `metric` kind can drop them without leaving a span half-built
+        self.emit(json!({
+            "kind": "metric",
+            "metricKind": kind,
+            "name": measurement.name,
+            "unit": measurement.unit,
+            "description": measurement.description,
+            "value": value,
+            "attributes": attributes(measurement.attributes),
+        }));
     }
 
     fn disable_root(&self, trace_id: TraceId, root_span_id: SpanId) {

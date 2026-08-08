@@ -74,13 +74,17 @@ impl Pool {
             }
         }
         let total = idle.len();
-        Ok(Self {
+        let pool = Self {
             inner: Arc::new(PoolInner {
                 config,
                 state: Mutex::new(PoolState { idle, total }),
                 available: Notify::new(),
             }),
-        })
+        };
+        // publish the pre-warmed size, so the gauge exists before any checkout
+        let (idle, busy) = pool.inner.worker_counts_now();
+        pool.inner.record_workers(idle, busy);
+        Ok(pool)
     }
 
     /// Dedicates a worker to one REPL session created from `repl`.
@@ -125,6 +129,9 @@ impl Pool {
         .into_iter()
         .map(|worker| (worker, CapacityGuard::new(&self.inner)))
         .collect();
+        for _ in &idle {
+            self.inner.count_termination("closed");
+        }
         for (worker, _) in &mut idle {
             let _ = worker
                 .send(&request(pb::parent_request::Kind::Shutdown(pb::Shutdown {})))
@@ -162,12 +169,35 @@ impl Pool {
 const SHUTDOWN_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 impl PoolInner {
-    /// Takes a worker, reusing/spawning a local one or connecting a fresh remote
-    /// one, waiting as capacity allows.
+    /// Takes a worker, reusing/spawning a local one or connecting a fresh
+    /// remote one, waiting as capacity allows — and times that for
+    /// `monty.pool.checkout.wait`.
     pub(crate) async fn acquire_worker(&self) -> Result<Worker, PoolError> {
+        #[cfg(feature = "telemetry-adapter")]
+        let started = Instant::now();
+        // set by the acquisition itself: only it can tell an idle reuse from a
+        // spawn, or either from a wait for capacity
+        let mut outcome = "idle";
+        let worker = self.acquire_worker_inner(&mut outcome).await;
+        #[cfg(feature = "telemetry-adapter")]
+        if let Some(metrics) = &self.config.metrics {
+            let outcome = match &worker {
+                Ok(_) => outcome,
+                Err(PoolError::Exhausted) => "exhausted",
+                Err(_) => "error",
+            };
+            metrics.checkout_wait(started.elapsed(), outcome);
+        }
+        worker
+    }
+
+    /// Reuses/spawns a local worker or connects a fresh remote one, waiting as
+    /// capacity allows, and reports through `outcome` how it got one.
+    async fn acquire_worker_inner(&self, outcome: &mut &'static str) -> Result<Worker, PoolError> {
         // WebSocket connections are single-use and never pooled idle, so the
         // idle-reuse step is skipped and each acquisition dials a fresh worker.
         let websocket = self.config.transport.is_websocket();
+        let mut waited = false;
         let deadline = self.config.checkout_timeout.map(|t| Instant::now() + t);
         loop {
             // Register for wakeups BEFORE checking state: a release landing
@@ -179,26 +209,41 @@ impl PoolInner {
             // spawn/connect and the notified wait never hold the lock.
             let spawn = {
                 let mut state = lock_ignore_poison(&self.state);
+                let mut reused = None;
+                let mut died_idle = 0;
                 if !websocket {
                     // discard workers that died while idle — their replacement
                     // is the spawn below or a later checkout's spawn
                     while let Some(mut worker) = state.idle.pop() {
                         if worker.is_dead() {
                             state.total -= 1;
+                            died_idle += 1;
                             drop(worker); // kill-on-drop backstop; already dead
                         } else {
-                            return Ok(worker);
+                            reused = Some(worker);
+                            break;
                         }
                     }
                 }
                 // reserve capacity before releasing the lock to spawn/connect
-                let below_cap = state.total < self.config.max_processes;
+                let below_cap = reused.is_none() && state.total < self.config.max_processes;
                 if below_cap {
                     state.total += 1;
+                }
+                let (idle, busy) = worker_counts(&state);
+                drop(state); // never call into the host adapter under the lock
+                for _ in 0..died_idle {
+                    self.count_termination("died_idle");
+                }
+                self.record_workers(idle, busy);
+                if let Some(worker) = reused {
+                    *outcome = if waited { "waited" } else { "idle" };
+                    return Ok(worker);
                 }
                 below_cap
             };
             if spawn {
+                *outcome = if waited { "waited" } else { "spawned" };
                 // guard the reserved slot: a failed — or cancelled, for the
                 // WebSocket dial — spawn must release it or the pool shrinks
                 let capacity = CapacityGuard::new(self);
@@ -206,6 +251,7 @@ impl PoolInner {
                 capacity.disarm();
                 return Ok(worker);
             }
+            waited = true;
             match deadline {
                 Some(deadline) => {
                     if timeout_at(deadline, notified).await.is_err() {
@@ -215,6 +261,37 @@ impl PoolInner {
                 None => notified.await,
             }
         }
+    }
+
+    /// Counts one worker leaving the pool. Every path that drops a worker
+    /// records here or in [`crate::checkout`], so the reasons add up to the
+    /// pool's whole turnover.
+    pub(crate) fn count_termination(&self, reason: &'static str) {
+        #[cfg(feature = "telemetry-adapter")]
+        if let Some(metrics) = &self.config.metrics {
+            metrics.worker_terminated(reason);
+        }
+        #[cfg(not(feature = "telemetry-adapter"))]
+        let _ = reason;
+    }
+
+    /// Re-states the worker gauges after a change to the pool's state. Call it
+    /// with the lock already released: recording reaches into the host's SDK
+    /// (and, for a Python host, its GIL), which must never happen under the
+    /// pool mutex.
+    pub(crate) fn record_workers(&self, idle: usize, busy: usize) {
+        #[cfg(feature = "telemetry-adapter")]
+        if let Some(metrics) = &self.config.metrics {
+            metrics.workers(idle, busy);
+        }
+        #[cfg(not(feature = "telemetry-adapter"))]
+        let _ = (idle, busy);
+    }
+
+    /// Snapshots the gauge values from the pool state: a worker reserved for a
+    /// spawn counts as busy, since it exists to serve a waiting checkout.
+    pub(crate) fn worker_counts_now(&self) -> (usize, usize) {
+        worker_counts(&lock_ignore_poison(&self.state))
     }
 
     /// Returns a healthy worker to the idle queue (or retires it when it hit
@@ -228,19 +305,36 @@ impl PoolInner {
                 .is_some_and(|max| worker.checkouts_served >= max);
         if recycle {
             drop(worker); // kill (on drop) — reaped by tokio in the background
+            self.count_termination(if websocket { "single_use" } else { "recycled" });
             self.release_capacity();
         } else {
-            lock_ignore_poison(&self.state).idle.push(worker);
+            let (idle, busy) = {
+                let mut state = lock_ignore_poison(&self.state);
+                state.idle.push(worker);
+                worker_counts(&state)
+            };
             self.available.notify_one();
+            self.record_workers(idle, busy);
         }
     }
 
     /// Records the death/retirement of a worker, freeing capacity for a
     /// future spawn.
     pub(crate) fn release_capacity(&self) {
-        lock_ignore_poison(&self.state).total -= 1;
+        let (idle, busy) = {
+            let mut state = lock_ignore_poison(&self.state);
+            state.total -= 1;
+            worker_counts(&state)
+        };
         self.available.notify_one();
+        self.record_workers(idle, busy);
     }
+}
+
+/// The gauge values for a pool state: idle workers, and the rest (checked out
+/// or mid-spawn).
+fn worker_counts(state: &PoolState) -> (usize, usize) {
+    (state.idle.len(), state.total.saturating_sub(state.idle.len()))
 }
 
 /// RAII hold on one reserved capacity slot: releases it on drop unless
@@ -253,11 +347,39 @@ impl PoolInner {
 /// kill-on-drop handle kills the child whenever it is dropped.
 pub(crate) struct CapacityGuard<'a> {
     pool: Option<&'a PoolInner>,
+    /// Why the worker holding this slot left the pool, counted when the slot
+    /// is released. `None` for a slot merely reserved for a spawn, where no
+    /// worker has left.
+    reason: Option<&'static str>,
 }
 
 impl<'a> CapacityGuard<'a> {
+    /// Guards a slot reserved for a spawn that has not produced a worker yet.
     pub(crate) fn new(pool: &'a PoolInner) -> Self {
-        Self { pool: Some(pool) }
+        Self {
+            pool: Some(pool),
+            reason: None,
+        }
+    }
+
+    /// Guards the slot of a worker being torn down, counting its termination
+    /// under `reason` when the slot is released.
+    ///
+    /// The count belongs to the guard rather than to the teardown code because
+    /// every one of those sites awaits a reap: a caller dropping the turn
+    /// future there still kills the worker and frees its slot, so the
+    /// termination has to be counted on that path too.
+    pub(crate) fn terminating(pool: &'a PoolInner, reason: &'static str) -> Self {
+        Self {
+            pool: Some(pool),
+            reason: Some(reason),
+        }
+    }
+
+    /// Refines the reason once the worker's exit status has classified it.
+    /// The reason it replaces is what a cancelled teardown records instead.
+    pub(crate) const fn set_reason(&mut self, reason: &'static str) {
+        self.reason = Some(reason);
     }
 
     /// Keeps the slot reserved: the capacity was consumed by a live worker.
@@ -269,6 +391,9 @@ impl<'a> CapacityGuard<'a> {
 impl Drop for CapacityGuard<'_> {
     fn drop(&mut self) {
         if let Some(pool) = self.pool {
+            if let Some(reason) = self.reason {
+                pool.count_termination(reason);
+            }
             pool.release_capacity();
         }
     }

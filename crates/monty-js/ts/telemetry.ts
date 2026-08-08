@@ -16,8 +16,8 @@ export interface TelemetryTimestamp {
   nanoseconds: number
 }
 
-/** Version-1 native telemetry event delivered on the Node event loop. */
-export interface TelemetryEvent {
+/** Version-1 native span/log event delivered on the Node event loop. */
+export interface TelemetrySpanEvent {
   kind: 'start' | 'end' | 'log' | 'close'
   traceId: string
   spanId?: string
@@ -34,6 +34,31 @@ export interface TelemetryEvent {
   /** A `close` event that discards every span after global bridge disablement. */
   all?: boolean
 }
+
+/**
+ * One metric measurement, with everything needed to create the instrument
+ * named by `name` on first sight.
+ *
+ * Metrics carry no trace context: they are pool-wide aggregates that cover
+ * untraced sessions and worker lifecycle events belonging to no session. An
+ * adapter that only reconstructs spans can ignore them.
+ */
+export interface TelemetryMetricEvent {
+  kind: 'metric'
+  /** Which instrument records this measurement. */
+  metricKind: 'counter' | 'gauge' | 'histogram'
+  /** Dotted instrument name, e.g. `monty.pool.checkout.wait`. */
+  name: string
+  /** UCUM unit: `s`, `By`, `1`, or a `{thing}` annotation for counts. */
+  unit: string
+  /** One-line description of what the instrument measures. */
+  description: string
+  value: number
+  attributes: Record<string, unknown>
+}
+
+/** Version-1 native telemetry event delivered on the Node event loop. */
+export type TelemetryEvent = TelemetrySpanEvent | TelemetryMetricEvent
 
 /** Adapter installed by the JavaScript Logfire SDK. */
 export interface MontyTelemetryAdapter {

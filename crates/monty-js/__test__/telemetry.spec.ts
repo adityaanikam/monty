@@ -30,8 +30,9 @@ test('installed telemetry adapter receives the session tree', async (ctx) => {
   const result = await session.feedRun("'\\x00' * 70000")
   t.is((result as string).length, 70_000)
   await session.close()
+  const spanEvents = () => events.filter((event) => event.kind !== 'metric')
   const deadline = Date.now() + 2_000
-  while (events.length < 4 && Date.now() < deadline) {
+  while (spanEvents().length < 4 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
 
@@ -51,7 +52,18 @@ test('installed telemetry adapter receives the session tree', async (ctx) => {
   t.true((output as string).length < (result as string).length)
   t.is(runEnd?.attributes?.length_limit_exceeded, true)
   t.deepEqual(
-    events.map((event) => event.kind),
+    spanEvents().map((event) => event.kind),
     ['start', 'start', 'end', 'end'],
   )
+
+  // metrics travel over the same callback but carry no trace context
+  const metrics = events.filter((event) => event.kind === 'metric')
+  const run = metrics.find((event) => event.name === 'monty.run.duration')
+  t.is(run?.metricKind, 'histogram')
+  t.is(run?.unit, 's')
+  t.deepEqual(run?.attributes, { outcome: 'complete' })
+  t.true((run?.value ?? 0) > 0)
+  const workers = metrics.filter((event) => event.name === 'monty.pool.workers')
+  t.true(workers.length > 0)
+  t.is(workers[0]?.metricKind, 'gauge')
 })

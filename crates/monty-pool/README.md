@@ -114,6 +114,30 @@ that creates each checkout's serialized parent context. Records are emitted thro
 SDK and exporter. Without the feature, workers contain no telemetry recorder or telemetry
 hot path.
 
+### Metrics
+
+The same handle yields a `Metrics` for `PoolConfig::metrics` — as does
+`Metrics::for_logfire` for a Rust host, which records into real instruments on its own meter
+(with exponential histogram buckets) rather than pushing measurements at an adapter it would
+otherwise have to implement to receive its own data. Either turns on the aggregate
+side: pool health (`monty.pool.workers`, `monty.pool.checkout.wait`,
+`monty.pool.worker.spawn.duration`, `monty.pool.worker.terminated`,
+`monty.pool.session.duration`) and per-turn cost (`monty.run.duration`,
+`monty.run.execution_time`, `monty.run.duration_budget_used`, `monty.turn.duration`,
+`monty.run.suspensions`, `monty.host.call.duration`, `monty.os.call.duration`,
+`monty.os.io.bytes`, `monty.errors`, `monty.snapshot.bytes`, `monty.print.bytes`,
+`monty.wire.frame.bytes`).
+
+Two differences from the spans above. Metrics cover **every** checkout, not only the ones a
+host gave a parent context — an aggregate over traced sessions alone would be misleading —
+and they record no sandbox-supplied values: attributes are closed sets, so an unresolved
+function name, an unrecognised exception class or any path is aggregated away rather than
+becoming its own time series. The subtraction worth knowing: `monty.run.duration` minus
+`monty.run.execution_time` is time the *host* spent answering suspensions.
+
+Measurements reach `TelemetryAdapter::record_metric`, which defaults to dropping them, so an
+adapter written before metrics existed keeps working unchanged.
+
 ## Transports
 
 - **Subprocess** (`PoolConfig::subprocess`) — spawn local `monty subprocess` children over

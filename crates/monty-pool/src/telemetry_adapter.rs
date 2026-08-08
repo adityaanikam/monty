@@ -19,6 +19,8 @@ use opentelemetry_sdk::{
     trace::{Span, SpanData, SpanProcessor},
 };
 
+pub use crate::metrics::{Measurement, MetricKind, MetricValue, Metrics};
+
 /// Current host-adapter protocol version.
 pub const TELEMETRY_ADAPTER_VERSION: u8 = 1;
 
@@ -26,6 +28,9 @@ pub const TELEMETRY_ADAPTER_VERSION: u8 = 1;
 pub struct TelemetryAdapterHandle {
     /// Retains the isolated provider and its processors for the handle's lifetime.
     logfire: Logfire,
+    /// The adapter itself, which metrics reach directly rather than through
+    /// the span pipeline.
+    adapter: Arc<dyn TelemetryAdapter>,
 }
 
 /// Distributed parent context and isolated recorder for one checkout root.
@@ -68,6 +73,16 @@ impl TelemetryAdapterHandle {
             parent: None,
             logfire: self.logfire.clone(),
         }
+    }
+
+    /// Metrics handle for [`PoolConfig::metrics`](crate::PoolConfig::metrics).
+    ///
+    /// Unlike spans, metrics do not travel per checkout: they are pool-wide
+    /// aggregates covering untraced sessions and worker lifecycle events that
+    /// belong to no session at all.
+    #[must_use]
+    pub fn metrics(&self) -> Metrics {
+        Metrics::new(Arc::clone(&self.adapter))
     }
 }
 
@@ -114,13 +129,24 @@ pub trait TelemetryAdapter: Send + Sync + 'static {
     fn emit_log(&self, parent_span_id: SpanId, record: &SdkLogRecord) -> bool;
     /// Discards host-side state after delivery for one Monty root becomes unreliable.
     fn disable_root(&self, trace_id: TraceId, root_span_id: SpanId);
+    /// Records one metric measurement, creating the instrument named by
+    /// [`Measurement::name`] on first sight.
+    ///
+    /// Defaults to dropping the measurement, so an adapter written against an
+    /// earlier version of this trait keeps compiling and keeps working — which
+    /// is why adding metrics did not bump [`TELEMETRY_ADAPTER_VERSION`].
+    /// Metrics carry no span context and cannot disable a root, so unlike the
+    /// methods above this one reports nothing back.
+    fn record_metric(&self, measurement: &Measurement<'_>) {
+        let _ = measurement;
+    }
 }
 
 /// Configures the exporter-free Rust pipeline shared by language adapters.
 pub fn configure_telemetry_adapter(
     adapter: Arc<dyn TelemetryAdapter>,
 ) -> Result<TelemetryAdapterHandle, ConfigureError> {
-    let processor = AdapterProcessor::new(adapter);
+    let processor = AdapterProcessor::new(Arc::clone(&adapter));
     let logfire = logfire::configure()
         .local()
         .send_to_logfire(false)
@@ -129,7 +155,7 @@ pub fn configure_telemetry_adapter(
         .with_additional_span_processor(processor.clone())
         .with_advanced_options(AdvancedOptions::default().with_log_processor(processor))
         .finish()?;
-    Ok(TelemetryAdapterHandle { logfire })
+    Ok(TelemetryAdapterHandle { logfire, adapter })
 }
 
 /// Shared processor state for span ancestry and root-level disablement.

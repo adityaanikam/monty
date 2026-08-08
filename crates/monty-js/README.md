@@ -360,6 +360,12 @@ disables the adapter and sends one global cleanup notification rather than
 risking unbounded host memory. Browser/WASM does not yet implement this adapter
 path.
 
+The same callback also delivers pool metrics as `{ kind: 'metric' }` events —
+worker counts, checkout waits, worker deaths by reason, run durations and each
+feed's sandbox execution time. They carry no trace context (they cover every
+checkout, traced or not) and no sandbox-supplied values, so an adapter that only
+reconstructs spans should ignore that kind.
+
 ## Value Conversion
 
 | Python            | JavaScript                                              |

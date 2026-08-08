@@ -9,7 +9,8 @@ use std::{
 };
 
 use monty_pool::telemetry_adapter::{
-    TELEMETRY_ADAPTER_VERSION, TelemetryAdapter, TelemetryAdapterHandle, TelemetryContext, configure_telemetry_adapter,
+    Measurement, MetricKind, MetricValue, Metrics, TELEMETRY_ADAPTER_VERSION, TelemetryAdapter, TelemetryAdapterHandle,
+    TelemetryContext, configure_telemetry_adapter,
 };
 use opentelemetry::{
     Array, KeyValue, Value,
@@ -33,6 +34,11 @@ struct InstalledBridge {
 struct PythonBridge {
     adapter: Py<PyAny>,
     disabled: AtomicBool,
+    /// Whether the adapter implements `record_metric`, resolved on the first
+    /// measurement. Adapters written before metrics existed simply lack it,
+    /// and dropping their measurements must not disturb their spans — so this
+    /// is a capability check, not an error.
+    metrics: OnceLock<bool>,
 }
 
 static BRIDGE: OnceLock<InstalledBridge> = OnceLock::new();
@@ -48,12 +54,22 @@ pub(crate) fn _install_telemetry_adapter(version: u8, adapter: Py<PyAny>) -> PyR
     let bridge = Arc::new(PythonBridge {
         adapter,
         disabled: AtomicBool::new(false),
+        metrics: OnceLock::new(),
     });
     let handle = configure_telemetry_adapter(Arc::clone(&bridge) as Arc<dyn TelemetryAdapter>)
         .map_err(|err| PyRuntimeError::new_err(format!("failed to configure Monty telemetry: {err}")))?;
     BRIDGE
         .set(InstalledBridge { bridge, handle })
         .map_err(|_| PyRuntimeError::new_err("Monty telemetry is already configured"))
+}
+
+/// The pool metrics handle, when an adapter is installed.
+///
+/// Unlike [`capture_telemetry_context`] this is not per-checkout: metrics are
+/// pool-wide, so it is read once when a pool is configured.
+pub(crate) fn pool_metrics() -> Option<Metrics> {
+    let installed = BRIDGE.get()?;
+    (!installed.bridge.disabled.load(Ordering::Relaxed)).then(|| installed.handle.metrics())
 }
 
 /// Captures serializable distributed context while Python contextvars are active.
@@ -167,6 +183,59 @@ impl TelemetryAdapter for PythonBridge {
             adapter.call_method1("disable_root", (trace_id.to_string(), root_span_id.to_string()))?;
             Ok(())
         });
+    }
+
+    fn record_metric(&self, measurement: &Measurement<'_>) {
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        Python::attach(|py| {
+            let adapter = self.adapter.bind(py);
+            if !*self
+                .metrics
+                .get_or_init(|| adapter.hasattr("record_metric").unwrap_or(false))
+            {
+                return;
+            }
+            let attributes = PyDict::new(py);
+            let call: PyResult<()> = (|| {
+                for attribute in measurement.attributes {
+                    set_value(&attributes, attribute.key.as_str(), &attribute.value)?;
+                }
+                let value = match measurement.value {
+                    MetricValue::I64(value) => value.into_pyobject(py)?.into_any(),
+                    MetricValue::F64(value) => value.into_pyobject(py)?.into_any(),
+                };
+                adapter.call_method1(
+                    "record_metric",
+                    (
+                        metric_kind(measurement.kind),
+                        measurement.name,
+                        measurement.unit,
+                        measurement.description,
+                        value,
+                        attributes,
+                    ),
+                )?;
+                Ok(())
+            })();
+            // a failing metrics callback disables the whole bridge, as a
+            // failing span callback does: it means the host is not in a state
+            // to be called into
+            if let Err(err) = call {
+                self.disabled.store(true, Ordering::Relaxed);
+                err.write_unraisable(py, Some(adapter));
+            }
+        });
+    }
+}
+
+/// The instrument kind a Python host creates for a measurement.
+fn metric_kind(kind: MetricKind) -> &'static str {
+    match kind {
+        MetricKind::Counter => "counter",
+        MetricKind::Gauge => "gauge",
+        MetricKind::Histogram => "histogram",
     }
 }
 

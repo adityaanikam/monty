@@ -198,6 +198,7 @@ impl NativePool {
         config.request_timeout = options.request_timeout_ms.map(duration_from_ms).transpose()?;
         config.duration_limit_grace = options.duration_limit_grace_ms.map(duration_from_ms).transpose()?;
         config.max_checkouts_per_worker = options.max_checkouts_per_worker;
+        config.metrics = configured_adapter().map(TelemetryAdapterHandle::metrics);
         if config.max_processes < 1 {
             return Err(invalid("maxProcesses must be at least 1"));
         }
