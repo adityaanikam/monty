@@ -193,7 +193,17 @@ function encodeClassInstance(obj: Record<string, unknown>): Uint8Array {
   for (const pair of obj.attrs as unknown[]) {
     if (!Array.isArray(pair)) throw new TypeError('ClassInstance attrs entries must be [name, value] pairs')
     if (typeof pair[0] !== 'string') throw new TypeError('ClassInstance attr name must be a string')
+    if (!(1 in pair)) throw new TypeError('ClassInstance attr value missing')
     pairs.push([pair[0], pair[1]])
+  }
+  // match the native binding: ids must fit u64 rather than silently encoding
+  // an invalid varint
+  const U64_MAX = 0xffff_ffff_ffff_ffffn
+  if (obj.instanceId < 0n || obj.instanceId > U64_MAX) {
+    throw new TypeError('ClassInstance instanceId must be a non-negative u64 BigInt')
+  }
+  if (obj.typeId < 0n || obj.typeId > U64_MAX) {
+    throw new TypeError('ClassInstance typeId must be a non-negative u64 BigInt')
   }
   const w = new Writer()
   w.string(1, String(obj.name)) // ClassInstance.name
