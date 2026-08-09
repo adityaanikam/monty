@@ -15,7 +15,7 @@ use tokio::{
 };
 
 #[cfg(feature = "telemetry")]
-use crate::telemetry_adapter::TelemetryContext;
+use crate::telemetry::TelemetryContext;
 use crate::{
     PoolConfig, PoolError,
     checkout::{Checkout, ReplConfig, request},

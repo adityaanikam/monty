@@ -19,7 +19,7 @@ use std::{
 
 use monty_pool::{
     Pool, PoolConfig, PoolError, PrintFuture, ReplConfig,
-    telemetry_adapter::{Measurement, MetricKind, MetricValue, TelemetryAdapter, configure_telemetry_adapter},
+    telemetry::{Measurement, MetricKind, MetricValue, TelemetryAdapter, configure_telemetry_adapter},
 };
 use monty_proto::pb;
 use monty_types::PrintStream;

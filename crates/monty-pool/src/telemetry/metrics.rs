@@ -1,10 +1,11 @@
 //! Aggregate metrics for pool health and turn latency — what the spans in
-//! [`crate::telemetry`] cannot answer: is the fleet saturated, how often do
-//! workers die, how much of its duration budget does a typical run use.
+//! [`tracing`](crate::telemetry::tracing) cannot answer: is the fleet
+//! saturated, how often do workers die, how much of its duration budget does a
+//! typical run use.
 //!
 //! Recorded for *every* checkout, not only those a host gave a
-//! [`TelemetryContext`](crate::telemetry_adapter::TelemetryContext) to: an
-//! aggregate covering only traced sessions would mislead. The host owns the
+//! [`TelemetryContext`](crate::telemetry::TelemetryContext) to: an aggregate
+//! covering only traced sessions would mislead. The host owns the
 //! instruments and the aggregation; each measurement is pushed to
 //! [`TelemetryAdapter::record_metric`] with the name, unit and description its
 //! SDK needs to create the instrument on first use.
@@ -31,13 +32,13 @@ use opentelemetry::{
     metrics::{Counter, Gauge},
 };
 
-use crate::telemetry_adapter::TelemetryAdapter;
+use crate::telemetry::TelemetryAdapter;
 
 /// Records measurements into the host's metrics SDK.
 ///
 /// Put on [`PoolConfig::metrics`](crate::PoolConfig::metrics); cheap to clone
 /// (one `Arc`). Comes from
-/// [`TelemetryAdapterHandle::metrics`](crate::telemetry_adapter::TelemetryAdapterHandle::metrics)
+/// [`TelemetryAdapterHandle::metrics`](crate::telemetry::TelemetryAdapterHandle::metrics)
 /// for a foreign-SDK host, or [`Metrics::for_logfire`] for a Rust one.
 #[derive(Clone)]
 pub struct Metrics(Arc<Sink>);
@@ -64,7 +65,8 @@ impl Metrics {
     /// already has a meter provider, so it gets real instruments — aggregated
     /// in-process, with exponential histogram buckets — instead of implementing
     /// [`TelemetryAdapter`] to receive its own measurements. The span-side
-    /// equivalent is `TelemetryContext::for_logfire`.
+    /// equivalent is
+    /// [`TelemetryContext::for_logfire`](crate::telemetry::TelemetryContext::for_logfire).
     #[must_use]
     pub fn for_logfire(logfire: Logfire) -> Self {
         Self(Arc::new(Sink::Logfire(Box::new(Instruments::new(logfire)))))
@@ -337,7 +339,7 @@ struct Instrument {
 }
 
 /// Records one worker's turns, mirroring the protocol the way
-/// [`crate::telemetry::Recorder`] mirrors it for spans.
+/// [`crate::telemetry::tracing::Recorder`] mirrors it for spans.
 ///
 /// A separate state machine rather than a branch inside that recorder, because
 /// metrics must also run for untraced checkouts. Lives on the
@@ -860,7 +862,7 @@ mod tests {
     };
 
     use super::{Measurement, MetricValue, Metrics, TurnMetrics};
-    use crate::telemetry_adapter::TelemetryAdapter;
+    use crate::telemetry::TelemetryAdapter;
 
     /// An adapter that keeps every measurement instead of exporting it.
     #[derive(Default)]

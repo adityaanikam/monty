@@ -20,9 +20,9 @@ use opentelemetry::Value as OtelValue;
 use tracing::{Span, field::Empty};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::{
-    telemetry_adapter::TelemetryContext,
-    telemetry_json::{
+use crate::telemetry::{
+    TelemetryContext,
+    tracing_json::{
         nonfinite_str, serialize_capped, serialize_dict_capped, serialize_named_iter_capped, serialize_seq_capped,
         serialize_value_capped,
     },

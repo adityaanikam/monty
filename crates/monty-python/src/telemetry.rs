@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use monty_pool::telemetry_adapter::{
+use monty_pool::telemetry::{
     Measurement, MetricKind, MetricValue, Metrics, TELEMETRY_ADAPTER_VERSION, TelemetryAdapter, TelemetryAdapterHandle,
     TelemetryContext, configure_telemetry_adapter,
 };

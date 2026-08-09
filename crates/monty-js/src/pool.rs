@@ -31,7 +31,7 @@ use std::{
 
 use monty_pool::{
     exceeds_max_value_depth,
-    telemetry_adapter::{TelemetryAdapterHandle, TelemetryContext},
+    telemetry::{TelemetryAdapterHandle, TelemetryContext},
     Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig, ResumeValue,
     TurnEvent,
 };

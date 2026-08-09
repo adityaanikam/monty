@@ -1,4 +1,17 @@
-//! Host-neutral bridge from Monty's Rust spans to language SDK adapters.
+//! Telemetry for the pool: spans describing what each session did, and
+//! aggregate metrics over the fleet running them.
+//!
+//! This root is the host-facing surface both are delivered through — the
+//! [`TelemetryAdapter`] bridge for a host whose SDK is in another language,
+//! and [`TelemetryContext::for_logfire`] / [`Metrics::for_logfire`] for a Rust
+//! host that already owns one. The recorders behind it are internal: the
+//! `tracing` submodule mirrors the protocol into spans, `metrics` into
+//! instruments, and `tracing_json` encodes span attributes the way the Logfire
+//! SDKs do.
+
+pub(crate) mod metrics;
+pub(crate) mod tracing;
+mod tracing_json;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -9,6 +22,7 @@ use std::{
 };
 
 use logfire::{ConfigureError, Logfire, config::AdvancedOptions};
+pub use metrics::{Measurement, MetricKind, MetricValue, Metrics};
 use opentelemetry::{
     Context, InstrumentationScope,
     trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
@@ -18,8 +32,6 @@ use opentelemetry_sdk::{
     logs::{LogProcessor, SdkLogRecord},
     trace::{Span, SpanData, SpanProcessor},
 };
-
-pub use crate::metrics::{Measurement, MetricKind, MetricValue, Metrics};
 
 /// Current host-adapter protocol version.
 pub const TELEMETRY_ADAPTER_VERSION: u8 = 1;

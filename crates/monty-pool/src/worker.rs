@@ -39,13 +39,13 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message, protocol::WebSocketConfig},
 };
 
-use crate::{MontyTransport, PoolConfig, PoolError};
 #[cfg(feature = "telemetry")]
-use crate::{
+use crate::telemetry::{
+    TelemetryContext,
     metrics::{TurnMetrics, outcome},
-    telemetry::Recorder,
-    telemetry_adapter::TelemetryContext,
+    tracing::Recorder,
 };
+use crate::{MontyTransport, PoolConfig, PoolError};
 
 /// The async WebSocket stream type for a remote worker.
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;

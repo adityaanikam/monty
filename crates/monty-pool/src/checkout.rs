@@ -21,7 +21,7 @@ use monty_types::{
 use tokio::{task::spawn_blocking, time::timeout};
 
 #[cfg(feature = "telemetry")]
-use crate::metrics::outcome;
+use crate::telemetry::metrics::outcome;
 use crate::{
     CrashCause, PoolError,
     pool::{CapacityGuard, PoolInner},
