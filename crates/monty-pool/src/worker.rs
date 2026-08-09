@@ -194,7 +194,9 @@ impl Worker {
                 // no flush
                 encode_framed_into(request, &mut w.send_buf)?;
                 w.stdin.write_all(&w.send_buf).await?;
-                let len = w.send_buf.len();
+                // body only, matching the WebSocket transport and both receive
+                // paths, which never see the 4-byte length prefix
+                let len = w.send_buf.len() - 4;
                 // don't let one huge frame pin its capacity for the worker's life
                 if w.send_buf.capacity() > RETAIN_BUF_MAX {
                     w.send_buf = Vec::with_capacity(SEND_BUF_CAPACITY);

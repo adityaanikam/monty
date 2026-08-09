@@ -103,9 +103,8 @@ def test_installed_telemetry_adapter_receives_metrics():
         [
             'monty.pool.checkout.wait',
             'monty.pool.session.duration',
-            'monty.pool.worker.spawn.duration',
             'monty.pool.worker.terminated',
-            'monty.pool.workers',
+            'monty.pool.workers.live',
             'monty.print.bytes',
             'monty.run.duration',
             'monty.run.execution_time',

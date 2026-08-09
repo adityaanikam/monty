@@ -15,7 +15,7 @@ use tokio::{
 };
 
 #[cfg(feature = "telemetry")]
-use crate::telemetry::TelemetryContext;
+use crate::telemetry::{Metrics, TelemetryContext, metrics::LiveWorkersGauge};
 use crate::{
     PoolConfig, PoolError,
     checkout::{Checkout, ReplConfig, request},
@@ -46,6 +46,10 @@ pub(crate) struct PoolInner {
     /// Signalled whenever a worker returns to the idle queue or capacity is
     /// released, waking blocked `checkout` calls.
     available: Notify,
+    /// This pool's stake in the shared live-worker gauge (`None` without
+    /// configured metrics); dropping it with the pool zeroes the stake.
+    #[cfg(feature = "telemetry")]
+    live_gauge: Option<LiveWorkersGauge>,
 }
 
 struct PoolState {
@@ -76,6 +80,8 @@ impl Pool {
         let total = idle.len();
         let pool = Self {
             inner: Arc::new(PoolInner {
+                #[cfg(feature = "telemetry")]
+                live_gauge: config.metrics.as_ref().map(Metrics::live_workers_gauge),
                 config,
                 state: Mutex::new(PoolState { idle, total }),
                 available: Notify::new(),
@@ -274,14 +280,14 @@ impl PoolInner {
         let _ = reason;
     }
 
-    /// Re-states the live worker gauge after a change to the pool's state.
-    /// Call it with the lock already released: recording reaches into the
-    /// host's SDK (and, for a Python host, its GIL), which must never happen
-    /// under the pool mutex.
+    /// Re-states this pool's share of the live worker gauge after a change to
+    /// the pool's state. Call it with the lock already released: recording
+    /// reaches into the host's SDK (and, for a Python host, its GIL), which
+    /// must never happen under the pool mutex.
     pub(crate) fn record_live_workers(&self, live: usize) {
         #[cfg(feature = "telemetry")]
-        if let Some(metrics) = &self.config.metrics {
-            metrics.live_workers(live);
+        if let Some(gauge) = &self.live_gauge {
+            gauge.record(live);
         }
         #[cfg(not(feature = "telemetry"))]
         let _ = live;

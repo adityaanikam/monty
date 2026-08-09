@@ -40,9 +40,10 @@ pub const TELEMETRY_ADAPTER_VERSION: u8 = 1;
 pub struct TelemetryAdapterHandle {
     /// Retains the isolated provider and its processors for the handle's lifetime.
     logfire: Logfire,
-    /// The adapter itself, which metrics reach directly rather than through
-    /// the span pipeline.
-    adapter: Arc<dyn TelemetryAdapter>,
+    /// The one recorder every pool built from this handle shares, so the
+    /// worker gauges total over all of them. Reaches the adapter directly
+    /// rather than through the span pipeline.
+    metrics: Metrics,
 }
 
 /// Distributed parent context and isolated recorder for one checkout root.
@@ -89,28 +90,21 @@ impl TelemetryAdapterHandle {
 
     /// Metrics handle for [`PoolConfig::metrics`](crate::PoolConfig::metrics).
     ///
-    /// Unlike spans, metrics do not travel per checkout: they are pool-wide
-    /// aggregates covering untraced sessions and worker lifecycle events that
-    /// belong to no session at all.
+    /// Unlike spans, metrics do not travel per checkout: they are aggregates
+    /// covering untraced sessions and worker lifecycle events that belong to
+    /// no session at all. Every call returns the same shared recorder, so the
+    /// worker gauges sum over all pools configured from this handle.
     #[must_use]
     pub fn metrics(&self) -> Metrics {
-        Metrics::new(Arc::clone(&self.adapter))
+        self.metrics.clone()
     }
 }
 
 impl TelemetryContext {
-    /// Records the pool's spans straight into `logfire`, with no adapter.
-    ///
-    /// The rest of this module exists to hand spans to a *foreign* SDK, so its
-    /// pipeline is exporter-free and the host owns delivery. A Rust host has no
-    /// boundary to cross: it already has a configured `Logfire`, and the
-    /// recorder only needs one to write into. Without this it would have to
-    /// implement [`TelemetryAdapter`] and stand up a second OTLP exporter to
-    /// receive its own spans — or define a second span vocabulary of its own.
-    ///
-    /// Unparented, like [`TelemetryAdapterHandle::unparented_context`]: a Rust
-    /// host's ambient span is in the same process, so the pool's roots attach
-    /// to it through `tracing` rather than through W3C fields.
+    /// Records the pool's spans straight into `logfire`: a Rust host already
+    /// owns a configured SDK, so it needs no [`TelemetryAdapter`] bridge.
+    /// Unparented, like [`TelemetryAdapterHandle::unparented_context`] — an
+    /// in-process ambient span attaches through `tracing`, not W3C fields.
     #[must_use]
     pub fn for_logfire(logfire: Logfire) -> Self {
         Self { parent: None, logfire }
@@ -167,7 +161,10 @@ pub fn configure_telemetry_adapter(
         .with_additional_span_processor(processor.clone())
         .with_advanced_options(AdvancedOptions::default().with_log_processor(processor))
         .finish()?;
-    Ok(TelemetryAdapterHandle { logfire, adapter })
+    Ok(TelemetryAdapterHandle {
+        logfire,
+        metrics: Metrics::new(adapter),
+    })
 }
 
 /// Shared processor state for span ancestry and root-level disablement.

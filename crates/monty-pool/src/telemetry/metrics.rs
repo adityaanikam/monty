@@ -24,7 +24,7 @@ use std::{
     fmt,
     sync::{
         Arc, PoisonError, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicIsize, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -160,13 +160,16 @@ struct Instrument {
 #[derive(Clone)]
 pub struct Metrics(Arc<Shared>);
 
-/// What every worker of one pool records through.
+/// What every pool holding a clone of one [`Metrics`] records through.
 struct Shared {
     sink: Sink,
     /// Workers blocked on a suspension right now, behind [`IDLE_WORKERS`].
-    /// Shared because the gauge is a property of the pool, while the
+    /// Shared because the gauge spans every pool recording here, while the
     /// suspensions it counts are observed one worker at a time.
     idle: AtomicUsize,
+    /// Live workers across every pool, behind [`LIVE_WORKERS`]. Signed so a
+    /// racing decrement can transiently pass zero without wrapping.
+    live: AtomicIsize,
 }
 
 /// Where measurements go, which is what separates a host that owns an OTel SDK
@@ -185,14 +188,14 @@ impl Metrics {
         Self::with_sink(Sink::Adapter(adapter))
     }
 
-    /// Records into a Rust host's own `Logfire`, with no adapter in between.
-    ///
-    /// The adapter exists to hand measurements to a *foreign* SDK. A Rust host
-    /// already has a meter provider, so it gets real instruments — aggregated
-    /// in-process, with exponential histogram buckets — instead of implementing
-    /// [`TelemetryAdapter`] to receive its own measurements. The span-side
-    /// equivalent is
+    /// Records into a Rust host's own `Logfire` — real instruments with
+    /// exponential histogram buckets — with no [`TelemetryAdapter`] in between.
+    /// The span-side equivalent is
     /// [`TelemetryContext::for_logfire`](crate::telemetry::TelemetryContext::for_logfire).
+    ///
+    /// Create one and clone it per pool: the worker gauges sum over the pools
+    /// sharing a `Metrics`, and separate handles would overwrite each other's
+    /// observations instead.
     #[must_use]
     pub fn for_logfire(logfire: Logfire) -> Self {
         Self::with_sink(Sink::Logfire(Box::new(Instruments::new(logfire))))
@@ -202,16 +205,17 @@ impl Metrics {
         Self(Arc::new(Shared {
             sink,
             idle: AtomicUsize::new(0),
+            live: AtomicIsize::new(0),
         }))
     }
 
-    /// The pool's live worker count, re-stated after every change to it.
-    ///
-    /// A gauge rather than an up/down counter: a decrement missed on one error
-    /// path would skew an up/down counter for the process's whole life, while
-    /// a gauge is corrected by the next observation.
-    pub(crate) fn live_workers(&self, live: usize) {
-        self.record(&LIVE_WORKERS, MetricValue::count(live), &[]);
+    /// One pool's contribution to the shared live-worker gauge; dropped with
+    /// the pool, which zeroes its share (see [`LiveWorkersGauge`]).
+    pub(crate) fn live_workers_gauge(&self) -> LiveWorkersGauge {
+        LiveWorkersGauge {
+            metrics: self.clone(),
+            published: AtomicUsize::new(0),
+        }
     }
 
     /// Time [`Pool::checkout`](crate::Pool::checkout) spent obtaining a worker.
@@ -282,6 +286,47 @@ impl fmt::Debug for Metrics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Metrics")
     }
+}
+
+/// One pool's stake in [`LIVE_WORKERS`], which totals over every pool sharing
+/// a [`Metrics`] — per-pool series would leak one per pool and go stale on
+/// drop, while a shared sum stays the number a saturation alert watches.
+///
+/// The pool re-states its own count and this publishes the delta, so within a
+/// pool the gauge keeps self-correcting: a stale contribution lasts only until
+/// that pool's next observation. Dropping it zeroes the pool's share.
+pub(crate) struct LiveWorkersGauge {
+    metrics: Metrics,
+    /// This pool's last-published contribution to the shared total.
+    published: AtomicUsize,
+}
+
+impl LiveWorkersGauge {
+    /// Publishes this pool's current live-worker count and records the total.
+    ///
+    /// Two pools publishing at once can record out of order, leaving the gauge
+    /// briefly stale — accepted for the same reason as [`Metrics::idle_workers`].
+    pub(crate) fn record(&self, live: usize) {
+        let previous = self.published.swap(live, Ordering::Relaxed);
+        let delta = to_isize(live) - to_isize(previous);
+        let total = self.metrics.0.live.fetch_add(delta, Ordering::Relaxed) + delta;
+        let total = usize::try_from(total).unwrap_or(0);
+        self.metrics.record(&LIVE_WORKERS, MetricValue::count(total), &[]);
+    }
+}
+
+impl Drop for LiveWorkersGauge {
+    /// A dropped pool's workers are gone; without this its last count would
+    /// sit in the shared total forever.
+    fn drop(&mut self) {
+        self.record(0);
+    }
+}
+
+/// Saturating usize→isize for gauge deltas; counts near `isize::MAX` cannot
+/// occur, this only avoids an `as` cast that could wrap.
+fn to_isize(n: usize) -> isize {
+    isize::try_from(n).unwrap_or(isize::MAX)
 }
 
 /// One measurement, with everything the host needs to create the instrument it
@@ -1064,6 +1109,29 @@ mod tests {
         assert_eq!(
             capture.attributes("monty.run.duration"),
             [[("outcome".to_owned(), "error".to_owned())]]
+        );
+    }
+
+    /// The live gauge totals over the pools sharing one `Metrics`, and a
+    /// dropped pool's contribution is zeroed rather than left to go stale.
+    #[test]
+    fn live_workers_totals_over_pools_and_drops_cleanly() {
+        let capture = Arc::new(Capture::default());
+        let metrics = Metrics::new(Arc::clone(&capture) as Arc<dyn TelemetryAdapter>);
+        let first = metrics.live_workers_gauge();
+        let second = metrics.live_workers_gauge();
+        first.record(2);
+        second.record(3);
+        first.record(1);
+        drop(second);
+        assert_eq!(
+            capture.values("monty.pool.workers.live"),
+            [
+                MetricValue::I64(2),
+                MetricValue::I64(5),
+                MetricValue::I64(4),
+                MetricValue::I64(1)
+            ]
         );
     }
 

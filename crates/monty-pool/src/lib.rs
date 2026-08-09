@@ -11,6 +11,7 @@ use std::{borrow::Cow, error, fmt, io, num::NonZero, path::PathBuf, process::Exi
 pub use monty_proto::{MAX_VALUE_DEPTH, exceeds_max_value_depth};
 use monty_types::MontyException;
 
+#[cfg(feature = "telemetry")]
 use crate::telemetry::Metrics;
 pub use crate::{
     checkout::{
@@ -79,7 +80,8 @@ pub struct PoolConfig {
     /// Where pool and turn metrics are recorded, from
     /// [`TelemetryAdapterHandle::metrics`](telemetry::TelemetryAdapterHandle::metrics).
     /// `None` records nothing at all. Independent of tracing: metrics cover
-    /// every checkout, traced or not.
+    /// every checkout, traced or not. Give every pool a clone of one
+    /// `Metrics` — the worker gauges total over the pools sharing it.
     #[cfg(feature = "telemetry")]
     pub metrics: Option<Metrics>,
 }

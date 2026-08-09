@@ -86,6 +86,13 @@ jobs:
       - name: Check vendored typeshed stubs are in sync
         run: make check-typeshed
 
+      # every other CI invocation enables the optional features
+      # (monty-pool/telemetry, monty-proto's worker and python), hence this check
+      - name: Check feature-gated crates build without their features
+        run: cargo check -p monty-proto -p monty-pool
+        env:
+          RUSTFLAGS: -D warnings
+
   test-rust:
     runs-on: ubuntu-latest
 

@@ -136,6 +136,11 @@ series each. The one name recorded is an os call's, which comes from the protoco
 fixed set. The subtraction worth knowing: `monty.run.duration` minus
 `monty.run.execution_time` is time the *host* spent answering suspensions.
 
+Metric attributes deliberately never identify a pool. Give every pool a clone of one
+`Metrics` (the handle's `metrics()` always returns the same one): the worker gauges then
+total over the pools sharing it, and a dropped pool zeroes its contribution. Separate
+`Metrics` handles would overwrite each other's gauge observations instead.
+
 Measurements reach `TelemetryAdapter::record_metric`, which defaults to dropping them, so an
 adapter written before metrics existed keeps working unchanged.
 

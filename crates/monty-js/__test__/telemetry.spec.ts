@@ -63,7 +63,7 @@ test('installed telemetry adapter receives the session tree', async (ctx) => {
   t.is(run?.unit, 's')
   t.deepEqual(run?.attributes, { outcome: 'complete' })
   t.true((run?.value ?? 0) > 0)
-  const workers = metrics.filter((event) => event.name === 'monty.pool.workers')
+  const workers = metrics.filter((event) => event.name === 'monty.pool.workers.live')
   t.true(workers.length > 0)
   t.is(workers[0]?.metricKind, 'gauge')
 })
