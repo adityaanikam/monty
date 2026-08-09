@@ -13,7 +13,7 @@
 //! transport gets the same property for free — partial-message state lives
 //! inside the `WebSocketStream`, and `Stream::poll_next` is cancel-safe.
 
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 use std::time::Instant;
 use std::{
     env,
@@ -40,7 +40,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{MontyTransport, PoolConfig, PoolError};
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 use crate::{
     metrics::{TurnMetrics, outcome},
     telemetry::Recorder,
@@ -58,11 +58,11 @@ pub(crate) struct Worker {
     /// Checkouts this worker has served, for `max_checkouts_per_worker`.
     pub(crate) checkouts_served: u32,
     /// Records an adapter checkout's protocol turns, created only while needed.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     recorder: Option<Box<Recorder>>,
     /// Records aggregate turn metrics, for every checkout this worker serves
     /// rather than only the traced ones.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     metrics: Option<Box<TurnMetrics>>,
 }
 
@@ -96,7 +96,7 @@ struct WebSocketWorker {
 impl Worker {
     /// Creates a worker for `config`'s transport.
     pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         let started = Instant::now();
         let worker = match &config.transport {
             MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path),
@@ -106,7 +106,7 @@ impl Worker {
                 Self::websocket(url, config.request_timeout.unwrap_or(DEFAULT_DIAL_TIMEOUT)).await
             }
         };
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         let worker = worker.map(|mut worker| {
             worker.metrics = config
                 .metrics
@@ -114,7 +114,7 @@ impl Worker {
                 .map(|metrics| Box::new(TurnMetrics::new(metrics)));
             worker
         });
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Some(metrics) = &config.metrics {
             let transport = if config.transport.is_websocket() {
                 "websocket"
@@ -164,9 +164,9 @@ impl Worker {
                 send_buf: Vec::with_capacity(SEND_BUF_CAPACITY),
             })),
             checkouts_served: 0,
-            #[cfg(feature = "telemetry-adapter")]
+            #[cfg(feature = "telemetry")]
             recorder: None,
-            #[cfg(feature = "telemetry-adapter")]
+            #[cfg(feature = "telemetry")]
             metrics: None,
         })
     }
@@ -192,9 +192,9 @@ impl Worker {
         Ok(Self {
             kind: WorkerKind::WebSocket(Box::new(WebSocketWorker { stream: Some(stream) })),
             checkouts_served: 0,
-            #[cfg(feature = "telemetry-adapter")]
+            #[cfg(feature = "telemetry")]
             recorder: None,
-            #[cfg(feature = "telemetry-adapter")]
+            #[cfg(feature = "telemetry")]
             metrics: None,
         })
     }
@@ -233,7 +233,7 @@ impl Worker {
         };
         // record only requests that hit the wire: a rejected oversize frame
         // leaves the turn (and any pending suspension) exactly where it was
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Ok(len) = result {
             if let Some(recorder) = &mut self.recorder {
                 recorder.begin_turn(request);
@@ -253,7 +253,7 @@ impl Worker {
     }
 
     /// Assigns propagated host context before this worker starts a checkout.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     pub(crate) fn set_adapter_context(&mut self, context: TelemetryContext) {
         let worker_pid = self.pid();
         self.recorder
@@ -299,16 +299,16 @@ impl Worker {
         }?;
         // only after a complete decode, so a `recv` future dropped mid-frame
         // (deadline race) records nothing — cancel-safety intact
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Some(recorder) = &mut self.recorder {
             recorder.event(&event);
         }
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Some(metrics) = &mut self.metrics {
             metrics.frame("received", len);
             metrics.event(&event);
         }
-        #[cfg(not(feature = "telemetry-adapter"))]
+        #[cfg(not(feature = "telemetry"))]
         let _ = len;
         Ok(event)
     }

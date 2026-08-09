@@ -16,7 +16,7 @@ repository = { workspace = true }
 name = "monty_pool"
 
 [features]
-telemetry-adapter = [
+telemetry = [
     "dep:logfire",
     "dep:num-traits",
     "dep:opentelemetry",
@@ -26,6 +26,9 @@ telemetry-adapter = [
     "dep:tracing",
     "dep:tracing-opentelemetry",
 ]
+# Former name of `telemetry`, kept so consumers pinning this crate by git rev
+# or version keep building across the rename. Remove once they have moved.
+telemetry-adapter = ["telemetry"]
 
 [dependencies]
 monty-types = { workspace = true }

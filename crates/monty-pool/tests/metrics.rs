@@ -5,7 +5,7 @@
 //! a real worker is the plumbing — that every path which spawns, hands out or
 //! discards a worker reaches the adapter.
 
-#![cfg(feature = "telemetry-adapter")]
+#![cfg(feature = "telemetry")]
 
 use std::{
     collections::HashMap,

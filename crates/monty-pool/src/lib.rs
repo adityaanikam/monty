@@ -1,14 +1,14 @@
 #![doc = include_str!("../README.md")]
 
 mod checkout;
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 mod metrics;
 mod pool;
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 mod telemetry;
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 pub mod telemetry_adapter;
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 mod telemetry_json;
 mod worker;
 
@@ -17,7 +17,7 @@ use std::{borrow::Cow, error, fmt, io, num::NonZero, path::PathBuf, process::Exi
 pub use monty_proto::{MAX_VALUE_DEPTH, exceeds_max_value_depth};
 use monty_types::MontyException;
 
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 pub use crate::metrics::Metrics;
 pub use crate::{
     checkout::{
@@ -87,7 +87,7 @@ pub struct PoolConfig {
     /// [`TelemetryAdapterHandle::metrics`](telemetry_adapter::TelemetryAdapterHandle::metrics).
     /// `None` records nothing at all. Independent of tracing: metrics cover
     /// every checkout, traced or not.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     pub metrics: Option<Metrics>,
 }
 
@@ -117,7 +117,7 @@ impl PoolConfig {
             request_timeout: None,
             duration_limit_grace: Some(Duration::from_secs(1)),
             max_checkouts_per_worker: None,
-            #[cfg(feature = "telemetry-adapter")]
+            #[cfg(feature = "telemetry")]
             metrics: None,
         }
     }

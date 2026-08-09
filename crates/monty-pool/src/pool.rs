@@ -14,7 +14,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 use crate::telemetry_adapter::TelemetryContext;
 use crate::{
     PoolConfig, PoolError,
@@ -98,7 +98,7 @@ impl Pool {
     }
 
     /// Checks out a session with distributed context captured by a host adapter.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     pub async fn checkout_with_telemetry(
         &self,
         repl: &ReplConfig,
@@ -173,13 +173,13 @@ impl PoolInner {
     /// remote one, waiting as capacity allows — and times that for
     /// `monty.pool.checkout.wait`.
     pub(crate) async fn acquire_worker(&self) -> Result<Worker, PoolError> {
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         let started = Instant::now();
         // set by the acquisition itself: only it can tell an idle reuse from a
         // spawn, or either from a wait for capacity
         let mut outcome = "idle";
         let worker = self.acquire_worker_inner(&mut outcome).await;
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Some(metrics) = &self.config.metrics {
             let outcome = match &worker {
                 Ok(_) => outcome,
@@ -267,11 +267,11 @@ impl PoolInner {
     /// records here or in [`crate::checkout`], so the reasons add up to the
     /// pool's whole turnover.
     pub(crate) fn count_termination(&self, reason: &'static str) {
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Some(metrics) = &self.config.metrics {
             metrics.worker_terminated(reason);
         }
-        #[cfg(not(feature = "telemetry-adapter"))]
+        #[cfg(not(feature = "telemetry"))]
         let _ = reason;
     }
 
@@ -280,11 +280,11 @@ impl PoolInner {
     /// (and, for a Python host, its GIL), which must never happen under the
     /// pool mutex.
     pub(crate) fn record_workers(&self, idle: usize, busy: usize) {
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         if let Some(metrics) = &self.config.metrics {
             metrics.workers(idle, busy);
         }
-        #[cfg(not(feature = "telemetry-adapter"))]
+        #[cfg(not(feature = "telemetry"))]
         let _ = (idle, busy);
     }
 

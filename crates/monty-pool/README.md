@@ -94,7 +94,7 @@ a worker that has already exited.
 
 ## Observability
 
-The optional `telemetry-adapter` feature records semantic execution for language bindings
+The optional `telemetry` feature records semantic execution for language bindings
 and other hosts. `monty-pool` never selects an exporter, reads credentials or environment
 variables, or shuts an exporter down; the host SDK owns those choices and its final
 flush/shutdown.

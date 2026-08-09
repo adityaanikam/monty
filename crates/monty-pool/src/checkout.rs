@@ -1,6 +1,6 @@
 //! A checked-out worker: one REPL session, driven turn by turn.
 
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 use std::time::Instant;
 use std::{
     borrow::Cow,
@@ -20,7 +20,7 @@ use monty_types::{
 };
 use tokio::{task::spawn_blocking, time::timeout};
 
-#[cfg(feature = "telemetry-adapter")]
+#[cfg(feature = "telemetry")]
 use crate::metrics::outcome;
 use crate::{
     CrashCause, PoolError,
@@ -281,7 +281,7 @@ pub struct Checkout {
     feed_mounts: Option<MountTable>,
     /// When the session started, for `monty.pool.session.duration`. Taken by
     /// whichever of `finish` / `Drop` ends the session, so it is recorded once.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     started: Option<Instant>,
 }
 
@@ -330,7 +330,7 @@ impl Checkout {
             armed_deadline: None,
             restored_script_name: None,
             feed_mounts: None,
-            #[cfg(feature = "telemetry-adapter")]
+            #[cfg(feature = "telemetry")]
             started: Some(Instant::now()),
         };
         let mut no_print = on_print_sync(|_, _| {});
@@ -673,7 +673,7 @@ impl Checkout {
     /// error reported), but the pool remains healthy either way.
     pub async fn finish(mut self) -> Result<(), PoolError> {
         let result = self.finish_session().await;
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         self.record_finish(outcome(result.is_ok()));
         result
     }
@@ -709,7 +709,7 @@ impl Checkout {
     }
 
     /// Records the session's lifetime, once, when it ends.
-    #[cfg(feature = "telemetry-adapter")]
+    #[cfg(feature = "telemetry")]
     fn record_finish(&mut self, outcome: &'static str) {
         if let (Some(started), Some(metrics)) = (self.started.take(), &self.pool.config.metrics) {
             metrics.session_duration(started.elapsed(), outcome);
@@ -1318,7 +1318,7 @@ impl Drop for Checkout {
             self.pool.count_termination("abandoned");
             self.pool.release_capacity();
         }
-        #[cfg(feature = "telemetry-adapter")]
+        #[cfg(feature = "telemetry")]
         self.record_finish("abandoned");
     }
 }
