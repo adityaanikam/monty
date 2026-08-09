@@ -87,6 +87,15 @@ impl Capture {
             .unwrap_or_else(|| panic!("no {name} recorded with {key}={value}"))
     }
 
+    /// The most recent measurement recorded under `name`, whatever its
+    /// attributes.
+    #[track_caller]
+    fn latest(&self, name: &str) -> Recorded {
+        self.named(name)
+            .pop()
+            .unwrap_or_else(|| panic!("nothing recorded under {name}"))
+    }
+
     /// Whether anything was recorded under `name`.
     fn has(&self, name: &str) -> bool {
         !self.named(name).is_empty()
@@ -110,21 +119,10 @@ async fn a_feed_records_the_pool_and_turn_instruments() {
     config.max_processes = 2;
     let (pool, capture) = pool_with_metrics(config).await;
 
-    // pre-warming publishes the gauge and the spawn cost before any checkout
-    assert_eq!(
-        capture.last("monty.pool.workers", "state", "idle").value,
-        MetricValue::I64(1)
-    );
-    assert_eq!(
-        capture.last("monty.pool.workers", "state", "busy").value,
-        MetricValue::I64(0)
-    );
-    let spawn = capture.last("monty.pool.worker.spawn.duration", "outcome", "ok");
-    assert_eq!(spawn.kind, MetricKind::Histogram);
-    assert_eq!(
-        spawn.attributes.get("transport").map(String::as_str),
-        Some("subprocess")
-    );
+    // pre-warming publishes the live gauge before any checkout
+    let live = capture.latest("monty.pool.workers.live");
+    assert_eq!(live.value, MetricValue::I64(1));
+    assert_eq!(live.kind, MetricKind::Gauge);
 
     let mut checkout = pool.checkout(&ReplConfig::default()).await.expect("checkout");
     checkout
@@ -133,10 +131,10 @@ async fn a_feed_records_the_pool_and_turn_instruments() {
         .expect("feed");
     checkout.finish().await.expect("finish");
 
-    // the pre-warmed worker was reused, so no waiting and no second spawn
+    // the pre-warmed worker was reused, so nothing waited and nothing spawned
     assert_eq!(capture.named("monty.pool.checkout.wait").len(), 1);
     capture.last("monty.pool.checkout.wait", "outcome", "idle");
-    assert_eq!(capture.named("monty.pool.worker.spawn.duration").len(), 1);
+    assert_eq!(capture.latest("monty.pool.workers.live").value, MetricValue::I64(1));
 
     capture.last("monty.run.duration", "outcome", "complete");
     capture.last("monty.pool.session.duration", "outcome", "ok");
@@ -180,10 +178,7 @@ async fn saturation_and_abandonment_are_recorded() {
     drop(held);
     capture.last("monty.pool.session.duration", "outcome", "abandoned");
     capture.last("monty.pool.worker.terminated", "reason", "abandoned");
-    assert_eq!(
-        capture.last("monty.pool.workers", "state", "busy").value,
-        MetricValue::I64(0)
-    );
+    assert_eq!(capture.latest("monty.pool.workers.live").value, MetricValue::I64(0));
 }
 
 /// A worker that dies during a turn: the teardown path counts its termination
@@ -215,10 +210,7 @@ async fn a_crashed_worker_is_counted_as_it_is_torn_down() {
     // both the teardown and the drop that follows it
     assert_eq!(capture.named("monty.pool.worker.terminated").len(), 1);
     capture.last("monty.pool.worker.terminated", "reason", "crash");
-    assert_eq!(
-        capture.last("monty.pool.workers", "state", "busy").value,
-        MetricValue::I64(0)
-    );
+    assert_eq!(capture.latest("monty.pool.workers.live").value, MetricValue::I64(0));
 }
 
 /// A relay driving wire-level turns gets the same instrumentation as a typed

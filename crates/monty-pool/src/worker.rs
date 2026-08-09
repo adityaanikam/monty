@@ -13,8 +13,6 @@
 //! transport gets the same property for free — partial-message state lives
 //! inside the `WebSocketStream`, and `Stream::poll_next` is cancel-safe.
 
-#[cfg(feature = "telemetry")]
-use std::time::Instant;
 use std::{
     env,
     path::PathBuf,
@@ -40,11 +38,7 @@ use tokio_tungstenite::{
 };
 
 #[cfg(feature = "telemetry")]
-use crate::telemetry::{
-    TelemetryContext,
-    metrics::{TurnMetrics, outcome},
-    tracing::Recorder,
-};
+use crate::telemetry::{TelemetryContext, metrics::TurnMetrics, tracing::Recorder};
 use crate::{MontyTransport, PoolConfig, PoolError};
 
 /// The async WebSocket stream type for a remote worker.
@@ -96,8 +90,6 @@ struct WebSocketWorker {
 impl Worker {
     /// Creates a worker for `config`'s transport.
     pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
-        #[cfg(feature = "telemetry")]
-        let started = Instant::now();
         let worker = match &config.transport {
             MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path),
             // Bound the dial by `request_timeout` (see `websocket`); a missing
@@ -114,15 +106,6 @@ impl Worker {
                 .map(|metrics| Box::new(TurnMetrics::new(metrics)));
             worker
         });
-        #[cfg(feature = "telemetry")]
-        if let Some(metrics) = &config.metrics {
-            let transport = if config.transport.is_websocket() {
-                "websocket"
-            } else {
-                "subprocess"
-            };
-            metrics.worker_spawn(started.elapsed(), transport, outcome(worker.is_ok()));
-        }
         worker
     }
 

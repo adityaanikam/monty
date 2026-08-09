@@ -82,8 +82,7 @@ impl Pool {
             }),
         };
         // publish the pre-warmed size, so the gauge exists before any checkout
-        let (idle, busy) = pool.inner.worker_counts_now();
-        pool.inner.record_workers(idle, busy);
+        pool.inner.record_live_workers(pool.inner.live_workers_now());
         Ok(pool)
     }
 
@@ -230,12 +229,12 @@ impl PoolInner {
                 if below_cap {
                     state.total += 1;
                 }
-                let (idle, busy) = worker_counts(&state);
+                let live = state.total;
                 drop(state); // never call into the host adapter under the lock
                 for _ in 0..died_idle {
                     self.count_termination("died_idle");
                 }
-                self.record_workers(idle, busy);
+                self.record_live_workers(live);
                 if let Some(worker) = reused {
                     *outcome = if waited { "waited" } else { "idle" };
                     return Ok(worker);
@@ -275,23 +274,23 @@ impl PoolInner {
         let _ = reason;
     }
 
-    /// Re-states the worker gauges after a change to the pool's state. Call it
-    /// with the lock already released: recording reaches into the host's SDK
-    /// (and, for a Python host, its GIL), which must never happen under the
-    /// pool mutex.
-    pub(crate) fn record_workers(&self, idle: usize, busy: usize) {
+    /// Re-states the live worker gauge after a change to the pool's state.
+    /// Call it with the lock already released: recording reaches into the
+    /// host's SDK (and, for a Python host, its GIL), which must never happen
+    /// under the pool mutex.
+    pub(crate) fn record_live_workers(&self, live: usize) {
         #[cfg(feature = "telemetry")]
         if let Some(metrics) = &self.config.metrics {
-            metrics.workers(idle, busy);
+            metrics.live_workers(live);
         }
         #[cfg(not(feature = "telemetry"))]
-        let _ = (idle, busy);
+        let _ = live;
     }
 
-    /// Snapshots the gauge values from the pool state: a worker reserved for a
-    /// spawn counts as busy, since it exists to serve a waiting checkout.
-    pub(crate) fn worker_counts_now(&self) -> (usize, usize) {
-        worker_counts(&lock_ignore_poison(&self.state))
+    /// Snapshots the live worker count, which includes one reserved for a
+    /// spawn already under way.
+    pub(crate) fn live_workers_now(&self) -> usize {
+        lock_ignore_poison(&self.state).total
     }
 
     /// Returns a healthy worker to the idle queue (or retires it when it hit
@@ -308,33 +307,27 @@ impl PoolInner {
             self.count_termination(if websocket { "single_use" } else { "recycled" });
             self.release_capacity();
         } else {
-            let (idle, busy) = {
+            let live = {
                 let mut state = lock_ignore_poison(&self.state);
                 state.idle.push(worker);
-                worker_counts(&state)
+                state.total
             };
             self.available.notify_one();
-            self.record_workers(idle, busy);
+            self.record_live_workers(live);
         }
     }
 
     /// Records the death/retirement of a worker, freeing capacity for a
     /// future spawn.
     pub(crate) fn release_capacity(&self) {
-        let (idle, busy) = {
+        let live = {
             let mut state = lock_ignore_poison(&self.state);
             state.total -= 1;
-            worker_counts(&state)
+            state.total
         };
         self.available.notify_one();
-        self.record_workers(idle, busy);
+        self.record_live_workers(live);
     }
-}
-
-/// The gauge values for a pool state: idle workers, and the rest (checked out
-/// or mid-spawn).
-fn worker_counts(state: &PoolState) -> (usize, usize) {
-    (state.idle.len(), state.total.saturating_sub(state.idle.len()))
 }
 
 /// RAII hold on one reserved capacity slot: releases it on drop unless
