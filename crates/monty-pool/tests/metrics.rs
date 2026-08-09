@@ -213,6 +213,22 @@ async fn a_crashed_worker_is_counted_as_it_is_torn_down() {
     assert_eq!(capture.latest("monty.pool.workers.live").value, MetricValue::I64(0));
 }
 
+/// A pool dropped without `close` — a supported shutdown — still counts its
+/// idle workers out and zeroes the live gauge.
+#[tokio::test]
+async fn a_dropped_pool_counts_its_idle_workers() {
+    let mut config = PoolConfig::subprocess(monty_binary());
+    config.min_processes = 2;
+    config.max_processes = 2;
+    let (pool, capture) = pool_with_metrics(config).await;
+
+    drop(pool);
+    let closed = capture.named("monty.pool.worker.terminated");
+    assert_eq!(closed.len(), 2);
+    capture.last("monty.pool.worker.terminated", "reason", "closed");
+    assert_eq!(capture.latest("monty.pool.workers.live").value, MetricValue::I64(0));
+}
+
 /// A relay driving wire-level turns gets the same instrumentation as a typed
 /// caller: the state machine lives on the worker, below the checkout's
 /// typed/raw split, so neither path can be instrumented and the other not.

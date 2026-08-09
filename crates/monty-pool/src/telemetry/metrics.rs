@@ -251,19 +251,18 @@ impl Metrics {
         );
     }
 
-    /// Publishes the idle count after one worker blocked or was answered.
-    ///
-    /// Two workers changing state at once can publish out of order, leaving
-    /// the gauge briefly off by one; the next transition corrects it, and the
-    /// alternative — holding a lock across a call into the host's SDK — is the
-    /// deadlock the pool is careful to avoid everywhere else.
+    /// Publishes the idle count after one worker blocked or was answered;
+    /// [`record_stable`] keeps racing publishes from sticking out of order.
     fn idle_workers(&self, delta: isize) {
-        let idle = if delta > 0 {
-            self.0.idle.fetch_add(1, Ordering::Relaxed) + 1
+        if delta > 0 {
+            self.0.idle.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.0.idle.fetch_sub(1, Ordering::Relaxed).saturating_sub(1)
-        };
-        self.record(&IDLE_WORKERS, MetricValue::count(idle), &[]);
+            self.0.idle.fetch_sub(1, Ordering::Relaxed);
+        }
+        record_stable(
+            || self.0.idle.load(Ordering::Relaxed),
+            |idle| self.record(&IDLE_WORKERS, MetricValue::count(idle), &[]),
+        );
     }
 
     /// Hands one measurement to whichever sink this handle was built with.
@@ -302,16 +301,19 @@ pub(crate) struct LiveWorkersGauge {
 }
 
 impl LiveWorkersGauge {
-    /// Publishes this pool's current live-worker count and records the total.
-    ///
-    /// Two pools publishing at once can record out of order, leaving the gauge
-    /// briefly stale — accepted for the same reason as [`Metrics::idle_workers`].
+    /// Publishes this pool's current live-worker count and records the total;
+    /// [`record_stable`] keeps racing publishes from sticking out of order.
     pub(crate) fn record(&self, live: usize) {
         let previous = self.published.swap(live, Ordering::Relaxed);
         let delta = to_isize(live) - to_isize(previous);
-        let total = self.metrics.0.live.fetch_add(delta, Ordering::Relaxed) + delta;
-        let total = usize::try_from(total).unwrap_or(0);
-        self.metrics.record(&LIVE_WORKERS, MetricValue::count(total), &[]);
+        self.metrics.0.live.fetch_add(delta, Ordering::Relaxed);
+        record_stable(
+            || self.metrics.0.live.load(Ordering::Relaxed),
+            |total| {
+                let total = usize::try_from(total).unwrap_or(0);
+                self.metrics.record(&LIVE_WORKERS, MetricValue::count(total), &[]);
+            },
+        );
     }
 }
 
@@ -327,6 +329,24 @@ impl Drop for LiveWorkersGauge {
 /// occur, this only avoids an `as` cast that could wrap.
 fn to_isize(n: usize) -> isize {
     isize::try_from(n).unwrap_or(isize::MAX)
+}
+
+/// Records the atomic's current value, repeating until what was recorded is
+/// still current. Two racing updates can otherwise publish out of order and a
+/// stale value would stick until the *next* transition — which may never come.
+/// Every stale record is followed by a corrective one on the same thread, so
+/// the last value the host keeps is the true one, without holding a lock
+/// across the call into its SDK (the deadlock the pool avoids everywhere).
+fn record_stable<T: PartialEq + Copy>(load: impl Fn() -> T, record: impl Fn(T)) {
+    let mut value = load();
+    loop {
+        record(value);
+        let current = load();
+        if current == value {
+            break;
+        }
+        value = current;
+    }
 }
 
 /// One measurement, with everything the host needs to create the instrument it
@@ -613,6 +633,12 @@ impl TurnMetrics {
     /// Records one event from the worker: a suspension opens the pending
     /// round-trip, a turn-ending event closes the run or housekeeping turn.
     pub(crate) fn event(&mut self, event: &pb::ChildEvent) {
+        // a load's reply stamps the restored session's cumulative clock, spent
+        // in another process: re-base the delta ratchet so the next run
+        // records only its own cost
+        if matches!(self.turn, Some(("load", _))) {
+            self.reported_micros = self.reported_micros.max(event.total_execution_micros);
+        }
         match &event.kind {
             Some(pb::child_event::Kind::Print(p)) => self.metrics.record(
                 &PRINT_BYTES,
@@ -625,9 +651,12 @@ impl TurnMetrics {
             Some(pb::child_event::Kind::ResolveFutures(_)) => self.suspend(SuspensionKind::ResolveFutures),
             Some(pb::child_event::Kind::Complete(_)) => self.end_run("complete", event),
             Some(pb::child_event::Kind::Error(_)) => {
-                // an error answering a `Dump` leaves the feed suspended and
-                // resumable, so only the dump turn ends here
-                if matches!(self.turn, Some(("dump", _))) {
+                // an error answering an open housekeeping turn (`Dump`,
+                // `Load`, `InstallDependencies`, ...) is that turn's outcome,
+                // not a run's — no run happened, so recording an execution
+                // sample would fake one. A failed dump even leaves the feed
+                // suspended and resumable.
+                if self.turn.is_some() {
                     self.end_turn("error");
                 } else {
                     self.end_run("error", event);
@@ -651,6 +680,12 @@ impl TurnMetrics {
     /// Counts one suspension and starts timing the host's answer, during which
     /// this worker is idle.
     fn suspend(&mut self, kind: SuspensionKind) {
+        // a suspension answering `Load` is a restored feed re-raising it: the
+        // load itself is done, and the host round-trip that follows must not
+        // be billed to the load turn
+        if matches!(self.turn, Some(("load", _))) {
+            self.end_turn("ok");
+        }
         self.metrics.record(
             &SUSPENSIONS,
             MetricValue::I64(1),
@@ -1110,6 +1145,107 @@ mod tests {
             capture.attributes("monty.run.duration"),
             [[("outcome".to_owned(), "error".to_owned())]]
         );
+    }
+
+    /// A restored session's cumulative clock was spent in another process, so
+    /// the load's reply re-bases the ratchet and the next run records only
+    /// its own delta — not the whole restored history.
+    #[test]
+    fn a_load_rebases_the_execution_clock() {
+        let (mut metrics, capture) = recorder();
+        metrics.begin_turn(&request(pb::parent_request::Kind::Load(pb::Load { state: vec![] })));
+        metrics.event(&pb::ChildEvent {
+            kind: Some(pb::child_event::Kind::Ok(pb::Ok {})),
+            total_execution_micros: 10_000_000,
+            max_duration_micros: None,
+            restored_script_name: Some("dumped.py".to_owned()),
+        });
+        metrics.begin_turn(&feed());
+        metrics.event(&pb::ChildEvent {
+            kind: Some(pb::child_event::Kind::Complete(pb::Complete { value: None })),
+            total_execution_micros: 10_000_100,
+            max_duration_micros: None,
+            restored_script_name: None,
+        });
+
+        assert_eq!(
+            capture.values("monty.run.execution_time"),
+            [MetricValue::F64(Duration::from_micros(100).as_secs_f64())]
+        );
+    }
+
+    /// A feed restored mid-suspension re-raises the suspension as the load's
+    /// reply: that ends the load turn — the host round-trip that follows is
+    /// not the load's cost — and the eventual completion contributes only the
+    /// post-resume execution delta, with no wall time (the feed's start was
+    /// never seen in this process).
+    #[test]
+    fn a_restored_suspension_closes_the_load_turn() {
+        let (mut metrics, capture) = recorder();
+        metrics.begin_turn(&request(pb::parent_request::Kind::Load(pb::Load { state: vec![] })));
+        metrics.event(&pb::ChildEvent {
+            kind: Some(pb::child_event::Kind::NameLookup(pb::NameLookup {
+                name: "value".to_owned(),
+            })),
+            total_execution_micros: 10_000_000,
+            max_duration_micros: None,
+            restored_script_name: None,
+        });
+        let turns = capture.attributes("monty.turn.duration");
+        assert_eq!(
+            turns,
+            [[
+                ("turn".to_owned(), "load".to_owned()),
+                ("outcome".to_owned(), "ok".to_owned())
+            ]]
+        );
+
+        metrics.begin_turn(&request(pb::parent_request::Kind::ResumeNameLookup(
+            pb::ResumeNameLookup {
+                kind: Some(pb::resume_name_lookup::Kind::Value(MontyObject::Int(1).into())),
+            },
+        )));
+        metrics.event(&pb::ChildEvent {
+            kind: Some(pb::child_event::Kind::Complete(pb::Complete { value: None })),
+            total_execution_micros: 10_000_050,
+            max_duration_micros: None,
+            restored_script_name: None,
+        });
+        assert_eq!(
+            capture.values("monty.run.execution_time"),
+            [MetricValue::F64(Duration::from_micros(50).as_secs_f64())]
+        );
+        assert!(capture.values("monty.run.duration").is_empty());
+    }
+
+    /// An error answering a housekeeping turn is that turn's outcome; no run
+    /// happened, so no run instruments may record.
+    #[test]
+    fn a_failed_housekeeping_turn_is_not_a_run() {
+        let (mut metrics, capture) = recorder();
+        metrics.begin_turn(&request(pb::parent_request::Kind::InstallDependencies(
+            pb::InstallDependencies {
+                requirements: vec!["pydantic".to_owned()],
+            },
+        )));
+        metrics.event(&event(pb::child_event::Kind::Error(pb::Error {
+            exception: Some(pb::RaisedException {
+                exc_type: "ValueError".to_owned(),
+                message: None,
+                traceback: vec![],
+                data: None,
+            }),
+        })));
+
+        assert_eq!(
+            capture.attributes("monty.turn.duration"),
+            [[
+                ("turn".to_owned(), "install_dependencies".to_owned()),
+                ("outcome".to_owned(), "error".to_owned())
+            ]]
+        );
+        assert!(capture.values("monty.run.duration").is_empty());
+        assert!(capture.values("monty.run.execution_time").is_empty());
     }
 
     /// The live gauge totals over the pools sharing one `Metrics`, and a

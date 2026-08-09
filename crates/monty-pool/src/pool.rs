@@ -336,6 +336,19 @@ impl PoolInner {
     }
 }
 
+#[cfg(feature = "telemetry")]
+impl Drop for PoolInner {
+    /// A pool dropped without [`Pool::close`] — a supported shutdown — kills
+    /// its idle workers via their kill-on-drop handles; count them here so
+    /// that path does not under-report worker turnover. (`close` drains the
+    /// idle queue and counts, so nothing is counted twice.)
+    fn drop(&mut self) {
+        for _ in 0..lock_ignore_poison(&self.state).idle.len() {
+            self.count_termination("closed");
+        }
+    }
+}
+
 /// RAII hold on one reserved capacity slot: releases it on drop unless
 /// [`CapacityGuard::disarm`]ed.
 ///
