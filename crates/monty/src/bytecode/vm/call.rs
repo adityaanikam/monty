@@ -420,6 +420,11 @@ impl VM<'_> {
     /// Converts a direct call suspension into a specific synchronous-context error.
     #[cold]
     fn unsupported_call_result(&mut self, ctx: &'static str, result: CallResult) -> RunError {
+        // The rejected call will never be resumed. An un-dispatched
+        // `OsCallWithEffect` has not armed `pending_os_effect` (its pin is
+        // released by `result.drop_with` below), but discard defensively so a
+        // stale effect can never divert the next unrelated resume result.
+        self.discard_pending_os_effect();
         let error = match &result {
             CallResult::External(function_name, _) => ExcType::not_implemented(format!(
                 "{ctx}: external function '{}' is not yet supported in this context",
@@ -449,6 +454,11 @@ impl VM<'_> {
     /// Converts a nested VM suspension into a specific synchronous-context error.
     #[cold]
     fn unsupported_frame_exit(&mut self, ctx: &'static str, exit: FrameExit) -> RunError {
+        // The nested `run()` armed `pending_os_effect` at dispatch, but this
+        // suspension is rejected and will never be resumed — discard the
+        // effect (rolling back the pinned file's state) or the next unrelated
+        // resume result is silently diverted into the stale file buffer.
+        self.discard_pending_os_effect();
         let error = match &exit {
             FrameExit::Return(_) => unreachable!("return exits are handled above"),
             FrameExit::ExternalCall { function_name, .. } => ExcType::not_implemented(format!(

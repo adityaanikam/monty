@@ -1932,31 +1932,7 @@ impl<'h> VM<'h> {
     /// Also clears any pending file effect so user code that catches a
     /// host-side OS exception can retry without stale in-flight state.
     pub fn resume_with_exception(&mut self, error: RunError) -> Result<FrameExit, RunError> {
-        if let Some(effect) = self.pending_os_effect.take() {
-            match effect {
-                PendingOsEffect::BufferStore { file_id } => {
-                    if let HeapReadOutput::OpenFile(mut file) = self.heap.read(file_id) {
-                        file.get_mut(self.heap).clear_pending_read();
-                        drop(file);
-                    }
-                    self.heap.dec_ref(file_id);
-                }
-                PendingOsEffect::WritePosition {
-                    file_id,
-                    previous_position,
-                    previous_length,
-                } => {
-                    if let HeapReadOutput::OpenFile(mut file) = self.heap.read(file_id) {
-                        file.get_mut(self.heap)
-                            .rollback_write_position(previous_position, previous_length);
-                        drop(file);
-                    }
-                    self.heap.dec_ref(file_id);
-                }
-                // Holds no state or heap references — nothing to roll back.
-                PendingOsEffect::ListdirNames => {}
-            }
-        }
+        self.discard_pending_os_effect();
         // Use the normal exception handling mechanism
         // handle_exception returns None if caught, Some(error) if not caught
         if let Some(uncaught_error) = self.handle_exception(error) {
@@ -1964,6 +1940,43 @@ impl<'h> VM<'h> {
         }
         // Exception was caught, continue execution
         self.run_external()
+    }
+
+    /// Discards an in-flight [`PendingOsEffect`] whose OS call will never be
+    /// resumed with a result, rolling back the file state it guards and
+    /// releasing its pinned refcount.
+    ///
+    /// Must be called on every path that abandons a paused OS call — a
+    /// host-side exception, a suspension rejected in a synchronous context
+    /// (see `unsupported_frame_exit`), or VM teardown — otherwise the stale
+    /// effect diverts the next, unrelated resume result into the wrong file.
+    pub(crate) fn discard_pending_os_effect(&mut self) {
+        let Some(effect) = self.pending_os_effect.take() else {
+            return;
+        };
+        match effect {
+            PendingOsEffect::BufferStore { file_id } => {
+                if let HeapReadOutput::OpenFile(mut file) = self.heap.read(file_id) {
+                    file.get_mut(self.heap).clear_pending_read();
+                    drop(file);
+                }
+                self.heap.dec_ref(file_id);
+            }
+            PendingOsEffect::WritePosition {
+                file_id,
+                previous_position,
+                previous_length,
+            } => {
+                if let HeapReadOutput::OpenFile(mut file) = self.heap.read(file_id) {
+                    file.get_mut(self.heap)
+                        .rollback_write_position(previous_position, previous_length);
+                    drop(file);
+                }
+                self.heap.dec_ref(file_id);
+            }
+            // Holds no state or heap references — nothing to roll back.
+            PendingOsEffect::ListdirNames => {}
+        }
     }
 
     // ========================================================================
@@ -2453,9 +2466,7 @@ impl ContainsHeap for VM<'_> {
 /// `take_globals`) are harmlessly drained as empty.
 impl Drop for VM<'_> {
     fn drop(&mut self) {
-        if let Some(file_id) = self.pending_os_effect.take().and_then(PendingOsEffect::pinned_file) {
-            self.heap.dec_ref(file_id);
-        }
+        self.discard_pending_os_effect();
         self.exception_stack.drain(..).drop_with(self.heap);
         self.cleanup_current_task();
         self.scheduler.cleanup(self.heap);

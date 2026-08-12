@@ -191,6 +191,79 @@ f.read(5)
 }
 
 // ---------------------------------------------------------------------------
+// A buffered-file suspension rejected in a synchronous context (a sort key
+// cannot yield to the host) must discard the armed `PendingOsEffect`;
+// otherwise the next, unrelated OS result is silently diverted into the stale
+// file's buffer (#711).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rejected_read_suspension_in_sort_key_does_not_poison_next_os_result() {
+    let code = r"
+f = open('/x.txt')
+try:
+    [1].sort(key=lambda x: f.read(5))
+except NotImplementedError:
+    pass
+g = open('/y.txt')
+g.read()
+";
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
+    let open_call = progress.into_os_call().expect("expected Open OsCall for f");
+    assert_eq!(open_call.function_call.name(), "open");
+    // The rejected sort-key read happens in-VM between these two suspensions.
+    let progress = open_call
+        .resume(MontyObject::FileHandle(file_handle("/x.txt", "r")), PrintWriter::Stdout)
+        .unwrap();
+    let open_call = progress.into_os_call().expect("expected Open OsCall for g");
+    assert_eq!(open_call.function_call.name(), "open");
+    let progress = open_call
+        .resume(MontyObject::FileHandle(file_handle("/y.txt", "r")), PrintWriter::Stdout)
+        .unwrap();
+    // With a stale effect this resume would be routed into f's buffer and
+    // truncated to 5 chars; it must arrive as g's full content.
+    let read_call = progress.into_os_call().expect("expected ReadText OsCall for g");
+    assert_eq!(read_call.function_call.name(), "Path.read_text");
+    let progress = read_call
+        .resume(MontyObject::String("full content of y".to_owned()), PrintWriter::Stdout)
+        .unwrap();
+    let result = progress.into_complete().expect("expected Complete");
+    assert_eq!(result, MontyObject::String("full content of y".to_owned()));
+}
+
+#[test]
+fn rejected_write_suspension_in_sort_key_rolls_back_and_allows_retry() {
+    let code = r"
+f = open('/x.txt', 'w')
+try:
+    [1].sort(key=lambda x: f.write('abc'))
+except NotImplementedError:
+    pass
+f.write('retry')
+f.tell()
+";
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
+    let open_call = progress.into_os_call().expect("expected Open OsCall");
+    assert_eq!(open_call.function_call.name(), "open");
+    let progress = open_call
+        .resume(MontyObject::FileHandle(file_handle("/x.txt", "w")), PrintWriter::Stdout)
+        .unwrap();
+    // The rejected sort-key write must not leave a stale `WritePosition`
+    // effect: the retry write suspends afresh and its result lands cleanly.
+    let write_call = progress.into_os_call().expect("expected write OsCall for retry");
+    assert_eq!(write_call.function_call.name(), "Path.append_text");
+    let progress = write_call.resume(MontyObject::Int(5), PrintWriter::Stdout).unwrap();
+    let result = progress.into_complete().expect("expected Complete");
+    assert_eq!(result, MontyObject::Int(5));
+}
+
+// ---------------------------------------------------------------------------
 // apply_write_position: a host that returns a non-int (or negative) byte
 // count must surface as a clean Python error rather than panic. The
 // surfaced error from `as_int(...)?` is a TypeError; the negative-int
