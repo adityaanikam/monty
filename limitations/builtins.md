@@ -48,12 +48,15 @@ mechanism beyond dataclass field inheritance.
   CPython).
 - **dict/set lookups under a mutating `__eq__`** — like CPython, a lookup
   (`in`, `d[k]`, `set.remove`, …) whose user `__eq__` mutates the container
-  restarts its probe rather than raising. Monty snapshots candidate identities
-  and validates each before and after comparison, where CPython probes the live
-  table; a `__eq__` that removes a non-candidate entry and inserts a colliding
-  key equal to the one being looked up (leaving the length and every existing
-  candidate unchanged) can therefore be missed by that same lookup, where
-  CPython may find it. No mutation pattern can panic or corrupt either engine.
+  keeps probing rather than raising, and never repeats a comparison it has
+  already made. Monty re-reads the colliding candidates after each comparison
+  where CPython walks the live probe chain, so an `__eq__` that moves the entry
+  being compared makes Monty re-compare the other candidates from scratch —
+  extra `__eq__` calls CPython would not make (CPython restarts on that too, but
+  only after a resize or when that entry's own slot changed). An `__eq__` that
+  adds a colliding key on *every* comparison never finishes in either engine;
+  under `max_duration` Monty raises `TimeoutError`. No mutation pattern can
+  panic or corrupt either engine.
 - **`enumerate`, `zip`, `map`, `filter` and `reversed` are eager, not lazy** —
   each drains its source and returns a `list`, so `type(enumerate(x)).__name__`
   is `'list'` rather than `'enumerate'`. Observable several ways: a

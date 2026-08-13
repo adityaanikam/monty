@@ -137,6 +137,99 @@ assert stale_candidate_lookup('dict') is False
 assert stale_candidate_lookup('set') is False
 
 
+# === dict/set: a mutation that leaves the candidate in place compares once ===
+# CPython's `lookdict` only restarts when the compared entry itself changed, so
+# an insertion elsewhere must not repeat the comparison
+insert_calls = []
+D5 = {}
+
+
+class DictInserter:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        insert_calls.append('eq')
+        D5[len(D5) + 100] = 0
+        return True
+
+
+D5[DictInserter()] = 'v'
+assert D5[DictInserter()] == 'v'
+assert insert_calls == ['eq']
+assert len(D5) == 2
+
+insert_calls.clear()
+S3 = set()
+
+
+class SetInserter:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        insert_calls.append('eq')
+        S3.add(len(S3) + 100)
+        return False
+
+
+S3.add(SetInserter())
+assert (SetInserter() in S3) is False
+assert insert_calls == ['eq']
+assert len(S3) == 2
+
+
+# === dict/set: a colliding key inserted by __eq__ is still found ===
+# the probe re-reads the candidates and meets the new key, as CPython does by
+# carrying on through the live table — and like CPython it never re-compares a
+# candidate it already compared
+def inserted_candidate_lookup(kind, calls):
+    target = {} if kind == 'dict' else set()
+    inserted = False
+
+    class Wanted:
+        def __hash__(self):
+            return 1
+
+        def __eq__(self, other):
+            calls.append('wanted')
+            return isinstance(other, Wanted)
+
+    wanted = Wanted()
+
+    class Inserter:
+        def __hash__(self):
+            return 1
+
+        def __eq__(self, other):
+            nonlocal inserted
+            calls.append('inserter')
+            if not inserted:
+                inserted = True
+                if kind == 'dict':
+                    target[wanted] = 'inserted'
+                else:
+                    target.add(wanted)
+            return False
+
+    if kind == 'dict':
+        target[Inserter()] = 'original'
+        return target.get(Wanted(), 'MISS')
+    target.add(Inserter())
+    return Wanted() in target
+
+
+# the second 'inserter' is the nested insertion comparing against the entry
+# already stored, before the outer lookup goes on to the key it added
+dict_calls = []
+assert inserted_candidate_lookup('dict', dict_calls) == 'inserted'
+assert dict_calls == ['inserter', 'inserter', 'wanted']
+
+set_calls = []
+assert inserted_candidate_lookup('set', set_calls) is True
+assert set_calls == ['inserter', 'inserter', 'wanted']
+
+
 # === dict/set lookup calls the stored candidate's equality first ===
 equality_calls = []
 
@@ -280,6 +373,7 @@ except ValueError as exc:
 
 try:
     assert ComparisonRaiser() == 0
+    assert False, 'expected ValueError'
 except ValueError as exc:
     assert str(exc) == 'comparison failed'
 

@@ -641,6 +641,45 @@ a == b
     assert_timeout_in_builtin(code, "dict equality");
 }
 
+/// Test that a dict/set probe restarted by a mutating `__eq__` respects the
+/// time limit.
+///
+/// Every comparison adds another colliding key whose own `__eq__` does the
+/// same, so the probe never runs out of new candidates (CPython, walking the
+/// live chain, hangs on this too). Re-entering the VM for the callback restarts
+/// the dispatch countdown, so only the probe's own `check_time()` can end it.
+#[test]
+fn timeout_in_mutating_lookup_probe() {
+    let template = r"
+busy = False
+
+
+class Mutator:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        global busy
+        if not busy:
+            busy = True
+            ADD_MUTATOR
+            busy = False
+        return False
+
+
+container = MAKE_CONTAINER
+Mutator() in container
+";
+    let dict = template
+        .replace("ADD_MUTATOR", "container[Mutator()] = 0")
+        .replace("MAKE_CONTAINER", "{Mutator(): 0}");
+    let set = template
+        .replace("ADD_MUTATOR", "container.add(Mutator())")
+        .replace("MAKE_CONTAINER", "{Mutator()}");
+    assert_timeout_in_builtin(&dict, "dict probe restarted by __eq__");
+    assert_timeout_in_builtin(&set, "set probe restarted by __eq__");
+}
+
 /// Test that `str.splitlines()` on a large string respects the time limit.
 ///
 /// `str_splitlines()` scans the entire string for line endings in a while loop

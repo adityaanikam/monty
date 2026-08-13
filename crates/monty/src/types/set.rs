@@ -16,7 +16,7 @@ use crate::{
         HeapRead, HeapReadOutput, heap_read_ref_as_field, heap_read_ref_as_field_mut,
     },
     intern::StaticStrings,
-    types::{LazyHeapSet, Type, list::repr_items_fmt},
+    types::{LazyHeapSet, Type, dict::ProbeOutcome, list::repr_items_fmt},
     value::{EitherStr, VALUE_SIZE, Value},
 };
 
@@ -206,13 +206,19 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// Finds the index of the entry equal to `value`, or `None` if absent.
     ///
     /// Snapshots candidates so each index and value can be validated around
-    /// user `__eq__` without retaining a borrow of the hash table.
+    /// user `__eq__` without retaining a borrow of the hash table. Only a
+    /// candidate that moved restarts the whole probe; a mutation that merely
+    /// adds colliding values continues with those. Restarts poll the limits,
+    /// since calling back into the VM restarts its dispatch countdown and this
+    /// native loop reaches no checkpoint of its own. See
+    /// [`HeapRead::<Dict>::find_index_hash`] — the two must stay in sync.
     fn find_index(&self, value: &Value, hash: u64, vm: &mut VM<'h>) -> RunResult<Option<usize>> {
         'restart: loop {
+            // Collected inline rather than through `probe_candidates`, for the
+            // reason given in the dict twin.
             let mut candidate_indices: SmallVec<[usize; 2]> = SmallVec::new();
             let mut candidate_values: SmallVec<[Value; 2]> = SmallVec::new();
-            let storage = &self.get(vm.heap);
-            let len = storage.entries.len();
+            let storage = self.get(vm.heap);
             storage.indices.find(hash, |&idx| {
                 if storage.entries[idx].hash == hash {
                     candidate_indices.push(idx);
@@ -223,12 +229,14 @@ impl<'h> HeapRead<'h, SetStorage> {
             defer_drop!(candidate_values, vm);
 
             for (&candidate_index, candidate_value) in candidate_indices.iter().zip(candidate_values.iter()) {
-                if !self.probe_valid(len, candidate_index, hash, candidate_value, vm) {
+                if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
+                    vm.heap.tracker.check_memory_time()?;
                     continue 'restart;
                 }
                 // CPython compares the stored value on the left.
                 let eq = candidate_value.py_eq(value, vm)?;
-                if !self.probe_valid(len, candidate_index, hash, candidate_value, vm) {
+                if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
+                    vm.heap.tracker.check_memory_time()?;
                     continue 'restart;
                 }
                 if eq {
@@ -236,20 +244,101 @@ impl<'h> HeapRead<'h, SetStorage> {
                 }
             }
 
-            return Ok(None);
+            // A comparison can itself have added a colliding value the snapshot
+            // never saw, so a pass that ran any hands over to the
+            // mutation-aware continuation; with no candidates it is a miss.
+            if candidate_values.is_empty() {
+                return Ok(None);
+            }
+            match self.probe_after_compare(hash, value, candidate_values, vm)? {
+                ProbeOutcome::Found(index) => return Ok(Some(index)),
+                ProbeOutcome::Missing => return Ok(None),
+                // a candidate moved: fall through to the next probe from scratch
+                ProbeOutcome::Restart => (),
+            }
         }
+    }
+
+    /// Continues a probe whose comparisons all missed, in case one of them
+    /// mutated the set and added a colliding value.
+    ///
+    /// The twin of [`HeapRead::<Dict>::probe_after_compare`]: re-reads the
+    /// candidates until a pass finds nothing new, never comparing a value
+    /// twice, and off the ordinary lookup path.
+    fn probe_after_compare(
+        &self,
+        hash: u64,
+        value: &Value,
+        already_compared: &[Value],
+        vm: &mut VM<'h>,
+    ) -> RunResult<ProbeOutcome> {
+        let compared: SmallVec<[Value; 2]> = already_compared.iter().map(|v| v.clone_with_heap(vm.heap)).collect();
+        defer_drop_mut!(compared, vm);
+
+        loop {
+            let (candidate_indices, candidate_values) = self.probe_candidates(hash, vm);
+            defer_drop!(candidate_values, vm);
+            let mut compared_any = false;
+
+            for (&candidate_index, candidate_value) in candidate_indices.iter().zip(candidate_values.iter()) {
+                if compared.iter().any(|seen| seen.is(candidate_value)) {
+                    continue;
+                }
+                if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
+                    vm.heap.tracker.check_memory_time()?;
+                    return Ok(ProbeOutcome::Restart);
+                }
+                compared.push(candidate_value.clone_with_heap(vm.heap));
+                compared_any = true;
+                // CPython compares the stored value on the left.
+                let eq = candidate_value.py_eq(value, vm)?;
+                if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
+                    vm.heap.tracker.check_memory_time()?;
+                    return Ok(ProbeOutcome::Restart);
+                }
+                if eq {
+                    return Ok(ProbeOutcome::Found(candidate_index));
+                }
+            }
+
+            if !compared_any {
+                return Ok(ProbeOutcome::Missing);
+            }
+            vm.heap.tracker.check_memory_time()?;
+        }
+    }
+
+    /// Snapshots the live entries colliding on `hash`: their indices, plus an
+    /// owned reference to each of their values.
+    ///
+    /// Cloning the values lets `py_eq` run without the hash-table borrow held;
+    /// the caller owns the returned values and must drop them. Only the
+    /// mutation-aware continuation calls this — the fast path above inlines the
+    /// same collection.
+    fn probe_candidates(&self, hash: u64, vm: &VM<'h>) -> (SmallVec<[usize; 2]>, SmallVec<[Value; 2]>) {
+        let mut indices: SmallVec<[usize; 2]> = SmallVec::new();
+        let mut values: SmallVec<[Value; 2]> = SmallVec::new();
+        let storage = self.get(vm.heap);
+        storage.indices.find(hash, |&idx| {
+            if storage.entries[idx].hash == hash {
+                indices.push(idx);
+                values.push(storage.entries[idx].value.clone_with_heap(vm.heap));
+            }
+            false
+        });
+        (indices, values)
     }
 
     /// Checks that a snapshotted candidate still names the same live entry.
     ///
     /// The caller checks before and after `py_eq`; a mismatch restarts the probe.
-    fn probe_valid(&self, len: usize, index: usize, hash: u64, value: &Value, vm: &VM<'h>) -> bool {
+    #[inline]
+    fn probe_valid(&self, index: usize, hash: u64, value: &Value, vm: &VM<'h>) -> bool {
         let storage = self.get(vm.heap);
-        storage.entries.len() == len
-            && storage
-                .entries
-                .get(index)
-                .is_some_and(|entry| entry.hash == hash && entry.value.is(value))
+        storage
+            .entries
+            .get(index)
+            .is_some_and(|entry| entry.hash == hash && entry.value.is(value))
     }
 }
 
