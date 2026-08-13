@@ -46,6 +46,14 @@ mechanism beyond dataclass field inheritance.
   printed), as do list (live length, mid-repr pops truncate / appends extend),
   `set`, `collections.deque` and `collections.Counter` (all snapshot, like
   CPython).
+- **dict/set lookups under a mutating `__eq__`** — like CPython, a lookup
+  (`in`, `d[k]`, `set.remove`, …) whose user `__eq__` mutates the container
+  restarts its probe rather than raising. Monty detects the mutation via the
+  container's length plus the identity of the compared entry, where CPython
+  probes the live table; a `__eq__` that removes one entry *and* inserts a
+  colliding key equal to the one being looked up (leaving the length
+  unchanged) can therefore be missed by that same lookup, where CPython may
+  find it. No mutation pattern can panic or corrupt either engine.
 - **`enumerate`, `zip`, `map`, `filter` and `reversed` are eager, not lazy** —
   each drains its source and returns a `list`, so `type(enumerate(x)).__name__`
   is `'list'` rather than `'enumerate'`. Observable several ways: a

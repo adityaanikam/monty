@@ -125,28 +125,7 @@ impl<'h> HeapRead<'h, SetStorage> {
     fn remove(&mut self, value: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
         let hash = set_element_hash(value, vm)?;
 
-        // Collect candidates by hash
-        let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
-        let storage = &self.get(vm.heap);
-        storage.indices.find(hash, |&idx| {
-            if storage.entries[idx].hash == hash {
-                candidates.push(idx);
-            }
-            false
-        });
-
-        // Compare each candidate
-        let mut found_index = None;
-        for candidate_index in candidates {
-            let candidate_value = self.get(vm.heap).entries[candidate_index].value.clone_with_heap(vm);
-            defer_drop!(candidate_value, vm);
-            if value.py_eq(candidate_value, vm)? {
-                found_index = Some(candidate_index);
-                break;
-            }
-        }
-
-        let Some(index) = found_index else {
+        let Some(index) = self.find_index(value, hash, vm)? else {
             return Ok(false);
         };
 
@@ -221,27 +200,56 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// Checks if the set contains a value.
     pub fn contains(&self, value: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
         let hash = set_element_hash(value, vm)?;
+        Ok(self.find_index(value, hash, vm)?.is_some())
+    }
 
-        // Collect candidates by hash
-        let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
-        let storage = &self.get(vm.heap);
-        storage.indices.find(hash, |&idx| {
-            if storage.entries[idx].hash == hash {
-                candidates.push(idx);
-            }
-            false
-        });
+    /// Finds the index of the entry equal to `value`, or `None` if absent.
+    ///
+    /// Candidate indices are collected up front (avoiding a borrow conflict
+    /// between the index table and `py_eq`), but a user `__eq__` re-entering the
+    /// VM can mutate the set and leave them stale. Mirroring CPython's set
+    /// `lookkey`, every `py_eq` is followed by a validity check — length
+    /// unchanged and the identical value still at the candidate slot — and on
+    /// any mutation the whole probe restarts against the live entries.
+    fn find_index(&self, value: &Value, hash: u64, vm: &mut VM<'h>) -> RunResult<Option<usize>> {
+        'restart: loop {
+            let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
+            let storage = &self.get(vm.heap);
+            let len = storage.entries.len();
+            storage.indices.find(hash, |&idx| {
+                if storage.entries[idx].hash == hash {
+                    candidates.push(idx);
+                }
+                false
+            });
 
-        // Compare each candidate
-        for candidate_index in candidates {
-            let candidate_value = self.get(vm.heap).entries[candidate_index].value.clone_with_heap(vm);
-            defer_drop!(candidate_value, vm);
-            if value.py_eq(candidate_value, vm)? {
-                return Ok(true);
+            for candidate_index in candidates {
+                let candidate_value = self.get(vm.heap).entries[candidate_index].value.clone_with_heap(vm);
+                defer_drop!(candidate_value, vm);
+                let eq = value.py_eq(candidate_value, vm)?;
+                if !self.probe_valid(len, candidate_index, hash, candidate_value, vm) {
+                    continue 'restart;
+                }
+                if eq {
+                    return Ok(Some(candidate_index));
+                }
             }
+
+            return Ok(None);
         }
+    }
 
-        Ok(false)
+    /// True if a probe candidate is still valid after `py_eq` possibly ran user
+    /// code: the set's length is unchanged and the entry at `index` still holds
+    /// the identical value with the same hash. A `false` return means the set
+    /// was mutated mid-lookup and [`Self::find_index`] must restart its probe.
+    fn probe_valid(&self, len: usize, index: usize, hash: u64, value: &Value, vm: &VM<'h>) -> bool {
+        let storage = self.get(vm.heap);
+        storage.entries.len() == len
+            && storage
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.hash == hash && entry.value.is(value))
     }
 }
 
@@ -694,29 +702,16 @@ impl<'h> HeapRead<'h, Set> {
     /// `Ok(false)` if the element was already in the set (and the value is dropped).
     /// Returns `Err` if the element is unhashable (and the value is dropped).
     ///
-    /// Uses a two-phase lookup (collect candidates, then compare) to avoid
-    /// holding a borrow on the set storage during `py_eq` calls.
+    /// Uses the mutation-safe storage lookup ([`HeapRead::find_index`]) to
+    /// detect duplicates, so a user `__eq__` mutating the set mid-add cannot
+    /// leave the probe holding stale indices.
     pub fn add(&mut self, value: Value, vm: &mut VM<'h>) -> RunResult<bool> {
         let mut value_guard = DropGuard::new(value, vm);
         let (value, vm) = value_guard.as_parts();
         let hash = set_element_hash(value, vm)?;
 
-        // Collect candidate indices to avoid borrow conflict between set storage and py_eq
-        let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
-        let storage = &self.get(vm.heap).0;
-        storage.indices.find(hash, |&idx| {
-            if storage.entries[idx].hash == hash {
-                candidates.push(idx);
-            }
-            false
-        });
-
-        for candidate_index in candidates {
-            let candidate_value = self.get(vm.heap).0.entries[candidate_index].value.clone_with_heap(vm);
-            defer_drop!(candidate_value, vm);
-            if value.py_eq(candidate_value, vm)? {
-                return Ok(false);
-            }
+        if self.storage().find_index(value, hash, vm)?.is_some() {
+            return Ok(false);
         }
 
         // Add new entry

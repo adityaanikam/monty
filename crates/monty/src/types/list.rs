@@ -736,9 +736,14 @@ fn list_remove<'h>(list: &mut HeapRead<'h, List>, args: ArgValues, vm: &mut VM<'
 
     match found_idx {
         Some(idx) => {
-            // Remove the element and drop its refcount
-            let removed = list.get_mut(vm.heap).items.remove(idx);
-            removed.drop_with(vm.heap);
+            // A matching user `__eq__` may itself have shrunk the list, leaving
+            // `idx` stale; CPython clamps the deletion (`list_ass_slice`), so a
+            // gone index removes nothing rather than panicking.
+            let this = list.get_mut(vm.heap);
+            if idx < this.items.len() {
+                let removed = this.items.remove(idx);
+                removed.drop_with(vm.heap);
+            }
             Ok(Value::None)
         }
         None => Err(ExcType::value_error_remove_not_in_list()),
