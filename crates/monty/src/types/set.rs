@@ -205,28 +205,29 @@ impl<'h> HeapRead<'h, SetStorage> {
 
     /// Finds the index of the entry equal to `value`, or `None` if absent.
     ///
-    /// Candidate indices are collected up front (avoiding a borrow conflict
-    /// between the index table and `py_eq`), but a user `__eq__` re-entering the
-    /// VM can mutate the set and leave them stale. Mirroring CPython's set
-    /// `lookkey`, every `py_eq` is followed by a validity check — length
-    /// unchanged and the identical value still at the candidate slot — and on
-    /// any mutation the whole probe restarts against the live entries.
+    /// Snapshots candidates so each index and value can be validated around
+    /// user `__eq__` without retaining a borrow of the hash table.
     fn find_index(&self, value: &Value, hash: u64, vm: &mut VM<'h>) -> RunResult<Option<usize>> {
         'restart: loop {
-            let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
+            let mut candidate_indices: SmallVec<[usize; 2]> = SmallVec::new();
+            let mut candidate_values: SmallVec<[Value; 2]> = SmallVec::new();
             let storage = &self.get(vm.heap);
             let len = storage.entries.len();
             storage.indices.find(hash, |&idx| {
                 if storage.entries[idx].hash == hash {
-                    candidates.push(idx);
+                    candidate_indices.push(idx);
+                    candidate_values.push(storage.entries[idx].value.clone_with_heap(vm.heap));
                 }
                 false
             });
+            defer_drop!(candidate_values, vm);
 
-            for candidate_index in candidates {
-                let candidate_value = self.get(vm.heap).entries[candidate_index].value.clone_with_heap(vm);
-                defer_drop!(candidate_value, vm);
-                let eq = value.py_eq(candidate_value, vm)?;
+            for (&candidate_index, candidate_value) in candidate_indices.iter().zip(candidate_values.iter()) {
+                if !self.probe_valid(len, candidate_index, hash, candidate_value, vm) {
+                    continue 'restart;
+                }
+                // CPython compares the stored value on the left.
+                let eq = candidate_value.py_eq(value, vm)?;
                 if !self.probe_valid(len, candidate_index, hash, candidate_value, vm) {
                     continue 'restart;
                 }
@@ -239,10 +240,9 @@ impl<'h> HeapRead<'h, SetStorage> {
         }
     }
 
-    /// True if a probe candidate is still valid after `py_eq` possibly ran user
-    /// code: the set's length is unchanged and the entry at `index` still holds
-    /// the identical value with the same hash. A `false` return means the set
-    /// was mutated mid-lookup and [`Self::find_index`] must restart its probe.
+    /// Checks that a snapshotted candidate still names the same live entry.
+    ///
+    /// The caller checks before and after `py_eq`; a mismatch restarts the probe.
     fn probe_valid(&self, len: usize, index: usize, hash: u64, value: &Value, vm: &VM<'h>) -> bool {
         let storage = self.get(vm.heap);
         storage.entries.len() == len

@@ -99,6 +99,75 @@ D4[DictClearer4()] = 'x'
 assert len(D4) == 101
 
 
+# === dict/set: same-length mutation never compares a stale queued index ===
+def stale_candidate_lookup(kind):
+    target = {} if kind == 'dict' else set()
+    active = False
+    mutated = False
+
+    class Key:
+        def __hash__(self):
+            return 1
+
+        def __eq__(self, other):
+            nonlocal active, mutated
+            if isinstance(other, int):
+                raise RuntimeError('compared against mismatched hash')
+            if active and not mutated:
+                mutated = True
+                if kind == 'dict':
+                    target.pop(keys[-1])
+                    target[100] = None
+                else:
+                    target.remove(keys[-1])
+                    target.add(100)
+            return False
+
+    keys = [Key() for _ in range(4)]
+    for key in keys:
+        if kind == 'dict':
+            target[key] = None
+        else:
+            target.add(key)
+    active = True
+    return Key() in target
+
+
+assert stale_candidate_lookup('dict') is False
+assert stale_candidate_lookup('set') is False
+
+
+# === dict/set lookup calls the stored candidate's equality first ===
+equality_calls = []
+
+
+class StoredLookupKey:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        equality_calls.append('stored')
+        return False
+
+
+class QueryLookupKey:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        equality_calls.append('query')
+        return False
+
+
+stored_lookup_key = StoredLookupKey()
+query_lookup_key = QueryLookupKey()
+assert query_lookup_key not in {stored_lookup_key: None}
+assert equality_calls == ['stored']
+equality_calls.clear()
+assert query_lookup_key not in {stored_lookup_key}
+assert equality_calls == ['stored']
+
+
 # === set: `in`, `discard` and `add` with a clearing __eq__ ===
 S = set()
 

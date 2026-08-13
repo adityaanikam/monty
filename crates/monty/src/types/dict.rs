@@ -673,26 +673,29 @@ impl<'h> HeapRead<'h, Dict> {
             .ok_or_else(|| ExcType::type_error_unhashable_dict_key(&key.py_type_name(vm)))?
             .raw();
 
-        // Candidate indices are collected up front (avoiding a borrow conflict
-        // between the index table and `py_eq`), but a user `__eq__` re-entering
-        // the VM can mutate the dict and leave them stale. Mirroring CPython's
-        // `lookdict`, every `py_eq` is followed by [`Self::probe_valid`]; on any
-        // mutation the whole probe restarts against the live entries.
+        // Candidate snapshots avoid holding the index-table borrow while
+        // `py_eq` runs user code. Each is checked on both sides of that call so
+        // a mutation cannot turn a queued index into an unrelated comparison.
         'restart: loop {
-            let mut candidates: SmallVec<[usize; 2]> = SmallVec::new();
+            let mut candidate_indices: SmallVec<[usize; 2]> = SmallVec::new();
+            let mut candidate_keys: SmallVec<[Value; 2]> = SmallVec::new();
             let this = self.get(vm.heap);
             let len = this.entries.len();
             this.indices.find(hash, |v| {
                 if this.entries[*v].hash == hash {
-                    candidates.push(*v);
+                    candidate_indices.push(*v);
+                    candidate_keys.push(this.entries[*v].key.clone_with_heap(vm.heap));
                 }
                 false
             });
+            defer_drop!(candidate_keys, vm);
 
-            for candidate_index in candidates {
-                let candidate_key = self.get(vm.heap).entries[candidate_index].key.clone_with_heap(vm);
-                defer_drop!(candidate_key, vm);
-                let eq = key.py_eq(candidate_key, vm)?;
+            for (&candidate_index, candidate_key) in candidate_indices.iter().zip(candidate_keys.iter()) {
+                if !self.probe_valid(len, candidate_index, hash, candidate_key, vm) {
+                    continue 'restart;
+                }
+                // CPython compares the stored key on the left.
+                let eq = candidate_key.py_eq(key, vm)?;
                 if !self.probe_valid(len, candidate_index, hash, candidate_key, vm) {
                     continue 'restart;
                 }
@@ -705,10 +708,9 @@ impl<'h> HeapRead<'h, Dict> {
         }
     }
 
-    /// True if a probe candidate is still valid after `py_eq` possibly ran user
-    /// code: the dict's length is unchanged and the entry at `index` still holds
-    /// the identical key with the same hash. A `false` return means the dict was
-    /// mutated mid-lookup and [`Self::find_index_hash`] must restart its probe.
+    /// Checks that a snapshotted candidate still names the same live entry.
+    ///
+    /// The caller checks before and after `py_eq`; a mismatch restarts the probe.
     fn probe_valid(&self, len: usize, index: usize, hash: u64, key: &Value, vm: &VM<'h>) -> bool {
         let this = self.get(vm.heap);
         this.entries.len() == len
