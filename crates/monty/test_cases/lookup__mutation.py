@@ -197,6 +197,24 @@ assert (ListClearFalse() in L3) is False
 assert L3 == []
 
 
+# === comparison exceptions are caught in the frame running the opcode ===
+class ComparisonRaiser:
+    def __eq__(self, other):
+        raise ValueError('comparison failed')
+
+
+try:
+    ComparisonRaiser() == 0
+    assert False, 'expected ValueError'
+except ValueError as exc:
+    assert str(exc) == 'comparison failed'
+
+try:
+    assert ComparisonRaiser() == 0
+except ValueError as exc:
+    assert str(exc) == 'comparison failed'
+
+
 # === deque: mutation from __eq__ raises during `in` / `index` / `count` ===
 dq = deque()
 
@@ -209,16 +227,8 @@ class DequeAppender:
 
 dq.append(DequeAppender())
 
-
-# `in` goes via a helper so the raise crosses a call boundary — a bare
-# `0 in dq` inside `try` is uncatchable due to a separate monty bug where
-# comparison opcodes don't sync the frame ip before running user `__eq__`
-def dq_contains(x):
-    return x in dq
-
-
 try:
-    dq_contains(0)
+    0 in dq
     assert False, 'expected RuntimeError'
 except RuntimeError as exc:
     assert str(exc) == 'deque mutated during iteration'

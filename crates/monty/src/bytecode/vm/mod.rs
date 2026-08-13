@@ -78,6 +78,17 @@ macro_rules! try_catch_sync {
     };
 }
 
+/// Persists the cached frame IP before an operation that can execute Python.
+///
+/// A nested `run()` restores `instruction_ip` from the caller frame, so the
+/// caller must hold its resume IP for exceptions to find the right handler.
+macro_rules! try_catch_reentrant {
+    ($self:expr, $cached_frame:ident, $expr:expr) => {{
+        $self.current_frame_mut().ip = $cached_frame.ip;
+        try_catch_sync!($self, $cached_frame, $expr);
+    }};
+}
+
 /// Handles an exception and reloads cached frame state if caught.
 ///
 /// Use this in the main run loop where `cached_frame`
@@ -1205,16 +1216,16 @@ impl<'h> VM<'h> {
                 }
                 Opcode::BinaryMatMul => try_catch_sync!(self, cached_frame, self.binary_matmul()),
                 // Comparison Operations
-                Opcode::CompareEq => try_catch_sync!(self, cached_frame, self.compare_eq()),
-                Opcode::CompareNe => try_catch_sync!(self, cached_frame, self.compare_ne()),
-                Opcode::CompareLt => try_catch_sync!(self, cached_frame, self.compare_lt()),
-                Opcode::CompareLe => try_catch_sync!(self, cached_frame, self.compare_le()),
-                Opcode::CompareGt => try_catch_sync!(self, cached_frame, self.compare_gt()),
-                Opcode::CompareGe => try_catch_sync!(self, cached_frame, self.compare_ge()),
+                Opcode::CompareEq => try_catch_reentrant!(self, cached_frame, self.compare_eq()),
+                Opcode::CompareNe => try_catch_reentrant!(self, cached_frame, self.compare_ne()),
+                Opcode::CompareLt => try_catch_reentrant!(self, cached_frame, self.compare_lt()),
+                Opcode::CompareLe => try_catch_reentrant!(self, cached_frame, self.compare_le()),
+                Opcode::CompareGt => try_catch_reentrant!(self, cached_frame, self.compare_gt()),
+                Opcode::CompareGe => try_catch_reentrant!(self, cached_frame, self.compare_ge()),
                 Opcode::CompareIs => try_catch_sync!(self, cached_frame, self.compare_is()),
                 Opcode::CompareIsNot => try_catch_sync!(self, cached_frame, self.compare_is_not()),
-                Opcode::CompareIn => try_catch_sync!(self, cached_frame, self.compare_in()),
-                Opcode::CompareNotIn => try_catch_sync!(self, cached_frame, self.compare_not_in()),
+                Opcode::CompareIn => try_catch_reentrant!(self, cached_frame, self.compare_in()),
+                Opcode::CompareNotIn => try_catch_reentrant!(self, cached_frame, self.compare_not_in()),
                 // Unary Operations
                 Opcode::UnaryNot => {
                     let value = self.pop();
@@ -1657,9 +1668,12 @@ impl<'h> VM<'h> {
                     reload_cache!(self, cached_frame);
                 }
                 Opcode::Assert => {
-                    match decode_assert_flags(cached_frame.fetch_u8()).expect("invalid assert flags in bytecode") {
-                        Some(op) => try_catch_sync!(self, cached_frame, self.assert_cmp(op)),
-                        None => try_catch_sync!(self, cached_frame, self.assert_test()),
+                    if let Some(op) =
+                        decode_assert_flags(cached_frame.fetch_u8()).expect("invalid assert flags in bytecode")
+                    {
+                        try_catch_reentrant!(self, cached_frame, self.assert_cmp(op));
+                    } else {
+                        try_catch_reentrant!(self, cached_frame, self.assert_test());
                     }
                 }
                 Opcode::AssertFailed => {
