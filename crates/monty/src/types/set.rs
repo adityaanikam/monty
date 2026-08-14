@@ -18,7 +18,11 @@ use crate::{
     },
     identity::Identity,
     intern::StaticStrings,
-    types::{LazyHeapSet, Type, dict::ProbeOutcome, list::repr_items_fmt},
+    types::{
+        LazyHeapSet, Type,
+        dict::{ProbeOutcome, eq_is_native},
+        list::repr_items_fmt,
+    },
     value::{EitherStr, VALUE_SIZE, Value},
 };
 
@@ -215,29 +219,36 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// native loop reaches no checkpoint of its own. See
     /// [`HeapRead::<Dict>::find_index_hash`] — the two must stay in sync.
     fn find_index(&self, value: &Value, hash: u64, vm: &mut VM<'h>) -> RunResult<Option<usize>> {
+        // When no comparison can dispatch to user code, nothing can mutate the
+        // set mid-probe: skip revalidation and the miss continuation, as in
+        // the dict twin.
+        let value_native = eq_is_native(value, vm.heap);
+
         'restart: loop {
             // Collected inline rather than through `probe_candidates`, for the
             // reason given in the dict twin.
             let mut candidate_indices: SmallVec<[usize; 2]> = SmallVec::new();
             let mut candidate_values: SmallVec<[Value; 2]> = SmallVec::new();
+            let mut all_native = value_native;
             let storage = self.get(vm.heap);
             storage.indices.find(hash, |&idx| {
                 if storage.entries[idx].hash == hash {
                     candidate_indices.push(idx);
                     candidate_values.push(storage.entries[idx].value.clone_with_heap(vm.heap));
+                    all_native = all_native && eq_is_native(&storage.entries[idx].value, vm.heap);
                 }
                 false
             });
             defer_drop!(candidate_values, vm);
 
             for (&candidate_index, candidate_value) in candidate_indices.iter().zip(candidate_values.iter()) {
-                if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
+                if !all_native && !self.probe_valid(candidate_index, hash, candidate_value, vm) {
                     vm.heap.tracker.check_memory_time()?;
                     continue 'restart;
                 }
                 // CPython compares the stored value on the left.
                 let eq = candidate_value.py_eq(value, vm)?;
-                if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
+                if !all_native && !self.probe_valid(candidate_index, hash, candidate_value, vm) {
                     vm.heap.tracker.check_memory_time()?;
                     continue 'restart;
                 }
@@ -247,9 +258,10 @@ impl<'h> HeapRead<'h, SetStorage> {
             }
 
             // A comparison can itself have added a colliding value the snapshot
-            // never saw, so a pass that ran any hands over to the
-            // mutation-aware continuation; with no candidates it is a miss.
-            if candidate_values.is_empty() {
+            // never saw, so a pass that ran any hands over to the mutation-aware
+            // continuation — unless none could run user code; with no
+            // candidates it is a miss.
+            if all_native || candidate_values.is_empty() {
                 return Ok(None);
             }
             match self.probe_after_compare(hash, value, candidate_values, vm)? {

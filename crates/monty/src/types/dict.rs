@@ -668,6 +668,23 @@ struct DictInitArgs {
     extras: KwargsValues,
 }
 
+/// Whether an equality comparison involving `value` can never re-enter the VM.
+///
+/// True for immediates and for heap types whose `py_eq` is fully native.
+/// Instances and dataclasses dispatch to user `__eq__`, and containers
+/// (tuples, frozensets) recurse into element comparisons that might; those and
+/// any unlisted heap type return false. A conservative fast-path filter for
+/// the dict/set probes, not a complete classification.
+pub(crate) fn eq_is_native(value: &Value, heap: &Heap) -> bool {
+    match value {
+        Value::Ref(id) => matches!(
+            heap.get(*id),
+            HeapData::Str(_) | HeapData::Bytes(_) | HeapData::LongInt(_) | HeapData::Range(_)
+        ),
+        _ => true,
+    }
+}
+
 /// How a probe continued after user `__eq__` code may have mutated the
 /// container; shared by the dict and set lookups, which mirror each other.
 pub(crate) enum ProbeOutcome {
@@ -693,30 +710,38 @@ impl<'h> HeapRead<'h, Dict> {
         // `lookdict`. Restarts poll the limits — this native loop calls back into
         // the VM, which restarts the dispatch countdown, so it reaches no
         // checkpoint of its own.
+        //
+        // When neither the key nor any candidate can dispatch to user code,
+        // no comparison can mutate the dict, so revalidation and the miss
+        // continuation are skipped — this is the common (str/int keys) path.
+        let key_native = eq_is_native(key, vm.heap);
+
         'restart: loop {
             // Collected inline rather than through `probe_candidates`: every
             // lookup runs this, and moving the buffers out of a call shows up
             // in the dict benchmarks.
             let mut candidate_indices: SmallVec<[usize; 2]> = SmallVec::new();
             let mut candidate_keys: SmallVec<[Value; 2]> = SmallVec::new();
+            let mut all_native = key_native;
             let this = self.get(vm.heap);
             this.indices.find(hash, |v| {
                 if this.entries[*v].hash == hash {
                     candidate_indices.push(*v);
                     candidate_keys.push(this.entries[*v].key.clone_with_heap(vm.heap));
+                    all_native = all_native && eq_is_native(&this.entries[*v].key, vm.heap);
                 }
                 false
             });
             defer_drop!(candidate_keys, vm);
 
             for (&candidate_index, candidate_key) in candidate_indices.iter().zip(candidate_keys.iter()) {
-                if !self.probe_valid(candidate_index, hash, candidate_key, vm) {
+                if !all_native && !self.probe_valid(candidate_index, hash, candidate_key, vm) {
                     vm.heap.tracker.check_memory_time()?;
                     continue 'restart;
                 }
                 // CPython compares the stored key on the left.
                 let eq = candidate_key.py_eq(key, vm)?;
-                if !self.probe_valid(candidate_index, hash, candidate_key, vm) {
+                if !all_native && !self.probe_valid(candidate_index, hash, candidate_key, vm) {
                     vm.heap.tracker.check_memory_time()?;
                     continue 'restart;
                 }
@@ -727,8 +752,9 @@ impl<'h> HeapRead<'h, Dict> {
 
             // Nothing matched. Comparisons can themselves add colliding keys the
             // snapshot never saw, so a pass that ran any hands over to the
-            // mutation-aware continuation; with no candidates it is simply a miss.
-            if candidate_keys.is_empty() {
+            // mutation-aware continuation — unless none could run user code;
+            // with no candidates it is simply a miss.
+            if all_native || candidate_keys.is_empty() {
                 return Ok((None, hash));
             }
             match self.probe_after_compare(hash, key, candidate_keys, vm)? {
