@@ -22,8 +22,9 @@ const MAX_FIXED_BYTES: usize = 14;
 /// Complete identity key for a runtime value.
 ///
 /// Equality is the implementation of Python's `is`; the integer encoding is
-/// injective and used to expose the same key through `id()`.
-#[derive(PartialEq, Eq)]
+/// injective and used to expose the same key through `id()`. `Hash` lets
+/// identity sets answer "seen this object?" in O(1) (see the dict/set probes).
+#[derive(PartialEq, Eq, Hash)]
 pub(crate) enum Identity {
     /// Internal uninitialized-value sentinel.
     Undefined,

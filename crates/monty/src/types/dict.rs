@@ -5,6 +5,7 @@ use std::{
     mem, slice, vec,
 };
 
+use ahash::AHashSet;
 use hashbrown::HashTable;
 use serde::ser::SerializeStruct;
 use smallvec::{SmallVec, smallvec};
@@ -17,6 +18,7 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunResult},
     expressions::CmpOperator,
     heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    identity::Identity,
     intern::{Interns, StaticStrings},
     modules::collections::{
         counter::{
@@ -752,16 +754,26 @@ impl<'h> HeapRead<'h, Dict> {
         already_compared: &[Value],
         vm: &mut VM<'h>,
     ) -> RunResult<ProbeOutcome> {
+        // The clones keep every compared key alive so its heap slot cannot be
+        // recycled into a new key that would then be skipped by identity.
         let compared: SmallVec<[Value; 2]> = already_compared.iter().map(|k| k.clone_with_heap(vm.heap)).collect();
         defer_drop_mut!(compared, vm);
+        // Identity set for O(1) seen-checks — a linear scan is quadratic over
+        // a fully colliding dict, all skips, before the poll below is reached.
+        let mut compared_ids: AHashSet<Identity> = compared.iter().map(Value::id).collect();
 
         loop {
+            // Polled up front so every entry checks the limits at least once:
+            // the comparisons that brought us here ran user code, restarting
+            // the VM dispatch countdown, so no checkpoint fires otherwise —
+            // including on the no-mutation pass that returns `Missing`.
+            vm.heap.tracker.check_memory_time()?;
             let (candidate_indices, candidate_keys) = self.probe_candidates(hash, vm);
             defer_drop!(candidate_keys, vm);
             let mut compared_any = false;
 
             for (&candidate_index, candidate_key) in candidate_indices.iter().zip(candidate_keys.iter()) {
-                if compared.iter().any(|seen| seen.is(candidate_key)) {
+                if !compared_ids.insert(candidate_key.id()) {
                     continue;
                 }
                 if !self.probe_valid(candidate_index, hash, candidate_key, vm) {
@@ -784,7 +796,6 @@ impl<'h> HeapRead<'h, Dict> {
             if !compared_any {
                 return Ok(ProbeOutcome::Missing);
             }
-            vm.heap.tracker.check_memory_time()?;
         }
     }
 

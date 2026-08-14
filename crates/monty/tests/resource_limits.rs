@@ -680,6 +680,55 @@ Mutator() in container
     assert_timeout_in_builtin(&set, "set probe restarted by __eq__");
 }
 
+/// Missing lookups in a fully colliding container must not rescan their
+/// already-compared candidates quadratically.
+///
+/// `H` hashes constant but keeps identity equality, so every probe hands all
+/// N entries to the mutation-aware continuation and misses. Its seen-check
+/// must be O(1): a linear scan makes each lookup Θ(N²) — ~4s on these inputs
+/// versus ~1s, dominated by the unavoidable quadratic build — and that pass
+/// reaches no limit poll. The generous budget keeps the timing assertion
+/// robust on loaded CI.
+#[test]
+fn colliding_lookup_is_not_quadratic() {
+    let template = r"
+class H:
+    def __hash__(self):
+        return 1
+
+
+container = MAKE_CONTAINER
+for _ in range(800):
+    ADD_ENTRY
+
+probe = H()
+for _ in range(400):
+    assert probe not in container
+";
+    let dict = template
+        .replace("ADD_ENTRY", "container[H()] = 0")
+        .replace("MAKE_CONTAINER", "{}");
+    let set = template
+        .replace("ADD_ENTRY", "container.add(H())")
+        .replace("MAKE_CONTAINER", "set()");
+    for (label, code) in [("dict", dict), ("set", set)] {
+        let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).unwrap();
+        let start = Instant::now();
+        let result = run.run(
+            vec![],
+            ResourceTracker::new(ResourceLimits::default()),
+            PrintWriter::Stdout,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "{label}: expected success, got {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{label}: took {elapsed:?}, expected linear seen-checks"
+        );
+    }
+}
+
 /// Test that `str.splitlines()` on a large string respects the time limit.
 ///
 /// `str_splitlines()` scans the entire string for line endings in a while loop

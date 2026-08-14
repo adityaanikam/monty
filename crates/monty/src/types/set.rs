@@ -1,5 +1,6 @@
 use std::{cell::Cell, fmt::Write, mem};
 
+use ahash::AHashSet;
 use hashbrown::HashTable;
 use monty_types::{ResourceError, ResourceTracker};
 use smallvec::SmallVec;
@@ -15,6 +16,7 @@ use crate::{
         BorrowedHeapRead, BorrowedHeapReadMut, ContainsHeap, DropGuard, DropWithContext, HeapData, HeapId, HeapItem,
         HeapRead, HeapReadOutput, heap_read_ref_as_field, heap_read_ref_as_field_mut,
     },
+    identity::Identity,
     intern::StaticStrings,
     types::{LazyHeapSet, Type, dict::ProbeOutcome, list::repr_items_fmt},
     value::{EitherStr, VALUE_SIZE, Value},
@@ -272,16 +274,24 @@ impl<'h> HeapRead<'h, SetStorage> {
         already_compared: &[Value],
         vm: &mut VM<'h>,
     ) -> RunResult<ProbeOutcome> {
+        // The clones keep every compared value alive so its heap slot cannot
+        // be recycled into a new value that would then be skipped by identity.
         let compared: SmallVec<[Value; 2]> = already_compared.iter().map(|v| v.clone_with_heap(vm.heap)).collect();
         defer_drop_mut!(compared, vm);
+        // Identity set for O(1) seen-checks; see the dict twin for why the
+        // linear alternative is quadratic.
+        let mut compared_ids: AHashSet<Identity> = compared.iter().map(Value::id).collect();
 
         loop {
+            // Polled up front so every entry checks the limits at least once —
+            // see the dict twin.
+            vm.heap.tracker.check_memory_time()?;
             let (candidate_indices, candidate_values) = self.probe_candidates(hash, vm);
             defer_drop!(candidate_values, vm);
             let mut compared_any = false;
 
             for (&candidate_index, candidate_value) in candidate_indices.iter().zip(candidate_values.iter()) {
-                if compared.iter().any(|seen| seen.is(candidate_value)) {
+                if !compared_ids.insert(candidate_value.id()) {
                     continue;
                 }
                 if !self.probe_valid(candidate_index, hash, candidate_value, vm) {
@@ -304,7 +314,6 @@ impl<'h> HeapRead<'h, SetStorage> {
             if !compared_any {
                 return Ok(ProbeOutcome::Missing);
             }
-            vm.heap.tracker.check_memory_time()?;
         }
     }
 
