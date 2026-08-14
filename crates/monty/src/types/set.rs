@@ -20,7 +20,7 @@ use crate::{
     intern::StaticStrings,
     types::{
         LazyHeapSet, Type,
-        dict::{ProbeOutcome, eq_is_native},
+        dict::{ProbeOutcome, eq_is_native, probe_native_eq},
         list::repr_items_fmt,
     },
     value::{EitherStr, VALUE_SIZE, Value},
@@ -231,14 +231,34 @@ impl<'h> HeapRead<'h, SetStorage> {
             let mut candidate_values: SmallVec<[Value; 2]> = SmallVec::new();
             let mut all_native = value_native;
             let storage = self.get(vm.heap);
-            storage.indices.find(hash, |&idx| {
-                if storage.entries[idx].hash == hash {
-                    candidate_indices.push(idx);
-                    candidate_values.push(storage.entries[idx].value.clone_with_heap(vm.heap));
-                    all_native = all_native && eq_is_native(&storage.entries[idx].value, vm.heap);
-                }
-                false
-            });
+            // Native pairs are compared inline during the probe walk; only
+            // pairs that may need user code are cloned for the guarded loop —
+            // see the dict twin.
+            let found = storage
+                .indices
+                .find(hash, |&idx| {
+                    let entry = &storage.entries[idx];
+                    if entry.hash != hash {
+                        return false;
+                    }
+                    if candidate_indices.is_empty()
+                        && let Some(eq) = probe_native_eq(&entry.value, value, vm)
+                    {
+                        eq
+                    } else {
+                        candidate_indices.push(idx);
+                        candidate_values.push(entry.value.clone_with_heap(vm.heap));
+                        all_native = all_native && eq_is_native(&entry.value, vm.heap);
+                        false
+                    }
+                })
+                .copied();
+            if let Some(index) = found {
+                return Ok(Some(index));
+            }
+            if candidate_indices.is_empty() {
+                return Ok(None);
+            }
             defer_drop!(candidate_values, vm);
 
             for (&candidate_index, candidate_value) in candidate_indices.iter().zip(candidate_values.iter()) {
@@ -259,9 +279,8 @@ impl<'h> HeapRead<'h, SetStorage> {
 
             // A comparison can itself have added a colliding value the snapshot
             // never saw, so a pass that ran any hands over to the mutation-aware
-            // continuation — unless none could run user code; with no
-            // candidates it is a miss.
-            if all_native || candidate_values.is_empty() {
+            // continuation — unless none could run user code.
+            if all_native {
                 return Ok(None);
             }
             match self.probe_after_compare(hash, value, candidate_values, vm)? {
