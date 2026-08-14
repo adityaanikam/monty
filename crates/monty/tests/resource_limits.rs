@@ -683,15 +683,18 @@ Mutator() in container
 /// Missing lookups in a fully colliding container must not rescan their
 /// already-compared candidates quadratically.
 ///
-/// `H` hashes constant but keeps identity equality, so every probe hands all
-/// N entries to the mutation-aware continuation and misses. Its seen-check
-/// must be O(1): a linear scan makes each lookup Θ(N²) — ~4s on these inputs
-/// versus ~1s, dominated by the unavoidable quadratic build — and that pass
-/// reaches no limit poll. The generous budget keeps the timing assertion
-/// robust on loaded CI.
+/// `H` instances hash constant and are never `eq_is_native`, so a missing
+/// probe hands all N entries to the mutation-aware continuation, whose
+/// seen-check must be O(1) — a linear scan makes each miss Θ(N²), and that
+/// pass reaches no limit poll. Found lookups walk the same candidate chain
+/// but never reach the continuation, so timing misses against finds on the
+/// same container isolates exactly the continuation's cost — the ratio is
+/// independent of machine speed, coverage instrumentation, and feature
+/// flags. Healthy misses cost about the same as finds (~1.4x); the old
+/// linear seen-scan cost ~10x.
 #[test]
 fn colliding_lookup_is_not_quadratic() {
-    let template = r"
+    let build_template = r"
 class H:
     def __hash__(self):
         return 1
@@ -700,31 +703,45 @@ class H:
 container = MAKE_CONTAINER
 for _ in range(800):
     ADD_ENTRY
-
+";
+    // 800 found lookups: same per-candidate machinery as the misses below
+    // (every comparison still dispatches through the guarded snapshot loop),
+    // but the probe ends at its match, before the continuation.
+    let found_lookups = r"
+for k in list(container):
+    assert k in container
+";
+    // 400 misses, each comparing all 800 candidates and then entering the
+    // continuation — in total the same number of comparisons as the finds.
+    let missing_lookups = r"
 probe = H()
 for _ in range(400):
     assert probe not in container
 ";
-    let dict = template
-        .replace("ADD_ENTRY", "container[H()] = 0")
-        .replace("MAKE_CONTAINER", "{}");
-    let set = template
-        .replace("ADD_ENTRY", "container.add(H())")
-        .replace("MAKE_CONTAINER", "set()");
-    for (label, code) in [("dict", dict), ("set", set)] {
-        let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).unwrap();
-        let start = Instant::now();
-        let result = run.run(
-            vec![],
-            ResourceTracker::new(ResourceLimits::default()),
-            PrintWriter::Stdout,
-        );
-        let elapsed = start.elapsed();
+    for (label, make_container, add_entry) in [
+        ("dict", "{}", "container[H()] = 0"),
+        ("set", "set()", "container.add(H())"),
+    ] {
+        let build = build_template
+            .replace("MAKE_CONTAINER", make_container)
+            .replace("ADD_ENTRY", add_entry);
+        let mut repl = MontyRepl::new("test.py", ResourceTracker::default(), CompileOptions::default());
+        repl.feed_run(&build, vec![], PrintWriter::Stdout)
+            .unwrap_or_else(|e| panic!("{label}: build failed: {e}"));
 
-        assert!(result.is_ok(), "{label}: expected success, got {result:?}");
+        let start = Instant::now();
+        repl.feed_run(found_lookups, vec![], PrintWriter::Stdout)
+            .unwrap_or_else(|e| panic!("{label}: found lookups failed: {e}"));
+        let found_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        repl.feed_run(missing_lookups, vec![], PrintWriter::Stdout)
+            .unwrap_or_else(|e| panic!("{label}: missing lookups failed: {e}"));
+        let missing_elapsed = start.elapsed();
+
         assert!(
-            elapsed < Duration::from_secs(3),
-            "{label}: took {elapsed:?}, expected linear seen-checks"
+            missing_elapsed < found_elapsed * 3,
+            "{label}: misses took {missing_elapsed:?} vs finds {found_elapsed:?}, expected linear seen-checks"
         );
     }
 }
