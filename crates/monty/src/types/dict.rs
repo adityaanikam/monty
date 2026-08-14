@@ -825,6 +825,13 @@ impl<'h> HeapRead<'h, Dict> {
     /// already compared so no `__eq__` runs twice — CPython, walking the live
     /// probe chain, never repeats one either. Only reached once user code has
     /// run, so it is off the ordinary lookup path.
+    ///
+    /// Native pairs compared inline before the first deferral are not in the
+    /// seen set and may be re-compared here. That is deliberate: such
+    /// comparisons are side-effect-free and deterministic (the no-repeat
+    /// invariant protects user `__eq__` observability, which native pairs
+    /// lack), and recording them would put clone and identity bookkeeping on
+    /// the pure-native fast path.
     fn probe_after_compare(
         &self,
         hash: u64,

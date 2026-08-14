@@ -296,8 +296,10 @@ impl<'h> HeapRead<'h, SetStorage> {
     /// mutated the set and added a colliding value.
     ///
     /// The twin of [`HeapRead::<Dict>::probe_after_compare`]: re-reads the
-    /// candidates until a pass finds nothing new, never comparing a value
-    /// twice, and off the ordinary lookup path.
+    /// candidates until a pass finds nothing new, never re-running user
+    /// `__eq__` on a value, and off the ordinary lookup path. As in the dict
+    /// twin, inline-compared native pairs may be re-compared — deliberate,
+    /// see there.
     fn probe_after_compare(
         &self,
         hash: u64,
