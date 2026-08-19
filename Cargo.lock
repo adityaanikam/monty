@@ -2615,6 +2615,7 @@ version = "0.0.21"
 dependencies = [
  "monty-alloc",
  "monty-proto",
+ "monty-types",
  "prost",
  "serde",
  "serde_json",
