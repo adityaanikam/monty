@@ -193,6 +193,10 @@ Modes: `'read-only'`, `'read-write'`, and `'overlay'` (default — writes are
 kept in memory and discarded at the end of the feed). Mount I/O is serviced
 on the host side of the pool, so mounts work even for remote workers.
 
+The constructor opens the host directory, so an unusable path throws there
+rather than at the first feed, and the mount then follows _that directory_ for
+its lifetime — renaming or replacing it afterwards changes nothing.
+
 `feedRun` answers every OS call automatically: mounts get first refusal, then
 the `os` callback. `feedStart` answers none — a mounted read surfaces as a
 `FunctionSnapshot` with `isOsFunction` set, and `resumeAuto()` is what consults
@@ -281,12 +285,24 @@ try {
   await session.feedRun('fetch(123)')
 } catch (err) {
   if (err instanceof MontyTypingError) {
-    console.log(err.display()) // rendered diagnostics, one per line
+    console.log(err.display()) // rendered diagnostics
   }
 }
 ```
 
 A snippet that fails type checking does not run; the session survives.
+
+`typeCheckFormat` picks the rendering — ty's `'full'` (the default: source
+snippet and carets), `'concise'`, `'azure'`, `'json'`, `'jsonlines'`,
+`'rdjson'`, `'pylint'`, `'gitlab'` or `'github'` — and `typeCheckColor` adds
+ANSI colour to `'full'` and `'concise'`. Both are checkout options rather than
+`display()` arguments because the diagnostics are rendered inside the worker:
+ty's structured diagnostics resolve their spans against the type checker's
+database, so only the rendered text crosses the wire.
+
+```ts
+const session = await pool.checkout({ typeCheck: true, typeCheckFormat: 'json' })
+```
 
 ## Error Handling
 
@@ -320,9 +336,28 @@ const pool = await Monty.create({
 })
 ```
 
+A session's `maxMemory` is enforced in the worker's own allocator too (the
+[`monty-alloc`](https://crates.io/crates/monty-alloc) crate), which bounds the
+bytes the worker holds at once — allocated minus freed, plus headroom — instead
+of letting it grow the host without bound. A
+worker that cannot honour the limit raises `MontyRuntimeError` wrapping
+`MemoryError` — but unlike other runtime errors it takes the worker with it, so
+the session is finished (the pool recovers). The wasm worker applies the same
+limit to what it allocates, but a trapped module has no exit status to classify,
+so there it raises `MontyCrashedError`.
+
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo
 workspace `target/` build (development).
+
+The Node-only Logfire integration installs a version-1 adapter through
+`_installTelemetryAdapter(1, adapter)`. At checkout it propagates the active
+host trace context into Monty's exporter-free Rust spans, then reconstructs
+those records through the host SDK, which owns credentials, export, and
+shutdown. Delivery uses a bounded non-blocking queue; overflow permanently
+disables the adapter and sends one global cleanup notification rather than
+risking unbounded host memory. Browser/WASM does not yet implement this adapter
+path.
 
 ## Value Conversion
 

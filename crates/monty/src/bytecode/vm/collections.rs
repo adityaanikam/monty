@@ -10,28 +10,26 @@ use crate::{
         Dict, List, PyTrait, Set, Slice, allocate_tuple, collect_iterable, collect_iterable_bounded,
         instance::instance_defines_iter, slice::value_to_option_i64,
     },
-    value::{VALUE_SIZE, Value},
+    value::Value,
 };
 
 impl VM<'_> {
     /// Builds a list from the top n stack values.
-    pub(super) fn build_list(&mut self, count: usize) -> Result<(), RunError> {
+    pub(super) fn build_list(&mut self, count: usize) {
         let items = self.pop_n(count);
         let list = List::new(items);
-        let heap_id = self.heap.allocate(HeapData::List(list))?;
+        let heap_id = self.heap.allocate(HeapData::List(list));
         self.push(Value::Ref(heap_id));
-        Ok(())
     }
 
     /// Builds a tuple from the top n stack values.
     ///
     /// Uses the empty tuple singleton when count is 0, and SmallVec
     /// optimization for small tuples (≤2 elements).
-    pub(super) fn build_tuple(&mut self, count: usize) -> Result<(), RunError> {
+    pub(super) fn build_tuple(&mut self, count: usize) {
         let items = self.pop_n(count);
-        let value = allocate_tuple(items.into(), self.heap)?;
+        let value = allocate_tuple(items.into(), self.heap);
         self.push(value);
-        Ok(())
     }
 
     /// Builds a dict from the top 2n stack values (key/value pairs).
@@ -47,7 +45,7 @@ impl VM<'_> {
                 old_value.drop_with(self);
             }
         }
-        let heap_id = self.heap.allocate(HeapData::Dict(dict))?;
+        let heap_id = self.heap.allocate(HeapData::Dict(dict));
         self.push(Value::Ref(heap_id));
         Ok(())
     }
@@ -59,7 +57,7 @@ impl VM<'_> {
         for item in items {
             set.add(item, self)?;
         }
-        let heap_id = self.heap.allocate(HeapData::Set(set))?;
+        let heap_id = self.heap.allocate(HeapData::Set(set));
         self.push(Value::Ref(heap_id));
         Ok(())
     }
@@ -83,7 +81,7 @@ impl VM<'_> {
         let step = value_to_option_i64(step_val)?;
 
         let slice = Slice::new(start, stop, step);
-        let heap_id = this.heap.allocate(HeapData::Slice(slice))?;
+        let heap_id = this.heap.allocate(HeapData::Slice(slice));
         this.push(Value::Ref(heap_id));
         Ok(())
     }
@@ -125,8 +123,6 @@ impl VM<'_> {
 
             // Extend the list
             if let Value::Ref(id) = list_ref {
-                this.heap.track_growth(copied_items.len() * VALUE_SIZE)?;
-
                 let HeapReadOutput::List(mut list) = this.heap.read(*id) else {
                     panic!("list_extend: expected List on heap");
                 };
@@ -161,7 +157,7 @@ impl VM<'_> {
             return Err(RunError::internal("ListToTuple: expected list"));
         };
         let items = list.as_slice().iter().map(|v| v.clone_with_heap(this.heap)).collect();
-        let value = allocate_tuple(items, this.heap)?;
+        let value = allocate_tuple(items, this.heap);
         this.push(value);
         Ok(())
     }
@@ -405,7 +401,7 @@ impl VM<'_> {
             value.drop_with(self);
             return Err(RunError::internal("ListAppend: expected list on heap"));
         };
-        list.append(self, value)?;
+        list.append(self, value);
         Ok(())
     }
 
@@ -552,13 +548,14 @@ impl VM<'_> {
         }
 
         let (items, this) = items_guard.into_parts();
-        this.push_unpack_ex_results(items, before, after)
+        this.push_unpack_ex_results(items, before, after);
+        Ok(())
     }
 
     /// Helper to push unpacked items with starred target onto the stack.
     ///
     /// Takes a slice of items and creates the middle list.
-    fn push_unpack_ex_results(&mut self, items: Vec<Value>, before: usize, after: usize) -> Result<(), RunError> {
+    fn push_unpack_ex_results(&mut self, items: Vec<Value>, before: usize, after: usize) {
         let this = self;
 
         defer_drop_mut!(items, this);
@@ -571,15 +568,13 @@ impl VM<'_> {
 
         // Middle items as a list (starred target)
         let middle_list: Vec<Value> = items.drain(before..).collect();
-        let list_id = this.heap.allocate(HeapData::List(List::new(middle_list)))?;
+        let list_id = this.heap.allocate(HeapData::List(List::new(middle_list)));
         this.push(Value::Ref(list_id));
 
         // Before items
         for item in items.drain(..).rev() {
             this.push(item);
         }
-
-        Ok(())
     }
 }
 

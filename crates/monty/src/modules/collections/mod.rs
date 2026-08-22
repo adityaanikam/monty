@@ -22,7 +22,6 @@ pub(crate) mod defaultdict;
 
 use std::iter::once;
 
-use monty_types::ResourceError;
 use ruff_python_stdlib::identifiers::is_identifier;
 
 use self::counter::counter_update;
@@ -36,7 +35,6 @@ use crate::{
     intern::StaticStrings,
     types::{
         Dict, Module, NamedTupleClass, PyTrait, Type,
-        dict::DictKind,
         iter::collect_owned_iterable,
         str::{StringRepr, str_isidentifier},
     },
@@ -48,7 +46,7 @@ use crate::{
 /// # Panics
 ///
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_>) -> Result<HeapId, ResourceError> {
+pub fn create_module(vm: &mut VM<'_>) -> HeapId {
     let mut module = Module::new(StaticStrings::Collections);
 
     module.set_attr(StaticStrings::Deque, Value::Builtin(Builtins::Type(Type::Deque)), vm);
@@ -114,7 +112,7 @@ pub(crate) fn counter_init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value>
 
     let mut dict = Dict::new();
     dict.make_counter();
-    let value = Value::Ref(vm.heap.allocate(HeapData::Dict(dict))?);
+    let value = Value::Ref(vm.heap.allocate(HeapData::Dict(dict)));
     let Value::Ref(dict_id) = value else {
         unreachable!("just allocated a ref");
     };
@@ -164,17 +162,6 @@ pub(crate) fn defaultdict_init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Va
             return Err(e);
         }
     };
-
-    // The dict is already on the heap, so its `py_estimate_size` was charged
-    // without the boxed kind state — charge that box before installing it,
-    // otherwise the refund at free time exceeds what was tracked.
-    if let Err(error) = vm.heap.track_growth(DictKind::SPECIAL_SIZE) {
-        if let Some(factory) = factory {
-            factory.drop_with(vm);
-        }
-        dict_value.drop_with(vm);
-        return Err(error.into());
-    }
 
     let Value::Ref(dict_id) = dict_value else {
         unreachable!("Dict::init returns a dict ref");
@@ -261,9 +248,7 @@ fn namedtuple(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let field_names: Vec<EitherStr> = names.into_iter().map(EitherStr::Heap).collect();
     let class = NamedTupleClass::new(type_name, field_names, default_values, module);
-    Ok(Value::Ref(
-        vm.heap.allocate(HeapData::NamedTupleClass(Box::new(class)))?,
-    ))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::NamedTupleClass(Box::new(class)))))
 }
 
 /// Parses the `field_names` argument into owned strings.

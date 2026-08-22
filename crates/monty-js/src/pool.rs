@@ -30,14 +30,21 @@ use std::{
 };
 
 use monty_pool::{
-    exceeds_max_value_depth, Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, PrintFuture,
-    ReplConfig, ResumeValue, TurnEvent,
+    exceeds_max_value_depth,
+    telemetry_adapter::{TelemetryAdapterHandle, TelemetryContext},
+    Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig, ResumeValue,
+    TurnEvent,
 };
-use monty_types::{AssertMessageAnnotations, ExcType, MontyException, MontyObject, PrintStream, StackFrame};
+use monty_types::{
+    AssertMessageAnnotations, ExcType, MontyException, MontyObject, PrintStream, StackFrame, TypeCheckingConfig,
+    TypeCheckingFormat,
+};
 use napi::{
-    bindgen_prelude::{Array, Buffer, FnArgs, FromNapiValue, Function, JsObjectValue, Object, PromiseRaw, Unknown},
+    bindgen_prelude::{
+        Array, Buffer, ClassInstance, FnArgs, FromNapiValue, Function, JsObjectValue, Object, PromiseRaw, Unknown,
+    },
     threadsafe_function::UnknownReturnValue,
-    Env, Result,
+    Env, Error, Result,
 };
 use napi_derive::napi;
 use tokio::sync::Mutex as AsyncMutex;
@@ -45,6 +52,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{
     convert::{js_to_monty, monty_to_js},
     limits::{extract_limits, JsResourceLimits},
+    telemetry::configured_adapter,
 };
 
 /// Deepest *list-like* value nesting the wire protocol accepts (dicts and
@@ -111,6 +119,13 @@ pub struct NativeCheckoutOptions {
     pub type_check: bool,
     /// Stub declarations made available to type checking.
     pub type_check_stubs: Option<String>,
+    /// How typing diagnostics are rendered, e.g. `'full'` or `'concise'`.
+    /// Chosen here rather than on the thrown error because the checker's
+    /// structured diagnostics never leave the worker.
+    pub type_check_format: Option<String>,
+    /// Render typing diagnostics with ANSI colour escapes.
+    pub type_check_color: Option<bool>,
+
     /// Give failed `assert` statements pytest-style introspected messages
     /// (see limitations/assert.md), wire-encoded: absent = on with the
     /// default 120-byte operand-repr truncation, `0` = off, `n` = truncate
@@ -132,6 +147,34 @@ pub struct NativeMount {
     pub write_bytes_limit: Option<f64>,
     /// Aggregate budget for retained overlay data and transient results.
     pub memory_usage_limit: f64,
+}
+
+/// A mount whose host directory is opened here and held until this object is
+/// dropped, so every feed using it mounts that same directory. Wrapped by the
+/// TypeScript `MountDir` — not part of the public API.
+#[napi(js_name = "NativeMountDir")]
+pub struct NativeMountDir {
+    /// `None` once closed: the open directory is released and no later feed
+    /// can mount it. A feed already running holds its own reference.
+    spec: Option<MountSpec>,
+}
+
+#[napi]
+impl NativeMountDir {
+    /// Opens the host directory, throwing if it is missing, is not a directory,
+    /// or the virtual path is not absolute.
+    #[napi(constructor)]
+    pub fn new(mount: NativeMount) -> Result<Self> {
+        Ok(Self {
+            spec: Some(MountSpec::try_from(mount)?),
+        })
+    }
+
+    /// Releases the open directory. Idempotent.
+    #[napi]
+    pub fn close(&mut self) {
+        self.spec = None;
+    }
 }
 
 /// A pool of `monty` worker subprocesses. Wrapped by the TypeScript `Monty`
@@ -190,6 +233,13 @@ impl NativePool {
                 limits,
                 type_check: options.type_check,
                 type_check_stubs: options.type_check_stubs,
+                type_check_config: TypeCheckingConfig {
+                    format: match options.type_check_format {
+                        Some(name) => TypeCheckingFormat::from_name(&name).map_err(Error::from_reason)?,
+                        None => TypeCheckingFormat::default(),
+                    },
+                    color: options.type_check_color.unwrap_or(false),
+                },
                 assert_message_annotations: options.assert_message_annotations.map_or_else(
                     AssertMessageAnnotations::default,
                     AssertMessageAnnotations::from_max_bytes,
@@ -215,6 +265,38 @@ impl NativePool {
     }
 }
 
+/// Distributed context captured synchronously before native session entry.
+#[napi(object, js_name = "NativeTelemetryContext")]
+pub struct NativeTelemetryContext {
+    /// W3C trace ID of the active host span.
+    pub trace_id: Option<String>,
+    /// W3C span ID of the active host span.
+    pub span_id: Option<String>,
+    /// W3C trace flags of the active host span.
+    pub trace_flags: Option<u8>,
+    /// Vendor trace state propagated with the active host span.
+    pub trace_state: Option<String>,
+}
+
+impl NativeTelemetryContext {
+    /// Converts valid distributed context while ignoring a malformed adapter value.
+    fn parse(self, adapter: &TelemetryAdapterHandle) -> TelemetryContext {
+        self.trace_id
+            .zip(self.span_id)
+            .and_then(|(trace_id, span_id)| {
+                adapter
+                    .context(
+                        &trace_id,
+                        &span_id,
+                        self.trace_flags.unwrap_or_default(),
+                        self.trace_state.as_deref().unwrap_or_default(),
+                    )
+                    .ok()
+            })
+            .unwrap_or_else(|| adapter.unparented_context())
+    }
+}
+
 /// One worker process dedicated to one REPL session. Wrapped by the
 /// TypeScript `MontySession` class — not part of the public API.
 #[napi(js_name = "NativeSession")]
@@ -230,16 +312,27 @@ impl NativeSession {
     /// the REPL session in it. Rejects with the pool error message on
     /// exhaustion or spawn failure.
     #[napi]
-    pub fn enter<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+    pub fn enter<'env>(
+        &self,
+        env: &'env Env,
+        telemetry_context: Option<NativeTelemetryContext>,
+    ) -> Result<PromiseRaw<'env, ()>> {
         let pool = Arc::clone(&self.pool);
         let repl_config = self.repl_config.clone();
         let slot = Arc::clone(&self.checkout);
+        let telemetry_context =
+            telemetry_context.and_then(|context| configured_adapter().map(|adapter| context.parse(adapter)));
         env.spawn_future(async move {
             let pool = lock(&pool)
                 .as_ref()
                 .map(Arc::clone)
                 .ok_or_else(|| invalid("the pool is not started — create it with Monty.create()"))?;
-            let checkout = pool.checkout(&repl_config).await.map_err(pool_error)?;
+            let checkout = if let Some(context) = telemetry_context {
+                pool.checkout_with_telemetry(&repl_config, context).await
+            } else {
+                pool.checkout(&repl_config).await
+            }
+            .map_err(pool_error)?;
             *slot.lock().await = Some(checkout);
             Ok(())
         })
@@ -253,15 +346,12 @@ impl NativeSession {
         env: &'env Env,
         code: String,
         inputs: Option<Object<'env>>,
-        mounts: Vec<NativeMount>,
+        mounts: Vec<ClassInstance<'env, NativeMountDir>>,
         skip_type_check: bool,
         on_print: PrintCallback<'env>,
     ) -> Result<PromiseRaw<'env, Object<'env>>> {
         let inputs = convert_inputs(env, inputs)?;
-        let mounts = mounts
-            .into_iter()
-            .map(MountSpec::try_from)
-            .collect::<Result<Vec<_>>>()?;
+        let mounts = mount_specs(&mounts)?;
         self.run_turn(
             env,
             on_print,
@@ -449,13 +539,10 @@ impl NativeSession {
         &self,
         env: &'env Env,
         state: Buffer,
-        mounts: Vec<NativeMount>,
+        mounts: Vec<ClassInstance<'env, NativeMountDir>>,
         on_print: PrintCallback<'env>,
     ) -> Result<PromiseRaw<'env, Object<'env>>> {
-        let mounts = mounts
-            .into_iter()
-            .map(MountSpec::try_from)
-            .collect::<Result<Vec<_>>>()?;
+        let mounts = mount_specs(&mounts)?;
         let state = state.to_vec();
         self.run_outcome(
             env,
@@ -898,13 +985,12 @@ impl TryFrom<NativeMount> for MountSpec {
             .map(|limit| bytes_limit(limit, "writeBytesLimit"))
             .transpose()?;
         let memory_usage_limit = bytes_limit(mount.memory_usage_limit, "memoryUsageLimit")?;
-        Ok(Self {
-            virtual_path: mount.virtual_path,
-            host_path: mount.host_path.into(),
-            mode,
-            write_bytes_limit,
-            memory_usage_limit,
-        })
+        // Opens the directory: the spec carries a descriptor from here on, so
+        // the host path is resolved once per mount object rather than per feed.
+        let mut spec = Self::new(&mount.virtual_path, &mount.host_path, mode).map_err(pool_error)?;
+        spec.write_bytes_limit = write_bytes_limit;
+        spec.memory_usage_limit = memory_usage_limit;
+        Ok(spec)
     }
 }
 
@@ -931,6 +1017,24 @@ fn duration_from_ms(ms: f64) -> Result<Duration> {
 /// `.lock().await` (or `try_lock` on the event-loop thread).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Clones each mount's opened configuration for one turn — the descriptor is
+/// shared, so nothing is reopened and no host path is resolved again.
+///
+/// # Errors
+///
+/// Rejects the turn if any mount has been closed.
+fn mount_specs(mounts: &[ClassInstance<'_, NativeMountDir>]) -> Result<Vec<MountSpec>> {
+    mounts
+        .iter()
+        .map(|mount| {
+            mount
+                .spec
+                .clone()
+                .ok_or_else(|| invalid("mount is closed: create a new MountDir"))
+        })
+        .collect()
 }
 
 fn pool_error(err: PoolError) -> napi::Error {

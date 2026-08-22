@@ -1,13 +1,13 @@
 //! The `dataclasses.Field` objects making up a class's `__dataclass_fields__`.
 
-use std::{fmt::Write, mem};
+use std::fmt::Write;
 
 use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
     hash::{HashValue, identity_hash},
-    heap::{ContainsHeap, DropWithContext, HeapId, HeapItem, HeapRead},
+    heap::{ContainsHeap, DropWithContext, HeapId, HeapItem, HeapObjectRead},
     intern::StringId,
     types::{LazyHeapSet, PyTrait, Type, str::allocate_string},
     value::{EitherStr, Value},
@@ -77,7 +77,7 @@ const UNMODELLED_ATTRS: [(&str, &str); 3] = [
     ("_field_type", "dataclasses._FIELD"),
 ];
 
-impl<'h> PyTrait<'h> for HeapRead<'h, DataclassField> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, DataclassField> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::DataclassField
     }
@@ -92,8 +92,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DataclassField> {
         Ok(None)
     }
 
-    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        Ok(Some(identity_hash(self_id)))
+    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        Ok(Some(identity_hash(self.id())))
     }
 
     /// CPython's `Field.__repr__`, attribute for attribute. The two spellings
@@ -138,7 +138,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, DataclassField> {
         let value = match attr_str {
             "name" => {
                 let name = vm.interns.get_str(self.get(vm.heap).name).to_owned();
-                allocate_string(name, vm.heap)?
+                allocate_string(name, vm.heap)
             }
             "type" => self.get(vm.heap).annotation.clone_with_heap(vm.heap),
             // A required field's default *is* `MISSING` in CPython.
@@ -168,10 +168,6 @@ fn unmodelled_attr_error(attr: &str, missing: &str) -> RunError {
 }
 
 impl HeapItem for DataclassField {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         self.annotation.py_dec_ref_ids(stack);
         if let Some(default) = &mut self.default {

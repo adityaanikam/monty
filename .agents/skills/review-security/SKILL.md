@@ -11,6 +11,10 @@ Monty runs untrusted, potentially malicious Python. Review this branch on that b
 git diff origin/main...HEAD
 ```
 
+Use a subagent to run `.agents/skills/fix-pr-comments/pr-threads.sh` (from the
+`fix-pr-comments` skill) for security findings already raised on the PR, and confirm
+each is properly addressed.
+
 Cover the changes **and any code they touch** — a caller made unsafe by a changed callee
 is in scope even if it isn't in the diff. Ask:
 
@@ -28,6 +32,10 @@ is in scope even if it isn't in the diff. Ask:
   dumps are trusted by contract — hosts sign and verify them.)
 - **Panics or aborts?** `unwrap`/`expect` reachable from sandboxed input, unbounded
   recursion hitting a stack-overflow abort.
+- **Mount escapes?** Any behaviour that allows sandbox code to escape a filesystem mount
+  and read or alter files outside the mount point. This is particularly severe since
+  mounts are run on the host/client connecting to a sandbox - accessing that environment
+  is a very serious breach of the sandbox and security issue.
 
 Weight both classes by where they land. In a pool worker the process dies, the parent
 replaces the child and raises an exception — contained. Nothing else is: in host/parent

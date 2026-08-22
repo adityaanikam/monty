@@ -16,7 +16,6 @@ use crate::{
     asyncio::CallId,
     bytecode::{VM, VMSnapshot},
     defer_drop,
-    dump_format::{DumpKind, dump, load},
     exception_private::{ExcTypeExt, RunError},
     heap::{DropWithContext, Heap, HeapData, HeapReader},
     intern::{InternerBuilder, Interns},
@@ -96,7 +95,7 @@ impl MontyRepl {
     /// This is primarily intended for host integrations that need to attach
     /// per-execution state, such as cancellation markers, to an existing REPL.
     pub fn tracker(&self) -> &ResourceTracker {
-        self.heap.tracker()
+        &self.heap.tracker
     }
 
     /// Returns mutable access to the resource tracker for the next snippet.
@@ -104,7 +103,15 @@ impl MontyRepl {
     /// REPL hosts use this to install ephemeral execution controls, such as
     /// async cancellation flags, before calling `feed_start()`.
     pub fn tracker_mut(&mut self) -> &mut ResourceTracker {
-        self.heap.tracker_mut()
+        &mut self.heap.tracker
+    }
+
+    /// Number of live heap entries (excluding the empty-tuple singleton) —
+    /// `ref-count-return`-only introspection for GC tests.
+    #[cfg(feature = "ref-count-return")]
+    #[must_use]
+    pub fn heap_entry_count(&self) -> usize {
+        self.heap.entry_count()
     }
 
     /// Starts executing a new snippet and returns suspendable REPL progress.
@@ -316,9 +323,13 @@ impl MontyRepl {
                 // advances (and accumulates) during the call. This cannot go
                 // through `VM::run_external` because `evaluate_function` must
                 // push and run a single function frame itself.
-                vm.heap.tracker().on_execution_start();
+                vm.heap.tracker.on_execution_start();
                 let eval_result = vm.evaluate_function("MontyRepl::call_function", callable, arg_values);
-                vm.heap.tracker().on_execution_stop();
+                vm.heap.tracker.on_execution_stop();
+                // Same host-boundary epilogue as `run_external`: a limit
+                // overshoot the call swallowed must fail the call, not
+                // return a truncated value.
+                let eval_result = vm.finish_host_turn(eval_result);
 
                 let result = match eval_result {
                     Ok(value) => Ok(MontyObject::new(value, vm)),
@@ -384,31 +395,6 @@ impl MontyRepl {
         let input_id = self.next_input_id;
         self.next_input_id += 1;
         format!("<python-input-{input_id}>")
-    }
-}
-
-impl MontyRepl {
-    /// Serializes the REPL session state to bytes.
-    ///
-    /// This includes heap + globals + global slot mapping, allowing snapshot/restore
-    /// of interactive state between process runs. The header identifies the format
-    /// version and dump kind so incompatible data is rejected.
-    ///
-    /// # Errors
-    /// Returns an error if serialization fails.
-    pub fn dump(&self) -> Result<Vec<u8>, postcard::Error> {
-        dump(self, DumpKind::MontyRepl)
-    }
-}
-
-impl MontyRepl {
-    /// Restores a REPL session from bytes produced by `MontyRepl::dump`.
-    ///
-    /// # Errors
-    /// Returns an error for an incompatible dump version or kind, or if
-    /// deserialization fails.
-    pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        load(bytes, DumpKind::MontyRepl)
     }
 }
 
@@ -529,27 +515,6 @@ impl ReplProgress {
             Self::NameLookup(lookup) => lookup.snapshot.repl.tracker(),
             Self::Complete { repl, .. } => repl.tracker(),
         }
-    }
-}
-
-impl ReplProgress {
-    /// Serializes the REPL execution progress to a versioned binary format.
-    ///
-    /// # Errors
-    /// Returns an error if serialization fails.
-    pub fn dump(&self) -> Result<Vec<u8>, postcard::Error> {
-        dump(self, DumpKind::ReplProgress)
-    }
-}
-
-impl ReplProgress {
-    /// Deserializes REPL execution progress from a binary format.
-    ///
-    /// # Errors
-    /// Returns an error for an incompatible dump version or kind, or if
-    /// deserialization fails.
-    pub fn load(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        load(bytes, DumpKind::ReplProgress)
     }
 }
 
@@ -974,10 +939,8 @@ impl ReplSnapshot {
                     ExtFunctionResult::Error(exc) => vm.resume_with_exception(exc.into()),
                     ExtFunctionResult::Future(raw_call_id) => {
                         let call_id = CallId::new(raw_call_id);
-                        match vm.add_pending_call(call_id) {
-                            Ok(()) => vm.run_external(),
-                            Err(err) => vm.resume_with_exception(err),
-                        }
+                        vm.add_pending_call(call_id);
+                        vm.run_external()
                     }
                     ExtFunctionResult::NotFound(function_name) => {
                         vm.resume_with_exception(ExtFunctionResult::not_found_exc(&function_name))

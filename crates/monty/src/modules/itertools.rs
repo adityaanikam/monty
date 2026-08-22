@@ -5,8 +5,6 @@
 //! stubbed, so they raise `AttributeError` up front. See
 //! [`crate::types::itertools`] for why the family shares one `HeapData` variant.
 
-use monty_types::ResourceError;
-
 use crate::{
     args::{ArgValues, FromArgs},
     bytecode::VM,
@@ -16,7 +14,9 @@ use crate::{
     modules::ModuleFunctions,
     types::{
         ItertoolsIter, Module, Type,
-        itertools::{Chain, Compress, Count, Cycle, Islice, Pairwise, Repeat},
+        itertools::{
+            Chain, Compress, Count, Cycle, DropWhile, FilterFalse, Islice, Pairwise, Repeat, StarMap, TakeWhile,
+        },
     },
     value::Value,
 };
@@ -32,6 +32,10 @@ pub(crate) enum ItertoolsFunctions {
     Islice,
     Chain,
     Cycle,
+    Takewhile,
+    Dropwhile,
+    Filterfalse,
+    Starmap,
 }
 
 /// Static mapping of attribute names to functions for module creation.
@@ -43,13 +47,17 @@ const ITERTOOLS_FUNCTIONS: &[(StaticStrings, ItertoolsFunctions)] = &[
     (StaticStrings::Islice, ItertoolsFunctions::Islice),
     (StaticStrings::Chain, ItertoolsFunctions::Chain),
     (StaticStrings::Cycle, ItertoolsFunctions::Cycle),
+    (StaticStrings::Takewhile, ItertoolsFunctions::Takewhile),
+    (StaticStrings::Dropwhile, ItertoolsFunctions::Dropwhile),
+    (StaticStrings::Filterfalse, ItertoolsFunctions::Filterfalse),
+    (StaticStrings::Starmap, ItertoolsFunctions::Starmap),
 ];
 
 /// Creates the `itertools` module on the heap.
 ///
 /// # Panics
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_>) -> Result<HeapId, ResourceError> {
+pub fn create_module(vm: &mut VM<'_>) -> HeapId {
     let mut module = Module::new(StaticStrings::Itertools);
 
     for (name, func) in ITERTOOLS_FUNCTIONS {
@@ -69,6 +77,10 @@ pub(super) fn call(vm: &mut VM<'_>, function: ItertoolsFunctions, args: ArgValue
         ItertoolsFunctions::Islice => call_islice(vm, args),
         ItertoolsFunctions::Chain => call_chain(vm, args),
         ItertoolsFunctions::Cycle => call_cycle(vm, args),
+        ItertoolsFunctions::Takewhile => call_takewhile(vm, args),
+        ItertoolsFunctions::Dropwhile => call_dropwhile(vm, args),
+        ItertoolsFunctions::Filterfalse => call_filterfalse(vm, args),
+        ItertoolsFunctions::Starmap => call_starmap(vm, args),
     }
 }
 
@@ -94,7 +106,7 @@ fn call_count(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     // Rejecting here means `py_next` can add without a defined-ness check.
     if is_number(&start, vm) && is_number(&step, vm) {
         let iter = ItertoolsIter::Count(Count::new(normalize_bool(start), normalize_bool(step)));
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
     } else {
         start.drop_with(vm);
         step.drop_with(vm);
@@ -133,7 +145,7 @@ fn call_repeat(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         }
     };
     let iter = ItertoolsIter::Repeat(Repeat::new(object, remaining));
-    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
 }
 
 /// Whether `value` satisfies CPython's `PyNumber_Check` for `count()`.
@@ -190,7 +202,7 @@ fn call_pairwise(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     // here rather than on the first `next()`.
     let source = iterable.into_py_iter(vm)?;
     let iter = ItertoolsIter::Pairwise(Pairwise::new(source));
-    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
 }
 
 /// Argument shape for `compress(data, selectors)`.
@@ -217,7 +229,7 @@ fn call_compress(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let selectors = selectors.into_py_iter(guard.ctx())?;
     let (data, vm) = guard.into_parts();
     let iter = ItertoolsIter::Compress(Compress::new(data, selectors));
-    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
 }
 
 /// Argument shape for `islice(iterable, [start,] stop[, step])`.
@@ -260,7 +272,7 @@ fn call_islice(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let source = iterable.into_py_iter(vm)?;
     let iter = ItertoolsIter::Islice(Islice::new(source, start, stop, step));
-    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
 }
 
 /// Resolves `islice`'s overloaded positional slots into `(start, stop, step)`.
@@ -339,7 +351,7 @@ fn call_chain(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     // Arguments are NOT resolved here: CPython calls `iter()` on each only as it
     // reaches it, so `chain([1], 5)` constructs and raises mid-consumption.
     let iter = ItertoolsIter::Chain(Chain::new(iterables));
-    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
 }
 
 /// Argument shape for `cycle(iterable)`.
@@ -359,5 +371,74 @@ fn call_cycle(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     // Unlike `chain`, CPython resolves eagerly here, so `cycle(5)` raises now.
     let source = iterable.into_py_iter(vm)?;
     let iter = ItertoolsIter::Cycle(Cycle::new(source));
-    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
+}
+
+/// Argument shape shared by `takewhile`, `dropwhile`, `filterfalse` and
+/// `starmap`.
+///
+/// All four are `PyArg_UnpackTuple(args, name, 2, 2, ...)` in CPython, so both
+/// slots are positional-only, arity reads `takewhile expected 2 arguments, got
+/// 1`, and keywords are rejected wholesale. The macro embeds the name, hence
+/// one struct per callable rather than one shared struct.
+macro_rules! callable_and_iterable_args {
+    ($struct_name:ident, $py_name:literal) => {
+        #[derive(FromArgs)]
+        #[from_args(name = $py_name, style = unpack)]
+        struct $struct_name {
+            #[from_args(pos_only)]
+            callable: Value,
+            #[from_args(pos_only)]
+            iterable: Value,
+        }
+    };
+}
+
+callable_and_iterable_args!(TakeWhileArgs, "takewhile");
+callable_and_iterable_args!(DropWhileArgs, "dropwhile");
+callable_and_iterable_args!(FilterFalseArgs, "filterfalse");
+callable_and_iterable_args!(StarMapArgs, "starmap");
+
+/// `itertools.takewhile(predicate, iterable)` — the leading passing run.
+fn call_takewhile(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let TakeWhileArgs { callable, iterable } = TakeWhileArgs::from_args(args, vm)?;
+    let (predicate, source) = resolve_source(callable, iterable, vm)?;
+    let iter = ItertoolsIter::TakeWhile(TakeWhile::new(predicate, source));
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
+}
+
+/// `itertools.dropwhile(predicate, iterable)` — everything past that run.
+fn call_dropwhile(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let DropWhileArgs { callable, iterable } = DropWhileArgs::from_args(args, vm)?;
+    let (predicate, source) = resolve_source(callable, iterable, vm)?;
+    let iter = ItertoolsIter::DropWhile(DropWhile::new(predicate, source));
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
+}
+
+/// `itertools.filterfalse(predicate, iterable)` — the items it rejects.
+fn call_filterfalse(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let FilterFalseArgs { callable, iterable } = FilterFalseArgs::from_args(args, vm)?;
+    let (predicate, source) = resolve_source(callable, iterable, vm)?;
+    let iter = ItertoolsIter::FilterFalse(FilterFalse::new(predicate, source));
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
+}
+
+/// `itertools.starmap(function, iterable)` — each item spread as arguments.
+fn call_starmap(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let StarMapArgs { callable, iterable } = StarMapArgs::from_args(args, vm)?;
+    let (function, source) = resolve_source(callable, iterable, vm)?;
+    let iter = ItertoolsIter::StarMap(StarMap::new(function, source));
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Itertools(iter))))
+}
+
+/// Resolves the iterable while keeping the callable safe from the error path.
+///
+/// CPython resolves eagerly for all four, so a non-iterable raises here rather
+/// than on the first `next()`. The callable itself is never type-checked: a
+/// non-callable is only discovered when the adaptor first applies it.
+fn resolve_source(callable: Value, iterable: Value, vm: &mut VM<'_>) -> RunResult<(Value, Value)> {
+    let mut guard = DropGuard::new(callable, vm);
+    let source = iterable.into_py_iter(guard.ctx())?;
+    let (callable, _) = guard.into_parts();
+    Ok((callable, source))
 }

@@ -497,11 +497,10 @@ pub struct Configure {
     /// Optional stub file contents used by type checking.
     #[prost(string, optional, tag = "4")]
     pub type_check_stubs: ::core::option::Option<::prost::alloc::string::String>,
-    /// The parent's monty version (e.g. "0.0.18"). The child rejects the
-    /// session with a `FatalError` when this does not match its own version:
-    /// the protocol has no in-band negotiation and parent and child must be
-    /// deployed in lockstep, so a mismatch is a hard, fail-fast error rather
-    /// than a silent source of frame desync.
+    /// The parent's monty package version (e.g. "0.0.18"). INFORMATIONAL ONLY —
+    /// it is never checked, only reported (in telemetry, and when diagnosing a
+    /// rejected `protocol_version`). Parent and child may run different package
+    /// versions as long as their protocol versions are compatible.
     #[prost(string, tag = "5")]
     pub monty_version: ::prost::alloc::string::String,
     /// Introspected `assert` failure messages (see limitations/assert.md).
@@ -510,6 +509,26 @@ pub struct Configure {
     /// any ellipsis, cutting on a character boundary.
     #[prost(uint32, optional, tag = "6")]
     pub assert_message_annotations: ::core::option::Option<u32>,
+    /// How the child renders the diagnostics carried by `TypingError`. The
+    /// structured diagnostics borrow the type checker's database and so cannot
+    /// cross the wire — the parent picks the format up front and the child
+    /// renders it. Ignored when `type_check` is false.
+    #[prost(enumeration = "TypeCheckFormat", tag = "7")]
+    pub type_check_format: i32,
+    /// Render typing diagnostics with ANSI colour escapes. Only `FULL` and
+    /// `CONCISE` carry colour; the machine-readable formats ignore it.
+    #[prost(bool, tag = "8")]
+    pub type_check_color: bool,
+    /// Version of the wire schema the parent speaks. The child rejects the
+    /// session with a `FatalError` naming its own supported range when this
+    /// falls outside it, so a parent deployed separately from its worker (over
+    /// a websocket, say) learns what to downgrade to without a handshake.
+    ///
+    /// 0 means the parent declared nothing — either it predates this field or it
+    /// is not a monty parent — and is always rejected. The protocol has no
+    /// in-band negotiation, so an undeclared peer cannot be assumed compatible.
+    #[prost(uint32, tag = "9")]
+    pub protocol_version: u32,
 }
 /// Executes one snippet against the session. Turn ends with `Complete`,
 /// `Error`, `TypingError`, or a suspension event.
@@ -558,8 +577,9 @@ pub struct ResumeFutures {
     pub results: ::prost::alloc::vec::Vec<FutureResult>,
 }
 /// Requests an opaque serialized snapshot of the current session state
-/// (idle or suspended). The child stays usable afterwards. The bytes can only
-/// be restored by a monty child of the same version via `Load`.
+/// (idle or suspended). The child stays usable afterwards. The bytes carry
+/// monty's own dump format, versioned independently of this schema, and can
+/// only be restored via `Load` by a child built with the same dump version.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Dump {}
 /// Restores state produced by `Dump`. Valid only from no session. If
@@ -867,7 +887,7 @@ pub struct Error {
 /// survives.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TypingError {
-    /// Rendered diagnostics, one per line.
+    /// Diagnostics rendered in the session's `TypeCheckFormat`.
     #[prost(string, tag = "1")]
     pub diagnostics: ::prost::alloc::string::String,
 }
@@ -904,6 +924,59 @@ pub struct ShutdownDump {
     /// when there was no session yet or the dump itself failed.
     #[prost(bytes = "vec", optional, tag = "1")]
     pub dump: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+/// Rendering of the typing diagnostics a `TypingError` carries; mirrors ty's
+/// `DiagnosticFormat`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TypeCheckFormat {
+    /// Unset by an older parent — the child renders `FULL`.
+    Unspecified = 0,
+    Full = 1,
+    Concise = 2,
+    Azure = 3,
+    Json = 4,
+    JsonLines = 5,
+    Rdjson = 6,
+    Pylint = 7,
+    Gitlab = 8,
+    Github = 9,
+}
+impl TypeCheckFormat {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TYPE_CHECK_FORMAT_UNSPECIFIED",
+            Self::Full => "TYPE_CHECK_FORMAT_FULL",
+            Self::Concise => "TYPE_CHECK_FORMAT_CONCISE",
+            Self::Azure => "TYPE_CHECK_FORMAT_AZURE",
+            Self::Json => "TYPE_CHECK_FORMAT_JSON",
+            Self::JsonLines => "TYPE_CHECK_FORMAT_JSON_LINES",
+            Self::Rdjson => "TYPE_CHECK_FORMAT_RDJSON",
+            Self::Pylint => "TYPE_CHECK_FORMAT_PYLINT",
+            Self::Gitlab => "TYPE_CHECK_FORMAT_GITLAB",
+            Self::Github => "TYPE_CHECK_FORMAT_GITHUB",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TYPE_CHECK_FORMAT_UNSPECIFIED" => Some(Self::Unspecified),
+            "TYPE_CHECK_FORMAT_FULL" => Some(Self::Full),
+            "TYPE_CHECK_FORMAT_CONCISE" => Some(Self::Concise),
+            "TYPE_CHECK_FORMAT_AZURE" => Some(Self::Azure),
+            "TYPE_CHECK_FORMAT_JSON" => Some(Self::Json),
+            "TYPE_CHECK_FORMAT_JSON_LINES" => Some(Self::JsonLines),
+            "TYPE_CHECK_FORMAT_RDJSON" => Some(Self::Rdjson),
+            "TYPE_CHECK_FORMAT_PYLINT" => Some(Self::Pylint),
+            "TYPE_CHECK_FORMAT_GITLAB" => Some(Self::Gitlab),
+            "TYPE_CHECK_FORMAT_GITHUB" => Some(Self::Github),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

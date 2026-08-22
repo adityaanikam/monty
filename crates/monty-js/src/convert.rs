@@ -26,6 +26,7 @@
 //! - `MontyObject::FileHandle` ↔ `{ __monty_type__: 'FileHandle', path, mode, position }`
 //! - `MontyObject::Repr` → plain `string`
 //! - `MontyObject::Cycle` → placeholder `string`
+#![expect(unsafe_code, reason = "napi API is unsafe")]
 
 use std::{borrow::Cow, collections::HashMap, ptr};
 

@@ -8,7 +8,6 @@ use std::{
     fmt,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem,
 };
 
 use super::LazyHeapSet;
@@ -18,7 +17,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult},
     hash::HashValue,
-    heap::{HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::StaticStrings,
     types::{PyTrait, Type},
     value::{EitherStr, Value},
@@ -82,7 +81,7 @@ impl Slice {
             _ => return Err(ExcType::type_error_at_most("slice", 3, pos_args.len())),
         };
 
-        Ok(Value::Ref(heap.allocate(HeapData::Slice(slice))?))
+        Ok(Value::Ref(heap.allocate(HeapData::Slice(slice))))
     }
 
     /// Computes concrete indices for a sequence of the given length.
@@ -158,7 +157,7 @@ fn normalize_index(index: i64, length: i64, lower: i64, upper: i64) -> i64 {
     normalized.clamp(lower, upper)
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, Slice> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, Slice> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Slice
     }
@@ -177,7 +176,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Slice> {
         Ok(Some(a.start == b.start && a.stop == b.stop && a.step == b.step))
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
         self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))
@@ -220,10 +219,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Slice> {
 }
 
 impl HeapItem for Slice {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // Slice doesn't contain heap references, nothing to do
     }
@@ -265,8 +260,10 @@ pub(crate) fn slice_collect_iterator<Iter: DoubleEndedIterator + Clone, U, T: Fr
     let length = iter.clone().count();
     let (start, stop, step) = slice.indices(length)?;
 
+    let mut i = 0usize;
     let final_collect_op = |item| -> RunResult<U> {
-        vm.heap.check_time()?;
+        vm.heap.tracker.check_time_every(i)?;
+        i += 1;
         Ok(collect_map(item))
     };
 

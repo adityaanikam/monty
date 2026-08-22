@@ -14,6 +14,7 @@ exclude-newer-span = "P7D"
 members = [
     "monty-workspace",
     "pydantic-monty",
+    "pydantic-monty-client",
     "pydantic-monty-runtime",
 ]
 
@@ -403,7 +404,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -1369,9 +1370,23 @@ wheels = [
 
 [[package]]
 name = "pydantic-monty"
+version = "0.0.21"
+source = { editable = "packages/pydantic-monty" }
+dependencies = [
+    { name = "pydantic-monty-client" },
+    { name = "pydantic-monty-runtime" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pydantic-monty-client", editable = "crates/monty-python" },
+    { name = "pydantic-monty-runtime", editable = "crates/monty-runtime" },
+]
+
+[[package]]
+name = "pydantic-monty-client"
 source = { editable = "crates/monty-python" }
 dependencies = [
-    { name = "pydantic-monty-runtime" },
     { name = "typing-extensions" },
 ]
 
@@ -1387,10 +1402,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "pydantic-monty-runtime", editable = "crates/monty-runtime" },
-    { name = "typing-extensions", specifier = ">=4.5" },
-]
+requires-dist = [{ name = "typing-extensions", specifier = ">=4.5" }]
 
 [package.metadata.requires-dev]
 dev = [

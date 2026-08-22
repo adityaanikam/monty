@@ -158,6 +158,19 @@ interface worker {
         max-recursion-depth: option<u64>,
     }
 
+    /// Available renderings for type-check diagnostics.
+    enum type-check-format {
+        full,
+        concise,
+        azure,
+        json,
+        json-lines,
+        rdjson,
+        pylint,
+        gitlab,
+        github,
+    }
+
     /// Options for creating one REPL session.
     record configure-request {
         script-name: string,
@@ -165,6 +178,8 @@ interface worker {
         type-check: bool,
         type-check-stubs: option<string>,
         assert-message-annotations: option<u32>,
+        type-check-format: type-check-format,
+        type-check-color: bool,
     }
 
     /// One Python snippet and its host inputs.

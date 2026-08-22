@@ -229,12 +229,45 @@ export interface ResourceLimits {
   gcInterval?: bigint
   maxRecursionDepth?: bigint
 }
+/**
+ * # Variants
+ *
+ * ## `"full"`
+ *
+ * ## `"concise"`
+ *
+ * ## `"azure"`
+ *
+ * ## `"json"`
+ *
+ * ## `"json-lines"`
+ *
+ * ## `"rdjson"`
+ *
+ * ## `"pylint"`
+ *
+ * ## `"gitlab"`
+ *
+ * ## `"github"`
+ */
+export type TypeCheckFormat =
+  | 'full'
+  | 'concise'
+  | 'azure'
+  | 'json'
+  | 'json-lines'
+  | 'rdjson'
+  | 'pylint'
+  | 'gitlab'
+  | 'github'
 export interface ConfigureRequest {
   scriptName: string
   limits?: ResourceLimits
   typeCheck: boolean
   typeCheckStubs?: string
   assertMessageAnnotations?: number
+  typeCheckFormat: TypeCheckFormat
+  typeCheckColor: boolean
 }
 export interface FeedRequest {
   code: string

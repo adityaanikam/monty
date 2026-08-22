@@ -53,7 +53,8 @@ Key rules:
 - Avoid `#[cfg(unix)]`-only code in the main crate — all features must work on all platforms
 - Tests in `crates/*/tests/` should be cross-platform; use helper functions for
   OS-specific APIs like symlink creation (see `symlink_file`/`symlink_dir` in
-  `crates/monty-fs/tests/fs_security.rs`)
+  `crates/monty-fs/tests/common/mod.rs`, shared via `mod common;` — each
+  `tests/*.rs` is its own crate, so helpers used by more than one belong there)
 - CI runs `cargo test -p monty --features memory-model-checks` and `cargo test -p monty-fs`
   on Linux, macOS, and Windows
 
@@ -94,18 +95,23 @@ bindings) services via `MountTable::handle_os_call`.
 obtain any information about any file or directory outside the specific directory
 that is mounted. This is enforced by:
 
-- Path canonicalization after mapping virtual → host paths
-- Boundary checks verifying canonical paths remain within the mount
-- Symlink resolution that rejects links pointing outside the mount
-- Virtual-space normalization that prevents `..` escape
+- A `cap_std::fs::Dir` descriptor opened once at mount time, which every
+  operation runs relative to — so `..`, symlinks and intermediate directories
+  swapped mid-operation cannot reach out
+- Virtual-space normalization that prevents `..` escape in the sandbox namespace
 - `Resolve` and `Absolute` returning virtual paths, never host paths
 - Null byte rejection in all paths
 
-All path resolution goes through `path_security::resolve_path()` (in
-`crates/monty-fs/src/path_security.rs`) which is the sole security boundary.
-**Changes to `path_security.rs` require careful security review.**
+Path confinement is **structural**, not a check: `Mount::dir` (in
+`crates/monty-fs/src/mount_table.rs`) is the boundary; `path_security.rs` is
+now only path policy. The cost is that an absolute symlink target is never
+followed, even inside the mount (see `limitations/filesystem.md`) — do not
+"fix" that by comparing against the mount's host path, which restores the
+check-then-use this removes.
 
-`heap.rs` and `path_security.rs` are the two most security-critical files in the codebase.
+**Changes to `mount_table.rs` or `path_security.rs` require careful security
+review.** `heap.rs` and the mount boundary are the most security-critical
+code in the codebase.
 
 ## Subprocess isolation (`monty-proto`, `monty subprocess`, `monty-pool`)
 
@@ -137,6 +143,16 @@ subprocesses:
   with crash detection/replacement and a hard per-turn timeout. Frame reads
   are cancel-safe (partial-frame state lives in the worker, no pump task),
   and turn deadlines are tokio timers rather than a watchdog thread.
+- `crates/monty-alloc` — the `#[global_allocator]` both workers run under: it
+  counts live bytes against soft and hard session limits (via
+  `Child::session_budget`, re-armed after every request). The interpreter reads
+  the soft limit at execution checkpoints; crossing the hard limit ends the
+  process rather than letting Rust abort. Its `exit-code` feature picks how:
+  `monty-runtime` enables it and exits with `OOM_EXIT_CODE` for the pool to
+  classify, `monty-wasm-runtime` leaves it off and traps, having no exit status
+  to offer. Only a binary or a wasm module may declare a global allocator, so
+  the crate provides the type and each declares its own. Direct interpreter use
+  must install and arm this allocator before configuring `max_memory`.
 - `pydantic_monty.Monty` / `pydantic_monty.AsyncMonty` — the ONLY Python
   execution surface (there is no in-process Python API): sync and async pools
   of workers (`with Monty() as pool: with pool.checkout() as session:
@@ -286,19 +302,19 @@ iter.drop_with(self); // single path, no branching
 
 ### Resource-tracked string construction (`StringBuilder`)
 
-Any code that builds a `String` whose final size is not already bounded by an already-tracked input **must** use `StringBuilder` (in `crates/monty/src/string_builder.rs`) rather than `String::with_capacity(...).push(...)`. Intermediate `String`s live on the Rust heap *outside* the resource tracker, so a loop-built string can OOM the host before `allocate_string` ever consults the tracker — this is exactly the class of bug that hit `str.expandtabs` (huge `tabsize` amplifying a single tab into a multi-gigabyte allocation).
+Any code that builds a `String` whose final size is not already bounded by an existing input **must** use `StringBuilder` (in `crates/monty/src/string_builder.rs`) rather than `String::with_capacity(...).push(...)`. A loop-built string can otherwise jump past both allocator limits before an execution checkpoint — this is exactly the class of bug that hit `str.expandtabs` (huge `tabsize` amplifying a single tab into a multi-gigabyte allocation).
 
-`StringBuilder` actively *reserves* bytes with the tracker (via `on_grow`) as it grows, not just previews. This matters for nested builds: a `str.join` that invokes user-defined `__str__` methods, an f-string spec that evaluates an inner expression, etc. With a preview-only check, each builder would only see the *committed* memory and miss the outer's in-progress buffer — together they could exceed the limit. Reservations are released on `Drop` (cleanup on `?` / early-return paths) or in `finish(heap)` (which folds the handoff to `allocate_string` into the builder so the final size is re-added via `on_grow` exactly once). Growth is amortized via 2× doubling:
+`StringBuilder` preflights capacity growth against allocator-backed usage. The in-progress buffer is itself visible to the allocator, so nested builders share the same real-byte budget. Growth is amortized via 2× doubling:
 
 ```rust
 // Bounded size known up front (padding to a given width):
-let mut builder = StringBuilder::with_capacity(width * fillchar.len_utf8(), vm.heap.tracker())?;
+let mut builder = StringBuilder::with_capacity(width * fillchar.len_utf8(), &vm.heap.tracker)?;
 builder.push_str(s)?;
 for _ in 0..pad { builder.push(fillchar)?; }
 builder.finish(vm.heap)
 
 // Size not bounded up front (e.g. attacker-controlled multiplier):
-let mut builder = StringBuilder::new(vm.heap.tracker());
+let mut builder = StringBuilder::new(&vm.heap.tracker);
 for c in input.chars() { builder.push(c)?; }
 builder.finish(vm.heap)
 ```
@@ -306,6 +322,35 @@ builder.finish(vm.heap)
 `StringBuilder` also implements `fmt::Write`, so `write!(builder, ...)`, `format_args!`, and the existing `py_repr_fmt(f, ...)` machinery work against a tracker-protected buffer. `fmt::Error` is payload-free, so any `ResourceError` raised by a write is stashed on the builder and surfaced by `finish(heap)` — callers using `write!` don't need to thread the tracker error themselves.
 
 When the input *is* already bounded (e.g. `s.to_lowercase()`, slicing, `to_owned()` of an existing tracked string), passing a plain `String` / `&str` to `allocate_string` is fine — the result is bounded by a known multiple of an already-tracked input, so no amplification is possible.
+
+### Soft memory-limit checks — when and why
+
+`max_memory` is a **soft** limit: the VM polls allocator-backed usage every 255
+instructions (`check_memory_time`), and everything pathological is caught by the hard
+limits — the allocator's hard ceiling (soft + headroom, worker exits with
+`OOM_EXIT_CODE` and the pool replaces it) and the pool's turn timeout. Soft
+checks exist ONLY to turn *common* overshoots into a graceful `MemoryError`
+that keeps the session alive; they are not a safety boundary, so do not
+sprinkle them everywhere — every check is code noise and hot-path cost.
+
+Add a check only where ordinary code commonly allocates a multi-MiB burst
+inside a single builtin call (i.e. before the next instruction checkpoint):
+
+- Known-size bulk allocation: one up-front `tracker.check_allocation(n * VALUE_SIZE)`
+  (container clone/copy, e.g. `clone_all_items`, `list_copy`) or
+  `check_repeat_size`-style estimate (`resource_checks.rs`).
+- Iterator collection: `collect_python_iterator` / `checked_preallocation_hint`
+  already handle it; for push-loops that bypass them, a one-shot size-hint
+  preflight (see `deque_extend`) — never a per-item poll.
+- Unbounded/amplifying string building: `StringBuilder` (above).
+
+Do NOT add per-iteration `check_time()` polls to Rust-side loops for memory's
+sake, and do NOT preflight results bounded by a constant multiple of an
+already-tracked input (path joins, `*args` tuples, regex match lists, parsed
+JSON) — rare oversized cases there are the hard limit's job. Test each graceful
+path in `large_allocations_are_rejected_before_the_hard_limit`
+(`crates/monty-runtime/tests/subprocess.rs`) — the interpreter's own tests
+never arm the allocator, so only subprocess tests exercise `max_memory`.
 
 ## Dev Commands
 
@@ -324,6 +369,7 @@ make test-js              Test the JS package (builds the monty binary the worke
 make dev-py-release       Install the python package for development with a release build
 make build-wasm           Build the WASI 0.2 worker component (requires the wasm32-wasip1 target)
 make check-wasm-types     Verify checked-in component declarations match the WIT interface
+make test-wasm            Test the wasm worker component from Node, with no browser
 make test-browser         Build and test the wasm worker path in headless Chromium
 make dev-py-pgo           Install the python package for development with profile-guided optimization
 make format-rs            Format Rust code with fmt
@@ -336,8 +382,6 @@ make generate-proto       Regenerate monty-proto's checked-in code from the .pro
 make check-proto          Verify monty-proto's checked-in code matches the .proto schema
 make lint-py              Lint Python code with ruff
 make lint                 Lint the code with ruff and clippy
-make format-lint-rs       Format and lint Rust code with fmt and clippy
-make format-lint-py       Format and lint Python code with ruff
 make test-no-features     Run rust tests without any features enabled
 make test-memory-model-checks Run rust tests with memory-model-checks enabled - THIS IS EXTREMELY SLOW, SHOULD MOSTLY BE RUN IN CI OR IF ABSOLUTELY NECESSARY
 make test-ref-count-return Run rust tests with ref-count-return enabled
@@ -662,7 +706,18 @@ Workflow: write `assert_snapshot!(value, @"");`, then `cargo insta test --accept
 
 ## Python Package (`pydantic-monty`)
 
-The Python package provides Python bindings for the Monty interpreter, located in `crates/monty-python/`.
+Three PyPI distributions are built from this repo:
+
+- `pydantic-monty-client` (`crates/monty-python/`, Cargo package
+  `pydantic-monty-client`) — the PyO3 bindings, i.e. the `pydantic_monty`
+  module. It deliberately does **not** depend on the runtime, so it can be
+  installed where the `monty` binary comes from a base image or system package.
+- `pydantic-monty-runtime` (`crates/monty-runtime/`) — the `monty` worker binary.
+- `pydantic-monty` (`packages/pydantic-monty/`) — a hatchling metapackage with
+  no code, exactly pinning the other two. This is what users install. Its
+  version and both pins are rewritten from the Cargo workspace version by
+  `crates/monty-python/build.rs`; never edit them by hand.
+
 Execution always happens in `monty` worker subprocesses — there is no in-process execution API.
 The surface is `Monty` (sync pool) and `AsyncMonty` (async pool), each with
 `pool.checkout(...)` sessions driven by `feed_run` (a coroutine on async sessions).
@@ -672,6 +727,8 @@ The surface is `Monty` (sync pool) and `AsyncMonty` (async pool), each with
 - `crates/monty-python/src/` - Rust source for PyO3 bindings
 - `crates/monty-python/python/pydantic_monty/_monty.pyi` - Type stubs for the Python module
 - `crates/monty-python/tests/` - Python tests using pytest
+- `crates/monty-python/README.md` - the `pydantic-monty-client` readme (binary
+  resolution); the full user-facing docs live in `packages/pydantic-monty/README.md`
 
 ### Building and Testing
 
@@ -744,7 +801,7 @@ Raw ownership is also acceptable when immediately transferred into a documented 
 **Mutability of the heap parameter is asymmetric** — do not assume the two methods take the same kind of borrow:
 
 - `clone_with_heap` takes `&impl ContainsHeap` (immutable). The refcount field lives behind interior mutability, so `inc_ref` is `&self` on `Heap`. This means you can call `clone_with_heap` while other immutable borrows of the heap (e.g. a `HeapRead` handle obtained via `.get(heap)`) are still live.
-- `Heap::allocate` is also `&self` for the same reason — entry storage and the allocation tracker are behind interior mutability. New heap entries can be created without a `&mut Heap`.
+- `Heap::allocate` is also `&self` because entry storage is behind interior mutability. New heap entries can be created without a `&mut Heap`.
 - `drop_with` takes `&mut C` (the cleanup context — `Heap` / `HeapReader` / `VM` / `Encoder`), because dropping may free entries and run destructors, which mutates the heap.
 
 If you find yourself fighting the borrow checker around `clone_with_heap` or `allocate`, the fix is almost never `&mut` — it is more likely that you are passing the wrong receiver (e.g. `vm` instead of `vm.heap`) or holding a `&mut` borrow elsewhere that should be `&`.
@@ -787,7 +844,7 @@ recovery, framing and value conversion all live in Rust.
   selected via optionalDependencies; `napi create-npm-dirs` +
   `scripts/create-platform-packages.mjs`)
 - `crates/monty-js/__test__/` - Vitest tests shared by the native Node and
-  browser/WASM backends
+  browser/WASM backends; `wasm_*.spec.ts` drive the wasm worker without napi
 
 ### Current API
 
@@ -817,6 +874,7 @@ See `crates/monty-js/README.md` for full API documentation.
 make install-js   # npm install
 make build-js     # napi debug build + compile TypeScript
 make test-js      # builds the napi binding + debug monty binary, then runs Vitest
+make test-wasm    # builds and tests the wasm path from Node
 make test-browser # builds and tests the wasm path in headless Chromium
 make lint-js      # oxlint
 make format-js    # prettier
@@ -844,7 +902,8 @@ transport differs. The pieces:
   transport-agnostic `monty-proto` `Child` state machine. Rust builds a
   `wasm32-wasip1` core module, then Jco applies the Preview 1 reactor adapter
   and generates JavaScript canonical-ABI bindings. No napi, threads, stdio RPC,
-  or `SharedArrayBuffer`.
+  or `SharedArrayBuffer`. Its `monty-alloc` global allocator applies a session's
+  `max_memory` to component allocations; exceeding the hard limit traps.
 - `crates/monty-js/ts/worker/` — the TS pool/transport that drives it
   (`createWorkerPool`): a browser `Worker` backend (`browserFactory.ts`, whose
   `Worker.terminate()` is the watchdog's hard kill), a Node `worker_threads`
@@ -857,7 +916,8 @@ transport differs. The pieces:
 Build the worker component locally with `make build-wasm` (needs the
 `wasm32-wasip1` target); it is built and tested in CI. This also refreshes the
 checked-in WIT-derived declarations under `crates/monty-js/ts/worker/component/`;
-do not edit those files directly.
+do not edit those files directly. `make test-browser` runs the whole suite in
+headless Chromium, while `make test-wasm` runs `wasm_*.spec.ts` from Node.
 
 ## Limitations documentation (`./limitations/`)
 

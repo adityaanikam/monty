@@ -6,13 +6,19 @@
 // arena; protobuf is now entirely internal to Rust.
 
 import type { NativeFutureResult, NativeTurn, NotMountedTurn } from '../native.js'
-import { type AssertMessageAnnotations, encodeAssertMessageAnnotations } from '../options.js'
+import {
+  type AssertMessageAnnotations,
+  type TypeCheckFormat,
+  encodeAssertMessageAnnotations,
+  encodeTypeCheckFormat,
+} from '../options.js'
 import type {
   CallResult,
   Event as ComponentEvent,
   NameLookupResult,
   Request as ComponentRequest,
   ResourceLimits as ComponentResourceLimits,
+  TypeCheckFormat as ComponentTypeCheckFormat,
   Value as ComponentValue,
 } from './component/monty.component.js'
 import type { Dispatcher } from './host.js'
@@ -34,6 +40,10 @@ export interface WorkerSessionConfig {
   limits?: ResourceLimits
   typeCheck?: boolean
   typeCheckStubs?: string
+  /** How typing diagnostics are rendered by the worker (default `'full'`). */
+  typeCheckFormat?: TypeCheckFormat
+  /** Render typing diagnostics with ANSI colour escapes (default false). */
+  typeCheckColor?: boolean
   /**
    * Give failed `assert`s introspected messages. Absent/true means the
    * child's default, false disables them, and an integer customizes truncation.
@@ -71,6 +81,8 @@ export class WorkerTransport {
           typeCheck: config.typeCheck ?? false,
           ...(config.typeCheckStubs === undefined ? {} : { typeCheckStubs: config.typeCheckStubs }),
           ...(assertMessageAnnotations === undefined ? {} : { assertMessageAnnotations }),
+          typeCheckFormat: componentTypeCheckFormat(config.typeCheckFormat ?? 'full'),
+          typeCheckColor: config.typeCheckColor ?? false,
         },
       },
       'ok',
@@ -295,6 +307,12 @@ export class WorkerTransport {
         return { kind: 'protocol', message: `unexpected event kind ${event.tag}` }
     }
   }
+}
+
+/** Maps the public diagnostic name to the component's WIT enum. */
+function componentTypeCheckFormat(format: TypeCheckFormat): ComponentTypeCheckFormat {
+  const formats = ['full', 'concise', 'azure', 'json', 'json-lines', 'rdjson', 'pylint', 'gitlab', 'github'] as const
+  return formats[encodeTypeCheckFormat(format) - 1]
 }
 
 /** Converts JavaScript-facing limits to canonical WIT integer fields. */

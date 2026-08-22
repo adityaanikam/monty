@@ -46,7 +46,7 @@ Errors are returned as `MontyException`, with a traceback matching what CPython 
 
 ## Resource limits
 
-Untrusted code shouldn't be able to hog the host. `ResourceTracker` enforces limits on memory, execution time, GC interval and recursion depth; exceeding one terminates execution with a `ResourceError`:
+Untrusted code shouldn't be able to hog the host. `ResourceTracker` enforces execution-time and recursion limits and configures GC scheduling. Memory limits additionally require `monty-alloc` as the executable's global allocator:
 
 ```rust
 use std::time::Duration;
@@ -54,7 +54,6 @@ use monty::MontyRun;
 use monty_types::{CompileOptions, ResourceTracker, PrintWriter, ResourceLimits};
 
 let limits = ResourceLimits {
-    max_memory: Some(10 * 1024 * 1024),
     max_duration: Some(Duration::from_millis(20)),
     ..ResourceLimits::default()
 };
@@ -90,20 +89,25 @@ let RunProgress::Complete(result) = progress else { panic!("expected completion"
 assert_eq!(result, MontyObject::Int(42));
 ```
 
-A paused `RunProgress` is a self-contained snapshot of the interpreter: serialize it with `dump()`, store it in a file or database, and `load()` + resume it later — in a different process or on a different machine. `MontyRun` itself can also be dumped and loaded to cache parsed code:
+A REPL session is a self-contained snapshot of the interpreter: serialize it with `dump()`, store it in a file or database, and `Dump::load()` + keep feeding it later — in a different process or on a different machine. The dump carries the session metadata (script name, type-check stubs) alongside the state, behind a version this build checks on load:
 
 ```rust
-use monty::MontyRun;
-use monty_types::{CompileOptions, ResourceTracker, MontyObject, PrintWriter, ResourceLimits};
+use monty::{Dump, MontyRepl, Session, SessionRef, dump};
+use monty_types::{CompileOptions, MontyObject, PrintWriter, ResourceTracker};
 
-let runner = MontyRun::new("x + 1".to_owned(), "main.py", vec!["x".to_owned()], CompileOptions::default()).unwrap();
-let bytes = runner.dump().unwrap();
+let mut repl = MontyRepl::new("main.py", ResourceTracker::default(), CompileOptions::default());
+repl.feed_run("x = 41", vec![], PrintWriter::Stdout).unwrap();
+let bytes = dump("main.py", None, SessionRef::Idle(&repl)).unwrap();
 
-// later, restore and run
-let runner2 = MontyRun::load(&bytes).unwrap();
-let result = runner2.run(vec![MontyObject::Int(41)], ResourceTracker::default(), PrintWriter::Stdout).unwrap();
+// later, restore and carry on feeding
+let Session::Idle(mut restored) = Dump::load(&bytes).unwrap().state else {
+    panic!("expected an idle session")
+};
+let result = restored.feed_run("x + 1", vec![], PrintWriter::Stdout).unwrap();
 assert_eq!(result, MontyObject::Int(42));
 ```
+
+`MontyRun` and `RunProgress` have no dump format of their own, but both implement `serde::Serialize`/`Deserialize`, so a host that wants to cache parsed code or a paused run can serialize them with whatever format it already uses.
 
 Async host functions are supported too: `FunctionCall::resume_pending` continues execution with a pending future the sandboxed code can `await`; when all tasks are blocked, execution yields `RunProgress::ResolveFutures` for the host to supply results.
 

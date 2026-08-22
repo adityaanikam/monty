@@ -18,6 +18,7 @@ mod mount;
 mod pool;
 mod print_target;
 mod snapshot;
+mod telemetry;
 mod version;
 
 use std::sync::OnceLock;
@@ -42,7 +43,7 @@ use version::cargo_version_to_pep440;
 fn get_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
 
-    VERSION.get_or_init(|| cargo_version_to_pep440(env!("CARGO_PKG_VERSION")))
+    VERSION.get_or_init(|| cargo_version_to_pep440(monty_types::MONTY_VERSION))
 }
 
 /// Private Python object type used for the public `NOT_HANDLED` singleton.
@@ -130,6 +131,8 @@ mod _monty {
     use super::PyMountDir as MountDir;
     #[pymodule_export]
     use super::PyNameLookupSnapshot as NameLookupSnapshot;
+    #[pymodule_export]
+    use super::telemetry::_install_telemetry_adapter;
     use super::{get_not_handled, get_version};
 
     #[pymodule_init]

@@ -14,6 +14,8 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+#[cfg(feature = "telemetry-adapter")]
+use crate::telemetry_adapter::TelemetryContext;
 use crate::{
     PoolConfig, PoolError,
     checkout::{Checkout, ReplConfig, request},
@@ -91,11 +93,26 @@ impl Pool {
         Checkout::create(worker, Arc::clone(&self.inner), repl).await
     }
 
+    /// Checks out a session with distributed context captured by a host adapter.
+    #[cfg(feature = "telemetry-adapter")]
+    pub async fn checkout_with_telemetry(
+        &self,
+        repl: &ReplConfig,
+        context: TelemetryContext,
+    ) -> Result<Checkout, PoolError> {
+        let mut worker = self.inner.acquire_worker().await?;
+        worker.set_adapter_context(context);
+        Checkout::create(worker, Arc::clone(&self.inner), repl).await
+    }
+
     /// Asks idle workers to exit cleanly and reaps them, capping the wait per
     /// worker. Sessions still checked out keep their workers until they finish.
     ///
     /// Optional: dropping the pool kills idle workers instead, which is just
     /// as safe — this only trades a SIGKILL for a clean protocol goodbye.
+    ///
+    /// Telemetry exporter shutdown remains the configuring application's
+    /// responsibility and should happen after checked-out sessions finish.
     pub async fn close(&self) {
         // Pair each removed worker with a capacity guard immediately: if this
         // future is dropped mid-close, every unreaped worker is killed by its

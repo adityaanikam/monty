@@ -1268,11 +1268,13 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::ZeroDivisionError, "division by zero")
     }
 
-    /// Creates an OverflowError for string/sequence repetition with count too large.
+    /// Creates an OverflowError for an int too large for an index-sized integer.
     ///
-    /// Matches CPython's format: `OverflowError('cannot fit 'int' into an index-sized integer')`
+    /// This is CPython's `PyNumber_AsSsize_t` wording, used wherever a count or
+    /// size goes through `__index__` (repetition counts, `bytes(n)`) — unlike
+    /// [`Self::overflow_c_ssize_t`], which is `PyLong_AsSsize_t`'s.
     #[must_use]
-    fn overflow_repeat_count() -> SimpleException {
+    fn overflow_index_sized_int() -> SimpleException {
         SimpleException::new_msg(ExcType::OverflowError, "cannot fit 'int' into an index-sized integer")
     }
 
@@ -2019,7 +2021,7 @@ impl ExcTypeExt for ExcType {
                 "exceptions can only be called with zero or one string argument",
             )),
         }?;
-        let heap_id = vm.heap.allocate(HeapData::Exception(exc))?;
+        let heap_id = vm.heap.allocate(HeapData::Exception(exc));
         Ok(Value::Ref(heap_id))
     }
 }
@@ -2094,12 +2096,6 @@ impl SimpleException {
         self
     }
 
-    /// The structured payload, [`ExcData::None`] for most exceptions.
-    #[must_use]
-    pub fn data(&self) -> &ExcData {
-        &self.data
-    }
-
     #[must_use]
     pub fn exc_type(&self) -> ExcType {
         self.exc_type
@@ -2154,8 +2150,8 @@ impl<'h> HeapRead<'h, SimpleException> {
     /// Gets an attribute from this exception.
     ///
     /// Handles the `.args` attribute by allocating a tuple containing the message.
-    /// Returns `Err(AttributeError)` for all other attributes.
-    pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
+    /// Returns `None` for all other attributes.
+    pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> Option<CallResult> {
         // Fast path: interned strings can be matched by ID
         let is_args = attr
             .static_string()
@@ -2164,13 +2160,13 @@ impl<'h> HeapRead<'h, SimpleException> {
         if is_args {
             // Construct tuple with 0 or 1 elements based on whether arg exists
             let elements = if let Some(arg_str) = &self.get(vm.heap).arg {
-                smallvec![allocate_string(arg_str.as_str(), vm.heap)?]
+                smallvec![allocate_string(arg_str.as_str(), vm.heap)]
             } else {
                 smallvec![]
             };
-            Ok(Some(CallResult::Value(allocate_tuple(elements, vm.heap)?)))
+            Some(CallResult::Value(allocate_tuple(elements, vm.heap)))
         } else {
-            Ok(None)
+            None
         }
     }
 }

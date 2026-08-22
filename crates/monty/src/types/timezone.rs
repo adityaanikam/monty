@@ -6,7 +6,6 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem,
 };
 
 use crate::{
@@ -15,7 +14,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::Interns,
     types::{
         LazyHeapSet, PyTrait, Type,
@@ -83,11 +82,11 @@ impl TimeZone {
         };
 
         if offset_seconds == 0 && name_str.is_none() {
-            return vm.heap.get_timezone_utc().map_err(Into::into);
+            return Ok(vm.heap.get_timezone_utc());
         }
 
         let tz = Self::new(offset_seconds, name_str)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::TimeZone(tz))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::TimeZone(tz))))
     }
 
     /// Formats offset as `+HH:MM` / `-HH:MM` with optional `:SS`.
@@ -212,16 +211,12 @@ fn bad_name_arg(name_arg: &Value, heap: &Heap, interns: &Interns) -> RunError {
 }
 
 impl HeapItem for TimeZone {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.name.as_ref().map_or(0, String::len)
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {}
 }
 
 /// `HeapRead`-based dispatch for `TimeZone`, enabling the `HeapReadOutput` enum to
 /// delegate `PyTrait` calls to heap-resident timezone objects.
-impl<'h> PyTrait<'h> for HeapRead<'h, TimeZone> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, TimeZone> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::TimeZone
     }
@@ -239,7 +234,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeZone> {
         ))
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
         self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))
@@ -274,6 +269,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeZone> {
         } else {
             format!("UTC{}", tz.format_utc_offset())
         };
-        Ok(allocate_string(s, vm.heap)?)
+        Ok(allocate_string(s, vm.heap))
     }
 }

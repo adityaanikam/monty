@@ -9,7 +9,7 @@
 //! Custom serde serializes only the pattern string and flags, recompiling the regex
 //! on deserialization. This supports Monty's snapshot/restore feature.
 
-use std::{borrow::Cow, cell::OnceCell, cmp::Ordering, fmt::Write, iter, mem, str};
+use std::{borrow::Cow, cell::OnceCell, cmp::Ordering, fmt::Write, iter, str};
 
 use fancy_regex::{CompileError, Error as RegexError, Regex, RegexBuilder};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -20,7 +20,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
     intern::StaticStrings,
     modules::re::{ASCII, DOTALL, IGNORECASE, MULTILINE},
     resource_checks::check_estimated_size,
@@ -181,15 +181,9 @@ impl RePattern {
     /// Builds a single `ReMatch` heap value from a capture result, keeping the
     /// subject alive by refcount (`subject.clone_with_heap`) rather than copying
     /// its text. `all_ascii` is precomputed by the caller (once per `finditer`).
-    fn build_match(
-        &self,
-        caps: &fancy_regex::Captures<'_>,
-        subject: &Value,
-        all_ascii: bool,
-        heap: &Heap,
-    ) -> RunResult<Value> {
+    fn build_match(&self, caps: &fancy_regex::Captures<'_>, subject: &Value, all_ascii: bool, heap: &Heap) -> Value {
         let m = ReMatch::from_captures(caps, subject.clone_with_heap(heap), all_ascii, &self.compiled);
-        Ok(Value::Ref(heap.allocate(HeapData::ReMatch(Box::new(m)))?))
+        Value::Ref(heap.allocate(HeapData::ReMatch(Box::new(m))))
     }
 
     /// `pattern.search(string)` — find first match anywhere in the string.
@@ -198,7 +192,7 @@ impl RePattern {
     /// borrowed contents. Returns a `ReMatch` heap object, or `Value::None`.
     pub fn search(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
         match self.compiled.captures(text) {
-            Ok(Some(caps)) => self.build_match(&caps, subject, text.is_ascii(), heap),
+            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -213,7 +207,7 @@ impl RePattern {
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn match_start(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
         match self.match_regex()?.captures(text) {
-            Ok(Some(caps)) => self.build_match(&caps, subject, text.is_ascii(), heap),
+            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -228,7 +222,7 @@ impl RePattern {
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn fullmatch(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
         match self.fullmatch_regex()?.captures(text) {
-            Ok(Some(caps)) => self.build_match(&caps, subject, text.is_ascii(), heap),
+            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -249,7 +243,7 @@ impl RePattern {
             0 | 1 => {
                 for m in self.compiled.find_iter(text) {
                     let val = m.map_err(ExcType::re_pattern_error)?.as_str();
-                    results.push(allocate_string(val, heap)?);
+                    results.push(allocate_string(val, heap));
                 }
             }
             // One capture group — return list of the group's strings
@@ -257,7 +251,7 @@ impl RePattern {
                 for caps in self.compiled.captures_iter(text) {
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
                     let val = caps.get(1).map_or("", |m| m.as_str());
-                    results.push(allocate_string(val, heap)?);
+                    results.push(allocate_string(val, heap));
                 }
             }
             // Multiple capture groups — return list of tuples
@@ -267,15 +261,15 @@ impl RePattern {
                     let mut elements: TupleVec = SmallVec::with_capacity(cap_count - 1);
                     for cap in caps.iter().skip(1) {
                         let val = cap.map_or("", |m| m.as_str());
-                        elements.push(allocate_string(val, heap)?);
+                        elements.push(allocate_string(val, heap));
                     }
-                    results.push(allocate_tuple(elements, heap)?);
+                    results.push(allocate_tuple(elements, heap));
                 }
             }
         }
 
         let list = List::new(results);
-        Ok(Value::Ref(heap.allocate(HeapData::List(list))?))
+        Ok(Value::Ref(heap.allocate(HeapData::List(list))))
     }
 
     /// `pattern.sub(repl, string, count=0)` — substitute matches with a replacement.
@@ -304,11 +298,11 @@ impl RePattern {
             caps.expand(rust_repl.as_ref(), &mut result);
             last_end = m.end();
             // Check running size: current result + remaining unprocessed text.
-            check_estimated_size(result.len() + (text.len() - last_end), heap.tracker())?;
+            check_estimated_size(result.len() + (text.len() - last_end), &heap.tracker)?;
         }
 
         result.push_str(&text[last_end..]);
-        Ok(allocate_string(result, heap)?)
+        Ok(allocate_string(result, heap))
     }
 
     /// `pattern.split(string, maxsplit=0)` — split string by pattern occurrences.
@@ -338,11 +332,11 @@ impl RePattern {
 
         let mut results = Vec::with_capacity(pieces.len());
         for piece in pieces {
-            results.push(allocate_string(piece, heap)?);
+            results.push(allocate_string(piece, heap));
         }
 
         let list = List::new(results);
-        Ok(Value::Ref(heap.allocate(HeapData::List(list))?))
+        Ok(Value::Ref(heap.allocate(HeapData::List(list))))
     }
 
     /// `pattern.finditer(string)` — return all matches as a list.
@@ -357,15 +351,15 @@ impl RePattern {
         let mut results = Vec::new();
         for caps in self.compiled.captures_iter(text) {
             let caps = caps.map_err(ExcType::re_pattern_error)?;
-            results.push(self.build_match(&caps, subject, all_ascii, heap)?);
+            results.push(self.build_match(&caps, subject, all_ascii, heap));
         }
 
         let list = List::new(results);
-        Ok(Value::Ref(heap.allocate(HeapData::List(list))?))
+        Ok(Value::Ref(heap.allocate(HeapData::List(list))))
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, RePattern> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, RePattern> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::RePattern
     }
@@ -412,7 +406,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, RePattern> {
     fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
         match attr.static_string() {
             Some(StaticStrings::PatternAttr) => {
-                let v = allocate_string(self.get(vm.heap).pattern.as_str(), vm.heap)?;
+                let v = allocate_string(self.get(vm.heap).pattern.as_str(), vm.heap);
                 Ok(Some(CallResult::Value(v)))
             }
             Some(StaticStrings::Flags) => Ok(Some(CallResult::Value(Value::Int(i64::from(self.get(vm.heap).flags))))),
@@ -420,13 +414,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, RePattern> {
         }
     }
 
-    fn py_call_attr(
-        &mut self,
-        _self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let result = match attr.static_string() {
             Some(StaticStrings::Search) => {
                 let arg = args.get_one_arg("Pattern.search", vm.heap)?;
@@ -469,10 +457,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, RePattern> {
 }
 
 impl HeapItem for RePattern {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.pattern.len()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // No heap references — all data is owned.
     }

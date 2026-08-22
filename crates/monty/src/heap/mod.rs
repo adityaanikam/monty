@@ -1,3 +1,8 @@
+#![expect(
+    unsafe_code,
+    reason = "Paged arena hands out typed, aliasable views into UnsafeCell entries"
+)]
+
 #[cfg(feature = "ref-count-return")]
 use std::collections::HashSet;
 use std::{
@@ -12,7 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use monty_types::{ResourceError, ResourceTracker};
+use monty_types::ResourceTracker;
 use serde::ser::SerializeStruct;
 
 // Re-export items moved to `heap_traits` so that `crate::heap::DropGuard` etc. continue
@@ -25,7 +30,7 @@ use crate::{
     asyncio::{Awaiter, Coroutine, ExternalFuture, ExternalFutureState, GatherFuture, GatherState},
     exception_private::SimpleException,
     heap_data::{CellValue, Closure, FunctionDefaults},
-    modules::dataclasses::DataclassField,
+    modules::dataclasses::{DataclassField, DataclassParams},
     types::{
         BoundMethod, Bytes, BytesIterator, Class, Dataclass, Deque, Dict, DictItemIterator, DictItemsView,
         DictKeyIterator, DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, Instance,
@@ -163,7 +168,7 @@ impl<'a> HeapReader<'a> {
     /// delegates the typed match/reader-count logic there. Panics if `id` is out
     /// of bounds or the slot is currently freed.
     pub fn read(&self, id: HeapId) -> HeapReadOutput<'a> {
-        self.read_ptr(id).read(self)
+        self.read_ptr(id).read(id, self)
     }
 
     #[expect(clippy::unused_self, reason = "'a lifetime is used to create the safety guarantees")]
@@ -215,58 +220,102 @@ impl DerefMut for HeapReader<'_> {
 }
 
 pub enum HeapReadOutput<'a> {
-    Str(HeapRead<'a, Str>),
-    Bytes(HeapRead<'a, Bytes>),
-    List(HeapRead<'a, List>),
-    Deque(HeapRead<'a, Deque>),
-    Tuple(HeapRead<'a, Tuple>),
-    NamedTuple(HeapRead<'a, NamedTuple>),
-    NamedTupleClass(HeapRead<'a, NamedTupleClass>),
-    Dict(HeapRead<'a, Dict>),
-    DictItemsView(HeapRead<'a, DictItemsView>),
-    DictKeysView(HeapRead<'a, DictKeysView>),
-    DictValuesView(HeapRead<'a, DictValuesView>),
-    Set(HeapRead<'a, Set>),
-    FrozenSet(HeapRead<'a, FrozenSet>),
-    Closure(HeapRead<'a, Closure>),
-    FunctionDefaults(HeapRead<'a, FunctionDefaults>),
-    ExtFunction(HeapRead<'a, ExtFunction>),
-    Cell(HeapRead<'a, CellValue>),
-    Range(HeapRead<'a, Range>),
-    Slice(HeapRead<'a, Slice>),
-    Exception(HeapRead<'a, SimpleException>),
-    Dataclass(HeapRead<'a, Dataclass>),
-    Class(HeapRead<'a, Class>),
-    Instance(HeapRead<'a, Instance>),
-    BoundMethod(HeapRead<'a, BoundMethod>),
-    DataclassField(HeapRead<'a, DataclassField>),
-    ListIterator(HeapRead<'a, ListIterator>),
-    DequeIterator(HeapRead<'a, DequeIterator>),
-    TupleIterator(HeapRead<'a, TupleIterator>),
-    StringIterator(HeapRead<'a, StringIterator>),
-    BytesIterator(HeapRead<'a, BytesIterator>),
-    RangeIterator(HeapRead<'a, RangeIterator>),
-    DictKeyIterator(HeapRead<'a, DictKeyIterator>),
-    DictItemIterator(HeapRead<'a, DictItemIterator>),
-    DictValueIterator(HeapRead<'a, DictValueIterator>),
-    SetIterator(HeapRead<'a, SetIterator>),
-    CallableIterator(HeapRead<'a, CallableIterator>),
-    Itertools(HeapRead<'a, ItertoolsIter>),
-    LongInt(HeapRead<'a, LongInt>),
-    Module(HeapRead<'a, Module>),
-    Coroutine(HeapRead<'a, Coroutine>),
-    GatherFuture(HeapRead<'a, GatherFuture>),
-    ExternalFuture(HeapRead<'a, ExternalFuture>),
-    Path(HeapRead<'a, Path>),
-    OpenFile(HeapRead<'a, OpenFile>),
-    RePattern(HeapRead<'a, RePattern>),
-    ReMatch(HeapRead<'a, ReMatch>),
-    Date(HeapRead<'a, date::Date>),
-    DateTime(HeapRead<'a, datetime::DateTime>),
-    TimeDelta(HeapRead<'a, timedelta::TimeDelta>),
-    TimeZone(HeapRead<'a, timezone::TimeZone>),
+    Str(HeapObjectRead<'a, Str>),
+    Bytes(HeapObjectRead<'a, Bytes>),
+    List(HeapObjectRead<'a, List>),
+    Deque(HeapObjectRead<'a, Deque>),
+    Tuple(HeapObjectRead<'a, Tuple>),
+    NamedTuple(HeapObjectRead<'a, NamedTuple>),
+    NamedTupleClass(HeapObjectRead<'a, NamedTupleClass>),
+    Dict(HeapObjectRead<'a, Dict>),
+    DictItemsView(HeapObjectRead<'a, DictItemsView>),
+    DictKeysView(HeapObjectRead<'a, DictKeysView>),
+    DictValuesView(HeapObjectRead<'a, DictValuesView>),
+    Set(HeapObjectRead<'a, Set>),
+    FrozenSet(HeapObjectRead<'a, FrozenSet>),
+    Closure(HeapObjectRead<'a, Closure>),
+    FunctionDefaults(HeapObjectRead<'a, FunctionDefaults>),
+    ExtFunction(HeapObjectRead<'a, ExtFunction>),
+    Cell(HeapObjectRead<'a, CellValue>),
+    Range(HeapObjectRead<'a, Range>),
+    Slice(HeapObjectRead<'a, Slice>),
+    Exception(HeapObjectRead<'a, SimpleException>),
+    Dataclass(HeapObjectRead<'a, Dataclass>),
+    Class(HeapObjectRead<'a, Class>),
+    Instance(HeapObjectRead<'a, Instance>),
+    BoundMethod(HeapObjectRead<'a, BoundMethod>),
+    DataclassField(HeapObjectRead<'a, DataclassField>),
+    DataclassParams(HeapObjectRead<'a, DataclassParams>),
+    ListIterator(HeapObjectRead<'a, ListIterator>),
+    DequeIterator(HeapObjectRead<'a, DequeIterator>),
+    TupleIterator(HeapObjectRead<'a, TupleIterator>),
+    StringIterator(HeapObjectRead<'a, StringIterator>),
+    BytesIterator(HeapObjectRead<'a, BytesIterator>),
+    RangeIterator(HeapObjectRead<'a, RangeIterator>),
+    DictKeyIterator(HeapObjectRead<'a, DictKeyIterator>),
+    DictItemIterator(HeapObjectRead<'a, DictItemIterator>),
+    DictValueIterator(HeapObjectRead<'a, DictValueIterator>),
+    SetIterator(HeapObjectRead<'a, SetIterator>),
+    CallableIterator(HeapObjectRead<'a, CallableIterator>),
+    Itertools(HeapObjectRead<'a, ItertoolsIter>),
+    LongInt(HeapObjectRead<'a, LongInt>),
+    Module(HeapObjectRead<'a, Module>),
+    Coroutine(HeapObjectRead<'a, Coroutine>),
+    GatherFuture(HeapObjectRead<'a, GatherFuture>),
+    ExternalFuture(HeapObjectRead<'a, ExternalFuture>),
+    Path(HeapObjectRead<'a, Path>),
+    OpenFile(HeapObjectRead<'a, OpenFile>),
+    RePattern(HeapObjectRead<'a, RePattern>),
+    ReMatch(HeapObjectRead<'a, ReMatch>),
+    Date(HeapObjectRead<'a, date::Date>),
+    DateTime(HeapObjectRead<'a, datetime::DateTime>),
+    TimeDelta(HeapObjectRead<'a, timedelta::TimeDelta>),
+    TimeZone(HeapObjectRead<'a, timezone::TimeZone>),
 }
 
+/// A typed read handle for a Python object stored in a specific heap entry.
+///
+/// Unlike [`HeapRead`], this always represents the complete object rather than
+/// protected external data or a projected field, so its [`HeapId`] is available
+/// to operations that need Python identity or an owned reference to `self`.
+pub struct HeapObjectRead<'a, T: ?Sized> {
+    /// Identity of the complete Python object exposed by `read`.
+    id: HeapId,
+    /// Typed access guard that keeps the entry alive.
+    read: HeapRead<'a, T>,
+}
+
+impl<'a, T: ?Sized> HeapObjectRead<'a, T> {
+    /// Returns the heap entry containing this object.
+    pub fn id(&self) -> HeapId {
+        self.id
+    }
+
+    /// Returns a new owned reference to this object.
+    pub fn clone_value(&self, heap: &HeapReader<'a>) -> Value {
+        heap.inc_ref(self.id);
+        Value::Ref(self.id)
+    }
+}
+
+impl<'a, T: ?Sized> Deref for HeapObjectRead<'a, T> {
+    type Target = HeapRead<'a, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.read
+    }
+}
+
+impl<T: ?Sized> DerefMut for HeapObjectRead<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.read
+    }
+}
+
+/// A typed, identity-free view protected by a [`HeapReader`].
+///
+/// Complete heap objects are exposed as [`HeapObjectRead`]; this lower-level
+/// handle also supports projected fields and data protected by `protect`.
 pub struct HeapRead<'a, T: ?Sized> {
     value: NonNull<T>,
     /// Pointer to the `readers` counter in the owning `HeapValue`.
@@ -420,7 +469,10 @@ macro_rules! heap_read_ref_as_field {
         // SAFETY: (DH)
         //  - `std::mem::offset_of!` guarantees there is a field at fixed offset
         //  - `type_hint` guarantees that the field is of type `U` for the safety contract
-        unsafe { $crate::heap::cast_as_member_ref_type_hinted($heap_read, offset, type_hint) }
+        #[expect(unsafe_code)]
+        unsafe {
+            $crate::heap::cast_as_member_ref_type_hinted($heap_read, offset, type_hint)
+        }
     }};
 }
 
@@ -465,7 +517,10 @@ macro_rules! heap_read_ref_as_field_mut {
         // SAFETY: (DH)
         //  - `std::mem::offset_of!` guarantees there is a field at fixed offset
         //  - `type_hint` guarantees that the field is of type `U` for the safety contract
-        unsafe { $crate::heap::cast_as_member_ref_mut_type_hinted($heap_read, offset, type_hint) }
+        #[expect(unsafe_code)]
+        unsafe {
+            $crate::heap::cast_as_member_ref_mut_type_hinted($heap_read, offset, type_hint)
+        }
     }};
 }
 
@@ -554,31 +609,39 @@ impl<'a> HeapPtr<'a> {
     }
 
     /// Returns the typed [`HeapReadOutput`] for this entry, incrementing the
-    /// reader count so the produced [`HeapRead<T>`] handles participate in the
-    /// reader-count GC safety net (they are decremented on `Drop`).
+    /// reader count so the wrapped [`HeapRead<T>`] participates in the
+    /// reader-count GC safety net (it is decremented on `Drop`).
     ///
     /// All `HeapRead<T>` handle pointers are derived through the `UnsafeHeapData`
     /// `UnsafeCell`, so they retain `SharedReadWrite` permission and remain valid
     /// for both read and mutable access (the latter via `HeapRead::get_mut`,
     /// which requires `&mut HeapReader`).
-    pub fn read(self, reader: &HeapReader<'a>) -> HeapReadOutput<'a> {
+    fn read(self, id: HeapId, reader: &HeapReader<'a>) -> HeapReadOutput<'a> {
         /// Computes a `HeapRead` from the raw `UnsafeCell` pointer and a shared reference
         /// to the variant field. The `&T` is only used to compute the field's byte offset
         /// within the `HeapData` enum; the returned `NonNull` is derived from the original
         /// `*mut HeapData` pointer so it inherits the `SharedReadWrite` permission from
         /// the `UnsafeCell`, allowing both reads and writes.
         #[inline]
-        fn heap_read<'a, T>(base: *mut HeapData, field: &T, readers: NonNull<Cell<usize>>) -> HeapRead<'a, T> {
+        fn heap_read<'a, T>(
+            id: HeapId,
+            base: *mut HeapData,
+            field: &T,
+            readers: NonNull<Cell<usize>>,
+        ) -> HeapObjectRead<'a, T> {
             let base_addr = base as usize;
             let field_addr = ptr::from_ref(field) as usize;
             let offset = field_addr - base_addr;
-            HeapRead {
-                // SAFETY: The pointer is derived from the UnsafeCell's `*mut` via byte
-                // offset, preserving the `SharedReadWrite` permission. No reference retag
-                // occurs — we only use the `&T` for its address, not to derive the pointer.
-                value: unsafe { NonNull::new_unchecked(base.byte_add(offset).cast::<T>()) },
-                readers,
-                borrow: PhantomData,
+            HeapObjectRead {
+                id,
+                read: HeapRead {
+                    // SAFETY: The pointer is derived from the UnsafeCell's `*mut` via byte
+                    // offset, preserving the `SharedReadWrite` permission. No reference retag
+                    // occurs — we only use the `&T` for its address, not to derive the pointer.
+                    value: unsafe { NonNull::new_unchecked(base.byte_add(offset).cast::<T>()) },
+                    readers,
+                    borrow: PhantomData,
+                },
             }
         }
 
@@ -595,10 +658,11 @@ impl<'a> HeapPtr<'a> {
             reason = "We intentionally take &Box<T> to signal this is for boxed HeapData variants; &T would lose that context"
         )]
         fn heap_read_boxed<'a, T>(
+            id: HeapId,
             base: *mut HeapData,
             boxed: &Box<T>,
             readers: NonNull<Cell<usize>>,
-        ) -> HeapRead<'a, T> {
+        ) -> HeapObjectRead<'a, T> {
             let base_addr = base as usize;
             let field_addr = ptr::from_ref(boxed) as usize;
             let offset = field_addr - base_addr;
@@ -609,10 +673,13 @@ impl<'a> HeapPtr<'a> {
             // loading the field as `*mut T` yields the box's data pointer together with
             // the read/write provenance it was stored with.
             let value = unsafe { NonNull::new_unchecked(base.byte_add(offset).cast::<*mut T>().read()) };
-            HeapRead {
-                value,
-                readers,
-                borrow: PhantomData,
+            HeapObjectRead {
+                id,
+                read: HeapRead {
+                    value,
+                    readers,
+                    borrow: PhantomData,
+                },
             }
         }
 
@@ -629,66 +696,73 @@ impl<'a> HeapPtr<'a> {
         // The `heap_read` helper then derives the NonNull from `base` (not from `&T`),
         // so the returned pointer retains full SharedReadWrite permission.
         match unsafe { &*base } {
-            HeapData::Str(s) => HeapReadOutput::Str(heap_read(base, s, readers)),
-            HeapData::Bytes(bytes) => HeapReadOutput::Bytes(heap_read(base, bytes, readers)),
-            HeapData::List(list) => HeapReadOutput::List(heap_read(base, list, readers)),
-            HeapData::Deque(deque) => HeapReadOutput::Deque(heap_read(base, deque, readers)),
-            HeapData::Tuple(tuple) => HeapReadOutput::Tuple(heap_read(base, tuple, readers)),
+            HeapData::Str(s) => HeapReadOutput::Str(heap_read(id, base, s, readers)),
+            HeapData::Bytes(bytes) => HeapReadOutput::Bytes(heap_read(id, base, bytes, readers)),
+            HeapData::List(list) => HeapReadOutput::List(heap_read(id, base, list, readers)),
+            HeapData::Deque(deque) => HeapReadOutput::Deque(heap_read(id, base, deque, readers)),
+            HeapData::Tuple(tuple) => HeapReadOutput::Tuple(heap_read(id, base, tuple, readers)),
             HeapData::NamedTuple(named_tuple) => {
-                HeapReadOutput::NamedTuple(heap_read_boxed(base, named_tuple, readers))
+                HeapReadOutput::NamedTuple(heap_read_boxed(id, base, named_tuple, readers))
             }
-            HeapData::NamedTupleClass(class) => HeapReadOutput::NamedTupleClass(heap_read_boxed(base, class, readers)),
-            HeapData::Dict(dict) => HeapReadOutput::Dict(heap_read(base, dict, readers)),
-            HeapData::DictItemsView(v) => HeapReadOutput::DictItemsView(heap_read(base, v, readers)),
-            HeapData::DictKeysView(v) => HeapReadOutput::DictKeysView(heap_read(base, v, readers)),
-            HeapData::DictValuesView(v) => HeapReadOutput::DictValuesView(heap_read(base, v, readers)),
-            HeapData::Set(set) => HeapReadOutput::Set(heap_read(base, set, readers)),
-            HeapData::FrozenSet(frozen_set) => HeapReadOutput::FrozenSet(heap_read(base, frozen_set, readers)),
-            HeapData::Closure(closure) => HeapReadOutput::Closure(heap_read(base, closure, readers)),
+            HeapData::NamedTupleClass(class) => {
+                HeapReadOutput::NamedTupleClass(heap_read_boxed(id, base, class, readers))
+            }
+            HeapData::Dict(dict) => HeapReadOutput::Dict(heap_read(id, base, dict, readers)),
+            HeapData::DictItemsView(v) => HeapReadOutput::DictItemsView(heap_read(id, base, v, readers)),
+            HeapData::DictKeysView(v) => HeapReadOutput::DictKeysView(heap_read(id, base, v, readers)),
+            HeapData::DictValuesView(v) => HeapReadOutput::DictValuesView(heap_read(id, base, v, readers)),
+            HeapData::Set(set) => HeapReadOutput::Set(heap_read(id, base, set, readers)),
+            HeapData::FrozenSet(frozen_set) => HeapReadOutput::FrozenSet(heap_read(id, base, frozen_set, readers)),
+            HeapData::Closure(closure) => HeapReadOutput::Closure(heap_read(id, base, closure, readers)),
             HeapData::FunctionDefaults(function_defaults) => {
-                HeapReadOutput::FunctionDefaults(heap_read(base, function_defaults, readers))
+                HeapReadOutput::FunctionDefaults(heap_read(id, base, function_defaults, readers))
             }
-            HeapData::ExtFunction(name) => HeapReadOutput::ExtFunction(heap_read(base, name, readers)),
-            HeapData::Cell(cell_value) => HeapReadOutput::Cell(heap_read(base, cell_value, readers)),
-            HeapData::Range(range) => HeapReadOutput::Range(heap_read(base, range, readers)),
-            HeapData::Slice(slice) => HeapReadOutput::Slice(heap_read(base, slice, readers)),
+            HeapData::ExtFunction(name) => HeapReadOutput::ExtFunction(heap_read(id, base, name, readers)),
+            HeapData::Cell(cell_value) => HeapReadOutput::Cell(heap_read(id, base, cell_value, readers)),
+            HeapData::Range(range) => HeapReadOutput::Range(heap_read(id, base, range, readers)),
+            HeapData::Slice(slice) => HeapReadOutput::Slice(heap_read(id, base, slice, readers)),
             HeapData::Exception(simple_exception) => {
-                HeapReadOutput::Exception(heap_read(base, simple_exception, readers))
+                HeapReadOutput::Exception(heap_read(id, base, simple_exception, readers))
             }
-            HeapData::Dataclass(dataclass) => HeapReadOutput::Dataclass(heap_read_boxed(base, dataclass, readers)),
-            HeapData::Class(class) => HeapReadOutput::Class(heap_read_boxed(base, class, readers)),
-            HeapData::Instance(instance) => HeapReadOutput::Instance(heap_read_boxed(base, instance, readers)),
-            HeapData::BoundMethod(bound_method) => HeapReadOutput::BoundMethod(heap_read(base, bound_method, readers)),
-            HeapData::DataclassField(field) => HeapReadOutput::DataclassField(heap_read(base, field, readers)),
-            HeapData::ListIterator(iter) => HeapReadOutput::ListIterator(heap_read(base, iter, readers)),
-            HeapData::DequeIterator(iter) => HeapReadOutput::DequeIterator(heap_read(base, iter, readers)),
-            HeapData::TupleIterator(iter) => HeapReadOutput::TupleIterator(heap_read(base, iter, readers)),
-            HeapData::StringIterator(iter) => HeapReadOutput::StringIterator(heap_read(base, iter, readers)),
-            HeapData::BytesIterator(iter) => HeapReadOutput::BytesIterator(heap_read(base, iter, readers)),
-            HeapData::RangeIterator(iter) => HeapReadOutput::RangeIterator(heap_read(base, iter, readers)),
-            HeapData::DictKeyIterator(iter) => HeapReadOutput::DictKeyIterator(heap_read(base, iter, readers)),
-            HeapData::DictItemIterator(iter) => HeapReadOutput::DictItemIterator(heap_read(base, iter, readers)),
-            HeapData::DictValueIterator(iter) => HeapReadOutput::DictValueIterator(heap_read(base, iter, readers)),
-            HeapData::SetIterator(iter) => HeapReadOutput::SetIterator(heap_read(base, iter, readers)),
-            HeapData::CallableIterator(c) => HeapReadOutput::CallableIterator(heap_read(base, c, readers)),
-            HeapData::Itertools(i) => HeapReadOutput::Itertools(heap_read(base, i, readers)),
-            HeapData::LongInt(l) => HeapReadOutput::LongInt(heap_read(base, l, readers)),
-            HeapData::Module(module) => HeapReadOutput::Module(heap_read_boxed(base, module, readers)),
-            HeapData::Coroutine(coroutine) => HeapReadOutput::Coroutine(heap_read(base, coroutine, readers)),
+            HeapData::Dataclass(dataclass) => HeapReadOutput::Dataclass(heap_read_boxed(id, base, dataclass, readers)),
+            HeapData::Class(class) => HeapReadOutput::Class(heap_read_boxed(id, base, class, readers)),
+            HeapData::Instance(instance) => HeapReadOutput::Instance(heap_read_boxed(id, base, instance, readers)),
+            HeapData::BoundMethod(bound_method) => {
+                HeapReadOutput::BoundMethod(heap_read(id, base, bound_method, readers))
+            }
+            HeapData::DataclassField(field) => HeapReadOutput::DataclassField(heap_read(id, base, field, readers)),
+            HeapData::DataclassParams(params) => HeapReadOutput::DataclassParams(heap_read(id, base, params, readers)),
+            HeapData::ListIterator(iter) => HeapReadOutput::ListIterator(heap_read(id, base, iter, readers)),
+            HeapData::DequeIterator(iter) => HeapReadOutput::DequeIterator(heap_read(id, base, iter, readers)),
+            HeapData::TupleIterator(iter) => HeapReadOutput::TupleIterator(heap_read(id, base, iter, readers)),
+            HeapData::StringIterator(iter) => HeapReadOutput::StringIterator(heap_read(id, base, iter, readers)),
+            HeapData::BytesIterator(iter) => HeapReadOutput::BytesIterator(heap_read(id, base, iter, readers)),
+            HeapData::RangeIterator(iter) => HeapReadOutput::RangeIterator(heap_read(id, base, iter, readers)),
+            HeapData::DictKeyIterator(iter) => HeapReadOutput::DictKeyIterator(heap_read(id, base, iter, readers)),
+            HeapData::DictItemIterator(iter) => HeapReadOutput::DictItemIterator(heap_read(id, base, iter, readers)),
+            HeapData::DictValueIterator(iter) => HeapReadOutput::DictValueIterator(heap_read(id, base, iter, readers)),
+            HeapData::SetIterator(iter) => HeapReadOutput::SetIterator(heap_read(id, base, iter, readers)),
+            HeapData::CallableIterator(c) => HeapReadOutput::CallableIterator(heap_read(id, base, c, readers)),
+            HeapData::Itertools(i) => HeapReadOutput::Itertools(heap_read(id, base, i, readers)),
+            HeapData::LongInt(l) => HeapReadOutput::LongInt(heap_read(id, base, l, readers)),
+            HeapData::Module(module) => HeapReadOutput::Module(heap_read_boxed(id, base, module, readers)),
+            HeapData::Coroutine(coroutine) => HeapReadOutput::Coroutine(heap_read(id, base, coroutine, readers)),
             HeapData::GatherFuture(gather_future) => {
-                HeapReadOutput::GatherFuture(heap_read_boxed(base, gather_future, readers))
+                HeapReadOutput::GatherFuture(heap_read_boxed(id, base, gather_future, readers))
             }
             HeapData::ExternalFuture(external_future) => {
-                HeapReadOutput::ExternalFuture(heap_read_boxed(base, external_future, readers))
+                HeapReadOutput::ExternalFuture(heap_read_boxed(id, base, external_future, readers))
             }
-            HeapData::Path(path) => HeapReadOutput::Path(heap_read(base, path, readers)),
-            HeapData::OpenFile(file) => HeapReadOutput::OpenFile(heap_read_boxed(base, file, readers)),
-            HeapData::RePattern(re_pattern) => HeapReadOutput::RePattern(heap_read_boxed(base, re_pattern, readers)),
-            HeapData::ReMatch(re_match) => HeapReadOutput::ReMatch(heap_read_boxed(base, re_match, readers)),
-            HeapData::Date(d) => HeapReadOutput::Date(heap_read(base, d, readers)),
-            HeapData::DateTime(d) => HeapReadOutput::DateTime(heap_read(base, d, readers)),
-            HeapData::TimeDelta(d) => HeapReadOutput::TimeDelta(heap_read(base, d, readers)),
-            HeapData::TimeZone(d) => HeapReadOutput::TimeZone(heap_read(base, d, readers)),
+            HeapData::Path(path) => HeapReadOutput::Path(heap_read(id, base, path, readers)),
+            HeapData::OpenFile(file) => HeapReadOutput::OpenFile(heap_read_boxed(id, base, file, readers)),
+            HeapData::RePattern(re_pattern) => {
+                HeapReadOutput::RePattern(heap_read_boxed(id, base, re_pattern, readers))
+            }
+            HeapData::ReMatch(re_match) => HeapReadOutput::ReMatch(heap_read_boxed(id, base, re_match, readers)),
+            HeapData::Date(d) => HeapReadOutput::Date(heap_read(id, base, d, readers)),
+            HeapData::DateTime(d) => HeapReadOutput::DateTime(heap_read(id, base, d, readers)),
+            HeapData::TimeDelta(d) => HeapReadOutput::TimeDelta(heap_read(id, base, d, readers)),
+            HeapData::TimeZone(d) => HeapReadOutput::TimeZone(heap_read(id, base, d, readers)),
         }
     }
 }
@@ -792,7 +866,7 @@ pub(crate) struct Heap {
     /// Paged storage for heap entries with integrated free list.
     entries: StableHeap<HeapEntry>,
     /// Resource tracker for enforcing limits and scheduling GC.
-    tracker: ResourceTracker,
+    pub tracker: ResourceTracker,
     /// Number of entries currently flagged [`Purple`](CcColor::Purple) — i.e.,
     /// suspected cycle roots awaiting collection.
     ///
@@ -931,51 +1005,6 @@ impl Heap {
         this
     }
 
-    /// Returns a reference to the resource tracker.
-    pub fn tracker(&self) -> &ResourceTracker {
-        &self.tracker
-    }
-
-    /// Returns a mutable reference to the resource tracker.
-    pub fn tracker_mut(&mut self) -> &mut ResourceTracker {
-        &mut self.tracker
-    }
-
-    /// Checks whether the configured time limit has been exceeded.
-    ///
-    /// Delegates to the resource tracker's `check_time()`, which compares
-    /// elapsed execution time against the configured `max_duration` (a no-op
-    /// when no time limit is set).
-    ///
-    /// Call this inside Rust-side loops (builtins, sort, iterator collection)
-    /// that execute within a single bytecode instruction and would otherwise
-    /// bypass the VM's per-instruction timeout check.
-    #[inline]
-    pub fn check_time(&self) -> Result<(), ResourceError> {
-        self.tracker.check_time()
-    }
-
-    /// Tracks in-place memory growth of an existing heap object.
-    ///
-    /// Call this before performing mutations that grow containers (append, insert,
-    /// extend, dict set, set add). Returns `Err(ResourceError::Memory)` if the
-    /// growth would exceed configured memory limits.
-    #[inline]
-    pub fn track_growth(&self, additional_bytes: usize) -> Result<(), ResourceError> {
-        self.tracker.on_grow(|| additional_bytes)
-    }
-
-    /// Mirror of [`track_growth`](Self::track_growth) for in-place shrinks.
-    ///
-    /// Needed when a heap entry's `py_estimate_size` decreases without the
-    /// entry itself being freed: `on_free` at entry release reads the
-    /// *current* size, so growth charged earlier would otherwise leak in
-    /// the tracker counter.
-    #[inline]
-    pub fn track_shrink(&self, bytes: usize) {
-        self.tracker.on_free(|| bytes);
-    }
-
     /// Number of entries in the heap (including freed slots).
     pub fn size(&self) -> usize {
         self.entries.len()
@@ -994,16 +1023,12 @@ impl Heap {
 
     /// Allocates a new heap entry.
     ///
-    /// Returns `Err(ResourceError)` if allocation would exceed configured limits.
-    /// Use this when you need to handle resource limit errors gracefully.
-    ///
     /// GC-tracked types bump `allocations_since_gc` so that
     /// [`should_gc`](Self::should_gc) eventually fires; trial deletion's own
     /// candidate enrollment happens later, at `dec_ref` time. Leaf types
     /// (strings, bytes, …) cannot participate in cycles and don't count
     /// against the GC interval.
-    pub fn allocate(&self, data: HeapData) -> Result<HeapId, ResourceError> {
-        self.tracker.on_grow(|| data.py_estimate_size())?;
+    pub fn allocate(&self, data: HeapData) -> HeapId {
         if data.is_gc_tracked() {
             self.allocations_since_gc
                 .set(self.allocations_since_gc.get().wrapping_add(1));
@@ -1016,8 +1041,7 @@ impl Heap {
             color: Cell::new(CcColor::Black),
         };
 
-        let id = self.entries.allocate(new_entry);
-        Ok(id)
+        self.entries.allocate(new_entry)
     }
 
     /// Returns the singleton empty tuple.
@@ -1038,17 +1062,17 @@ impl Heap {
     ///
     /// The cache holds no reference count of its own. Its entry is removed when the
     /// last owning reference is dropped, before the heap slot can be reused.
-    pub fn get_ext_function(&mut self, name: &str) -> Result<Value, ResourceError> {
+    pub fn get_ext_function(&mut self, name: &str) -> Value {
         if let Some(id) = self.ext_function_cache.get(name).copied() {
             self.inc_ref(id);
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         } else {
             let function = ExtFunction::new(name);
             let cache_key = function.cache_key();
-            let id = self.allocate(HeapData::ExtFunction(function))?;
+            let id = self.allocate(HeapData::ExtFunction(function));
             let previous = self.ext_function_cache.insert(cache_key, id);
             debug_assert!(previous.is_none());
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         }
     }
 
@@ -1063,17 +1087,17 @@ impl Heap {
     ///
     /// The returned `Value::Ref` has its refcount incremented so the caller can drop
     /// it normally. The singleton itself is kept alive by the `timezone_utc` field.
-    pub fn get_timezone_utc(&mut self) -> Result<Value, ResourceError> {
+    pub fn get_timezone_utc(&mut self) -> Value {
         if let Some(id) = self.timezone_utc {
             self.inc_ref(id);
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         } else {
             let tz = TimeZone::utc();
-            let id = self.allocate(HeapData::TimeZone(tz))?;
+            let id = self.allocate(HeapData::TimeZone(tz));
             // Keep an extra refcount for the singleton cache
             self.inc_ref(id);
             self.timezone_utc = Some(id);
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         }
     }
 
@@ -1163,12 +1187,6 @@ impl Heap {
                     // a &self borrow on `StableHeap`. At least this repeated lookup is already
                     // on the slow path.
                     let mut value = reader.heap.entries.entry(current_id).expect("already looked up").free();
-
-                    // Notify tracker of freed memory
-                    reader
-                        .heap
-                        .tracker
-                        .on_free(|| value.data.0.get_mut().py_estimate_size());
 
                     // Collect child IDs and push onto work stack for iterative processing
                     py_dec_ref_ids_for_data(value.data.0.get_mut(), &mut work_stack);
@@ -1335,7 +1353,6 @@ impl Heap {
             if let HeapData::ExtFunction(function) = value.data.0.get_mut() {
                 Self::remove_ext_function_cache_entry(&mut self.ext_function_cache, &function.cache_key(), id);
             }
-            self.tracker.on_free(|| value.data.0.get_mut().py_estimate_size());
             freed += 1;
             // Walk children, marking child `Value::Ref`s as `Dereferenced`
             // under `memory-model-checks` so dropping the freed entry's data
@@ -1916,6 +1933,7 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
         HeapData::Instance(instance) => instance.py_dec_ref_ids(stack),
         HeapData::BoundMethod(bm) => bm.py_dec_ref_ids(stack),
         HeapData::DataclassField(field) => field.py_dec_ref_ids(stack),
+        HeapData::DataclassParams(params) => params.py_dec_ref_ids(stack),
         HeapData::ListIterator(iter) => iter.py_dec_ref_ids(stack),
         HeapData::DequeIterator(iter) => iter.py_dec_ref_ids(stack),
         HeapData::TupleIterator(iter) => iter.py_dec_ref_ids(stack),
@@ -1992,7 +2010,7 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
 /// Gated behind `--cfg heap_reader_compile_fail_tests` so they are only compiled
 /// when the integration test harness runs `cargo check` with the appropriate flags.
 #[cfg(heap_reader_compile_fail_tests)]
-#[path = "../tests/heap_reader_compile_fail_cases/cases.rs"]
+#[path = "../../tests/heap_reader_compile_fail_cases/cases.rs"]
 mod heap_reader_compile_fail_cases;
 
 /// Cycle-collector unit tests.
@@ -2029,7 +2047,7 @@ mod tests {
     /// The list's items become `[Value::Ref(id)]` and its refcount is bumped
     /// to 2 to reflect both the caller's ref and the new self-reference.
     fn alloc_self_cycle(heap: &Heap) -> HeapId {
-        let id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let id = heap.allocate(HeapData::List(List::new(vec![])));
         let entry = heap
             .entries
             .iter()
@@ -2063,8 +2081,8 @@ mod tests {
     /// stack must not grow with edge multiplicity — otherwise the outer
     /// pop processes A's children multiple times and over-counts.
     fn alloc_dup_child_cycle(heap: &Heap) -> (HeapId, HeapId) {
-        let p_id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let a_id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let p_id = heap.allocate(HeapData::List(List::new(vec![])));
+        let a_id = heap.allocate(HeapData::List(List::new(vec![])));
 
         let push_refs = |target: HeapId, refs: &[HeapId]| {
             let entry = heap
@@ -2173,13 +2191,13 @@ mod tests {
     /// Pure `cargo test` cannot observe this — the pointer arithmetic still
     /// reads valid bytes — but `cargo +nightly miri test` flags the access.
     /// The branch is reachable from normal Monty code (e.g. `list.remove`
-    /// on a self-referential list holds a `HeapRead<List>`, clones the
+    /// on a self-referential list holds a `HeapObjectRead<List>`, clones the
     /// matching element, and the deferred drop of that clone calls
     /// `dec_ref` on the same `HeapId` while the list reader is still live).
     #[test]
     fn dec_ref_must_not_invalidate_live_heap_read() {
         let mut heap = Heap::new(16, ResourceTracker::default());
-        let id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let id = heap.allocate(HeapData::List(List::new(vec![])));
         // Bump refcount so `dec_ref` enters the non-freeing branch where
         // the offending `data.0.get_mut()` lives. `List` is GC-tracked, so
         // `is_gc_tracked` returns true and the branch is fully exercised.
@@ -2340,17 +2358,16 @@ mod tests {
     #[test]
     fn callable_iterator_traces_callable_and_sentinel() {
         let heap = Heap::new(16, ResourceTracker::default());
-        let c = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let s = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let c = heap.allocate(HeapData::List(List::new(vec![])));
+        let s = heap.allocate(HeapData::List(List::new(vec![])));
 
         heap.inc_ref(c);
         heap.inc_ref(s);
-        let iter = heap
-            .allocate(HeapData::CallableIterator(CallableIterator::new(
-                Value::Ref(c),
-                Value::Ref(s),
-            )))
-            .unwrap();
+        let iter = heap.allocate(HeapData::CallableIterator(CallableIterator::new(
+            Value::Ref(c),
+            Value::Ref(s),
+        )));
+
         let mut traced = vec![];
         for_each_child_id(heap.get(iter), |id| traced.push(id));
         assert_eq!(traced, vec![c, s], "callable and sentinel are both traced");
@@ -2360,12 +2377,11 @@ mod tests {
         // under-decrements and frees a live object.
         heap.inc_ref(c);
         heap.inc_ref(c);
-        let shared = heap
-            .allocate(HeapData::CallableIterator(CallableIterator::new(
-                Value::Ref(c),
-                Value::Ref(c),
-            )))
-            .unwrap();
+        let shared = heap.allocate(HeapData::CallableIterator(CallableIterator::new(
+            Value::Ref(c),
+            Value::Ref(c),
+        )));
+
         let mut dup = vec![];
         for_each_child_id(heap.get(shared), |id| dup.push(id));
         assert_eq!(dup, vec![c, c], "a shared callable/sentinel is traced twice");
@@ -2377,16 +2393,14 @@ mod tests {
     #[test]
     fn callable_iterator_cycle_is_collected() {
         let mut heap = Heap::new(16, ResourceTracker::default());
-        let sentinel = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let list = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let sentinel = heap.allocate(HeapData::List(List::new(vec![])));
+        let list = heap.allocate(HeapData::List(List::new(vec![])));
         heap.inc_ref(list);
         heap.inc_ref(sentinel);
-        let iter = heap
-            .allocate(HeapData::CallableIterator(CallableIterator::new(
-                Value::Ref(list),
-                Value::Ref(sentinel),
-            )))
-            .unwrap();
+        let iter = heap.allocate(HeapData::CallableIterator(CallableIterator::new(
+            Value::Ref(list),
+            Value::Ref(sentinel),
+        )));
 
         // Close the cycle: the callable list references the iterator back.
         heap.inc_ref(iter);

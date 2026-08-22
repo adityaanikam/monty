@@ -1,4 +1,4 @@
-use std::{cell::Cell, ffi::c_int, fmt::Write, mem, ops, str};
+use std::{cell::Cell, ffi::c_int, fmt::Write, ops, str};
 
 /// Python bytes type, wrapping a `Vec<u8>`.
 ///
@@ -67,6 +67,7 @@ use std::{cell::Cell, ffi::c_int, fmt::Write, mem, ops, str};
 /// - `expandtabs(tabsize=8)` - Tab expansion
 /// - `translate(table[, delete])` - Character translation
 /// - `maketrans(frm, to)` - Create translation table (staticmethod)
+use memchr::memmem::{Finder, FinderRev};
 use monty_types::ResourceError;
 pub use monty_types::{bytes_repr, bytes_repr_fmt};
 use smallvec::smallvec;
@@ -79,7 +80,9 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult, SimpleException},
     hash::{HashValue, hash_python_bytes},
-    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, heap_read_ref_as_field},
+    heap::{
+        DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, heap_read_ref_as_field,
+    },
     intern::{BytesId, StaticStrings, StringId},
     resource_checks::{check_repeat_size, check_replace_size},
     types::{
@@ -181,8 +184,8 @@ impl Bytes {
             let errors = errors.as_ref().map_or("strict", |e| e.as_str(vm));
             let encoding = encoding.as_str(vm);
             let codec = Codec::find(encoding).ok_or_else(|| ExcType::lookup_error_unknown_encoding(encoding))?;
-            let encoded = codec.encode(s, errors, vm.heap.tracker())?;
-            let heap_id = vm.heap.allocate(HeapData::Bytes(Self::new(encoded)))?;
+            let encoded = codec.encode(s, errors, &vm.heap.tracker)?;
+            let heap_id = vm.heap.allocate(HeapData::Bytes(Self::new(encoded)));
             return Ok(Value::Ref(heap_id));
         }
         if source_str.is_some() {
@@ -197,13 +200,16 @@ impl Bytes {
                 if *n < 0 {
                     return Err(ExcType::value_error_negative_bytes_count());
                 }
-                let size = usize::try_from(*n).expect("bytes count validated non-negative");
+                // Fallible on a 32-bit target (`wasm32-wasip1`), where `bytes(2**40)`
+                // is a count no `usize` can hold. On 64-bit the conversion always
+                // succeeds and the size check below rejects it with `MemoryError`.
+                let size = usize::try_from(*n).map_err(|_| ExcType::overflow_index_sized_int())?;
                 // Pre-check the requested size against resource limits before
                 // touching the global allocator. Without this, `bytes(n)` for a
                 // very large `n` would attempt the native allocation directly
                 // and abort the host on failure rather than raising MemoryError.
                 // Mirrors the guard already used by `bytes.ljust`/`zfill`/`*`.
-                check_repeat_size(size, 1, vm.heap.tracker())?;
+                check_repeat_size(size, 1, &vm.heap.tracker)?;
                 vec![0u8; size]
             }
             Some(Value::InternBytes(bytes_id)) => {
@@ -216,7 +222,7 @@ impl Bytes {
             },
             Some(v) => return Err(ExcType::type_error_bytes_init(&v.py_type_name(vm))),
         };
-        let heap_id = vm.heap.allocate(HeapData::Bytes(Self::new(new_data)))?;
+        let heap_id = vm.heap.allocate(HeapData::Bytes(Self::new(new_data)));
         Ok(Value::Ref(heap_id))
     }
 }
@@ -239,17 +245,17 @@ struct BytesInitArgs {
 /// Concatenates two byte strings into a tracked heap value.
 pub(crate) fn concat_bytes(lhs: &[u8], rhs: &[u8], heap: &Heap) -> Result<Value, ResourceError> {
     let result_len = lhs.len().saturating_add(rhs.len());
-    check_repeat_size(result_len, 1, heap.tracker())?;
+    check_repeat_size(result_len, 1, &heap.tracker)?;
     let mut result = Vec::with_capacity(result_len);
     result.extend_from_slice(lhs);
     result.extend_from_slice(rhs);
-    Ok(Value::Ref(heap.allocate(HeapData::Bytes(result.into()))?))
+    Ok(Value::Ref(heap.allocate(HeapData::Bytes(result.into()))))
 }
 
 /// Repeats bytes after validating the allocation against resource limits.
 pub(crate) fn repeat_bytes(value: &[u8], count: usize, heap: &Heap) -> Result<Value, ResourceError> {
-    check_repeat_size(value.len(), count, heap.tracker())?;
-    Ok(Value::Ref(heap.allocate(HeapData::Bytes(value.repeat(count).into()))?))
+    check_repeat_size(value.len(), count, &heap.tracker)?;
+    Ok(Value::Ref(heap.allocate(HeapData::Bytes(value.repeat(count).into()))))
 }
 
 impl From<Vec<u8>> for Bytes {
@@ -278,9 +284,9 @@ impl ops::Deref for Bytes {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, Bytes> {
     /// One-sided implementation of Python membership (`__contains__`).
-    fn py_contains_impl(&self, _self_id: HeapId, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         bytes_contains(self.get(vm.heap).as_slice(), item, vm).map(Some)
     }
 
@@ -292,8 +298,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
         Type::Bytes
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        BytesIterator::from_heap(self_id.expect("heap values have an id"), vm)
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(BytesIterator::from_heap(self.id(), vm))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -307,7 +313,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
         {
             let b = self.get(vm.heap);
             let sliced_bytes = slice_collect_iterator(vm, slice, b.0.iter(), |b| *b)?;
-            let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(sliced_bytes)))?;
+            let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(sliced_bytes)));
             return Ok(Value::Ref(heap_id));
         }
 
@@ -325,7 +331,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
         Ok(eq_bytes(self.get(vm.heap).as_slice(), other, vm))
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let b = self.get(vm.heap);
         if let Some(cached) = b.1.get() {
             return Ok(Some(cached));
@@ -350,7 +356,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
         Ok(bytes_repr_fmt(&self.get(vm.heap).0, f)?)
     }
 
-    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let other = match other {
             Value::InternBytes(id) => vm.interns.get_bytes(*id),
             Value::Ref(id) if let HeapData::Bytes(value) = vm.heap.get(*id) => value.as_slice(),
@@ -370,13 +376,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
         self.py_mul_impl(other, vm)
     }
 
-    fn py_call_attr(
-        &mut self,
-        _self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let Some(method) = attr.static_string() else {
             args.drop_with(vm);
             return Err(ExcType::attribute_error(Type::Bytes, attr.as_str(vm.interns)));
@@ -389,10 +389,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Bytes> {
 }
 
 impl HeapItem for Bytes {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.0.len()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // No-op: bytes don't hold Value references
     }
@@ -427,23 +423,23 @@ fn call_bytes_method_impl<'h>(
         // Simple transformations (no arguments)
         StaticStrings::Lower => {
             args.check_zero_args("bytes.lower", vm.heap)?;
-            bytes_lower(bytes, vm)
+            Ok(bytes_lower(bytes, vm))
         }
         StaticStrings::Upper => {
             args.check_zero_args("bytes.upper", vm.heap)?;
-            bytes_upper(bytes, vm)
+            Ok(bytes_upper(bytes, vm))
         }
         StaticStrings::Capitalize => {
             args.check_zero_args("bytes.capitalize", vm.heap)?;
-            bytes_capitalize(bytes, vm)
+            Ok(bytes_capitalize(bytes, vm))
         }
         StaticStrings::Title => {
             args.check_zero_args("bytes.title", vm.heap)?;
-            bytes_title(bytes, vm)
+            Ok(bytes_title(bytes, vm))
         }
         StaticStrings::Swapcase => {
             args.check_zero_args("bytes.swapcase", vm.heap)?;
-            bytes_swapcase(bytes, vm)
+            Ok(bytes_swapcase(bytes, vm))
         }
         // Predicate methods (no arguments, return bool)
         StaticStrings::Isalpha => {
@@ -537,7 +533,7 @@ fn bytes_decode<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
 
     let codec = Codec::find(encoding).ok_or_else(|| ExcType::lookup_error_unknown_encoding(encoding))?;
     let s = codec.decode(bytes.get(vm.heap), errors)?;
-    Ok(super::str::allocate_string(s, vm.heap)?)
+    Ok(super::str::allocate_string(s, vm.heap))
 }
 
 /// Argument shape for `bytes.decode(encoding='utf-8', errors='strict')`.
@@ -557,6 +553,120 @@ struct BytesDecodeArgs {
     errors: Option<StrArg>,
 }
 
+// =============================================================================
+// Substring scanning
+// =============================================================================
+//
+// Every `bytes` substring operation funnels through the scanners below. A scan
+// runs inside one bytecode instruction, so the VM's per-instruction
+// `check_time()` cannot preempt it — hence the chunked polling.
+
+/// Bytes scanned between `check_time()` polls.
+const SCAN_CHUNK: usize = 64 * 1024;
+
+/// Finds the first occurrence of `needle` in `haystack`.
+///
+/// Callers must handle the empty needle: it would spin [`count_non_overlapping`].
+/// Repeated scans for the same needle should build one [`Finder`] via
+/// [`finder_for`] and call [`find_with`] instead — see their docstrings.
+fn find_subsequence(haystack: &[u8], needle: &[u8], heap: &Heap) -> Result<Option<usize>, ResourceError> {
+    match finder_for(needle, haystack) {
+        Some(finder) => find_with(&finder, haystack, heap),
+        None => Ok(None),
+    }
+}
+
+/// Builds a forward finder, or `None` when `needle` cannot fit in `haystack`.
+///
+/// [`Finder::new`] runs Two-Way preprocessing over the whole needle *before*
+/// [`find_with`] reaches its first `check_time()`, so a host-supplied needle
+/// longer than the haystack would burn unpolled time on a search that provably
+/// cannot match. Every finder must be built through this or [`rfinder_for`].
+fn finder_for<'n>(needle: &'n [u8], haystack: &[u8]) -> Option<Finder<'n>> {
+    (needle.len() <= haystack.len()).then(|| Finder::new(needle))
+}
+
+/// Builds a reverse finder, or `None` when `needle` cannot fit in `haystack`.
+///
+/// The mirror of [`finder_for`], with the same preprocessing rationale.
+fn rfinder_for<'n>(needle: &'n [u8], haystack: &[u8]) -> Option<FinderRev<'n>> {
+    (needle.len() <= haystack.len()).then(|| FinderRev::new(needle))
+}
+
+/// Finds the first occurrence of `finder`'s needle in `haystack`.
+///
+/// Chunks overlap by `needle.len() - 1` so boundary-straddling matches are
+/// found; the stride never drops below the needle length so that overlap cannot
+/// dominate. Above that floor a chunk spans up to `2 * needle.len()`, so a long
+/// needle widens the `max_duration` overshoot — unavoidable, since a window
+/// shorter than the needle cannot hold a match. See
+/// `limitations/resource_limits.md`.
+///
+/// Takes the [`Finder`] by reference because constructing one runs Two-Way
+/// preprocessing over the needle; callers scanning in a loop (counting,
+/// splitting, replacing) build it once rather than per match.
+fn find_with(finder: &Finder<'_>, haystack: &[u8], heap: &Heap) -> Result<Option<usize>, ResourceError> {
+    let needle_len = finder.needle().len();
+    debug_assert!(needle_len > 0, "callers must handle the empty needle");
+    let stride = SCAN_CHUNK.max(needle_len);
+    let mut start = 0;
+    while start < haystack.len() {
+        heap.tracker.check_time()?;
+        let end = start
+            .saturating_add(stride + needle_len.saturating_sub(1))
+            .min(haystack.len());
+        if let Some(pos) = finder.find(&haystack[start..end]) {
+            return Ok(Some(start + pos));
+        }
+        start += stride;
+    }
+    Ok(None)
+}
+
+/// Finds the last occurrence of `needle` in `haystack`.
+///
+/// The mirror of [`find_subsequence`]; [`rfind_with`] is the reusable form.
+fn rfind_subsequence(haystack: &[u8], needle: &[u8], heap: &Heap) -> Result<Option<usize>, ResourceError> {
+    match rfinder_for(needle, haystack) {
+        Some(finder) => rfind_with(&finder, haystack, heap),
+        None => Ok(None),
+    }
+}
+
+/// Finds the last occurrence of `finder`'s needle in `haystack`.
+///
+/// The mirror of [`find_with`], walking chunks from the end; the same
+/// preprocessing-reuse rationale applies.
+fn rfind_with(finder: &FinderRev<'_>, haystack: &[u8], heap: &Heap) -> Result<Option<usize>, ResourceError> {
+    let needle_len = finder.needle().len();
+    debug_assert!(needle_len > 0, "callers must handle the empty needle");
+    let stride = SCAN_CHUNK.max(needle_len);
+    let mut end = haystack.len();
+    while end > 0 {
+        heap.tracker.check_time()?;
+        let start = end.saturating_sub(stride + needle_len.saturating_sub(1));
+        if let Some(pos) = finder.rfind(&haystack[start..end]) {
+            return Ok(Some(start + pos));
+        }
+        end = end.saturating_sub(stride);
+    }
+    Ok(None)
+}
+
+/// Counts non-overlapping occurrences of `needle` in `haystack`.
+fn count_non_overlapping(haystack: &[u8], needle: &[u8], heap: &Heap) -> Result<usize, ResourceError> {
+    let Some(finder) = finder_for(needle, haystack) else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    let mut pos = 0;
+    while let Some(found) = find_with(&finder, &haystack[pos..], heap)? {
+        count += 1;
+        pos += found + needle.len();
+    }
+    Ok(count)
+}
+
 /// Implements Python's `bytes.count(sub[, start[, end]])` method.
 ///
 /// Returns the number of non-overlapping occurrences of the subsequence.
@@ -569,26 +679,11 @@ fn bytes_count<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         // Empty subsequence: count positions between each byte plus 1
         slice.len() + 1
     } else {
-        count_non_overlapping(slice, &sub)
+        count_non_overlapping(slice, &sub, vm.heap)?
     };
 
     let count_i64 = i64::try_from(count).expect("count exceeds i64::MAX");
     Ok(Value::Int(count_i64))
-}
-
-/// Counts non-overlapping occurrences of needle in haystack.
-fn count_non_overlapping(haystack: &[u8], needle: &[u8]) -> usize {
-    let mut count = 0;
-    let mut pos = 0;
-    while pos + needle.len() <= haystack.len() {
-        if &haystack[pos..pos + needle.len()] == needle {
-            count += 1;
-            pos += needle.len();
-        } else {
-            pos += 1;
-        }
-    }
-    count
 }
 
 /// Implements Python's `bytes.find(sub[, start[, end]])` method.
@@ -603,7 +698,7 @@ fn bytes_find<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>) 
         // Empty subsequence: always found at start position
         Some(0)
     } else {
-        find_subsequence(slice, &sub)
+        find_subsequence(slice, &sub, vm.heap)?
     };
 
     let idx = match result {
@@ -611,11 +706,6 @@ fn bytes_find<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>) 
         None => -1,
     };
     Ok(Value::Int(idx))
-}
-
-/// Finds the first occurrence of needle in haystack.
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
 /// Implements Python's `bytes.index(sub[, start[, end]])` method.
@@ -630,7 +720,7 @@ fn bytes_index<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         // Empty subsequence: always found at start position
         Some(0)
     } else {
-        find_subsequence(slice, &sub)
+        find_subsequence(slice, &sub, vm.heap)?
     };
 
     match result {
@@ -846,7 +936,7 @@ fn parse_bytes_sub_args(
 /// Implements Python's `bytes.lower()` method.
 ///
 /// Returns a copy of the bytes with all ASCII uppercase characters converted to lowercase.
-fn bytes_lower<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Value> {
+fn bytes_lower<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> Value {
     let result: Vec<u8> = bytes.get(vm.heap).iter().map(|&b| b.to_ascii_lowercase()).collect();
     allocate_bytes(result, vm.heap)
 }
@@ -854,7 +944,7 @@ fn bytes_lower<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Val
 /// Implements Python's `bytes.upper()` method.
 ///
 /// Returns a copy of the bytes with all ASCII lowercase characters converted to uppercase.
-fn bytes_upper<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Value> {
+fn bytes_upper<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> Value {
     let result: Vec<u8> = bytes.get(vm.heap).iter().map(|&b| b.to_ascii_uppercase()).collect();
     allocate_bytes(result, vm.heap)
 }
@@ -863,7 +953,7 @@ fn bytes_upper<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Val
 ///
 /// Returns a copy of the bytes with the first byte capitalized (if ASCII) and
 /// the rest lowercased.
-fn bytes_capitalize<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Value> {
+fn bytes_capitalize<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> Value {
     let bytes = bytes.get(vm.heap);
     let mut result = Vec::with_capacity(bytes.len());
     if let Some((&first, rest)) = bytes.split_first() {
@@ -879,7 +969,7 @@ fn bytes_capitalize<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResul
 ///
 /// Returns a titlecased version of the bytes where words start with an uppercase
 /// ASCII character and the remaining characters are lowercase.
-fn bytes_title<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Value> {
+fn bytes_title<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> Value {
     let bytes = bytes.get(vm.heap);
     let mut result = Vec::with_capacity(bytes.len());
     let mut prev_is_cased = false;
@@ -900,7 +990,7 @@ fn bytes_title<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Val
 ///
 /// Returns a copy of the bytes with ASCII uppercase characters converted to
 /// lowercase and vice versa.
-fn bytes_swapcase<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> RunResult<Value> {
+fn bytes_swapcase<'h>(bytes: &HeapRead<'h, [u8]>, vm: &mut VM<'h>) -> Value {
     let result: Vec<u8> = bytes
         .get(vm.heap)
         .iter()
@@ -1030,7 +1120,7 @@ fn bytes_rfind<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         // Empty subsequence: always found at end position
         Some(slice.len())
     } else {
-        rfind_subsequence(slice, &sub)
+        rfind_subsequence(slice, &sub, vm.heap)?
     };
 
     let idx = match result {
@@ -1038,14 +1128,6 @@ fn bytes_rfind<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         None => -1,
     };
     Ok(Value::Int(idx))
-}
-
-/// Finds the last occurrence of needle in haystack.
-fn rfind_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).rposition(|window| window == needle)
 }
 
 /// Implements Python's `bytes.rindex(sub[, start[, end]])` method.
@@ -1059,7 +1141,7 @@ fn bytes_rindex<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
     let result = if sub.is_empty() {
         Some(slice.len())
     } else {
-        rfind_subsequence(slice, &sub)
+        rfind_subsequence(slice, &sub, vm.heap)?
     };
 
     match result {
@@ -1086,7 +1168,7 @@ fn bytes_strip<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         None | Some(Value::None) => bytes_strip_whitespace_both(bytes.get(vm.heap)),
         Some(v) => bytes_strip_both(bytes.get(vm.heap), extract_bytes_only(v, vm)?),
     };
-    allocate_bytes(result.to_vec(), vm.heap)
+    Ok(allocate_bytes(result.to_vec(), vm.heap))
 }
 
 /// Implements Python's `bytes.lstrip([chars])` method.
@@ -1099,7 +1181,7 @@ fn bytes_lstrip<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
         None | Some(Value::None) => bytes_strip_whitespace_start(bytes.get(vm.heap)),
         Some(v) => bytes_strip_start(bytes.get(vm.heap), extract_bytes_only(v, vm)?),
     };
-    allocate_bytes(result.to_vec(), vm.heap)
+    Ok(allocate_bytes(result.to_vec(), vm.heap))
 }
 
 /// Implements Python's `bytes.rstrip([chars])` method.
@@ -1112,7 +1194,7 @@ fn bytes_rstrip<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
         None | Some(Value::None) => bytes_strip_whitespace_end(bytes.get(vm.heap)),
         Some(v) => bytes_strip_end(bytes.get(vm.heap), extract_bytes_only(v, vm)?),
     };
-    allocate_bytes(result.to_vec(), vm.heap)
+    Ok(allocate_bytes(result.to_vec(), vm.heap))
 }
 
 /// Strips bytes in `chars` from both ends of the byte slice.
@@ -1177,7 +1259,7 @@ fn bytes_removeprefix<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut 
     } else {
         bytes.to_vec()
     };
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 /// Implements Python's `bytes.removesuffix(suffix)` method.
@@ -1195,7 +1277,7 @@ fn bytes_removesuffix<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut 
     } else {
         bytes.to_vec()
     };
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 // =============================================================================
@@ -1216,10 +1298,10 @@ fn bytes_split<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
                 return Err(ExcType::value_error_empty_separator());
             }
             if maxsplit < 0 {
-                bytes_split_by_seq(bytes, sep)
+                bytes_split_by_seq(bytes, sep, vm.heap)?
             } else {
                 let max = usize::try_from(maxsplit).unwrap_or(usize::MAX);
-                bytes_splitn_by_seq(bytes, sep, max + 1)
+                bytes_splitn_by_seq(bytes, sep, max + 1, vm.heap)?
             }
         }
         None => {
@@ -1233,13 +1315,13 @@ fn bytes_split<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
     };
 
     let mut list_items = Vec::with_capacity(parts.len());
-    for part in parts {
-        vm.heap.check_time()?;
-        list_items.push(allocate_bytes(part.to_vec(), vm.heap)?);
+    for (i, part) in parts.into_iter().enumerate() {
+        vm.heap.tracker.check_memory_time_every(i)?;
+        list_items.push(allocate_bytes(part.to_vec(), vm.heap));
     }
 
     let list = List::new(list_items);
-    let heap_id = vm.heap.allocate(HeapData::List(list))?;
+    let heap_id = vm.heap.allocate(HeapData::List(list));
     Ok(Value::Ref(heap_id))
 }
 
@@ -1257,10 +1339,10 @@ fn bytes_rsplit<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
                 return Err(ExcType::value_error_empty_separator());
             }
             if maxsplit < 0 {
-                bytes_split_by_seq(bytes, sep)
+                bytes_split_by_seq(bytes, sep, vm.heap)?
             } else {
                 let max = usize::try_from(maxsplit).unwrap_or(usize::MAX);
-                bytes_rsplitn_by_seq(bytes, sep, max + 1)
+                bytes_rsplitn_by_seq(bytes, sep, max + 1, vm.heap)?
             }
         }
         None => {
@@ -1274,13 +1356,13 @@ fn bytes_rsplit<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
     };
 
     let mut list_items = Vec::with_capacity(parts.len());
-    for part in parts {
-        vm.heap.check_time()?;
-        list_items.push(allocate_bytes(part.to_vec(), vm.heap)?);
+    for (i, part) in parts.into_iter().enumerate() {
+        vm.heap.tracker.check_memory_time_every(i)?;
+        list_items.push(allocate_bytes(part.to_vec(), vm.heap));
     }
 
     let list = List::new(list_items);
-    let heap_id = vm.heap.allocate(HeapData::List(list))?;
+    let heap_id = vm.heap.allocate(HeapData::List(list));
     Ok(Value::Ref(heap_id))
 }
 
@@ -1323,27 +1405,38 @@ struct BytesRsplitArgs {
 }
 
 /// Splits bytes by a separator sequence.
-fn bytes_split_by_seq<'a>(bytes: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
+fn bytes_split_by_seq<'a>(bytes: &'a [u8], sep: &[u8], heap: &Heap) -> Result<Vec<&'a [u8]>, ResourceError> {
+    let Some(finder) = finder_for(sep, bytes) else {
+        return Ok(vec![bytes]);
+    };
     let mut parts = Vec::new();
     let mut start = 0;
 
-    while let Some(pos) = find_subsequence(&bytes[start..], sep) {
+    while let Some(pos) = find_with(&finder, &bytes[start..], heap)? {
         parts.push(&bytes[start..start + pos]);
         start = start + pos + sep.len();
     }
     parts.push(&bytes[start..]);
 
-    parts
+    Ok(parts)
 }
 
 /// Splits bytes by a separator sequence, returning at most n parts.
-fn bytes_splitn_by_seq<'a>(bytes: &'a [u8], sep: &[u8], n: usize) -> Vec<&'a [u8]> {
+fn bytes_splitn_by_seq<'a>(bytes: &'a [u8], sep: &[u8], n: usize, heap: &Heap) -> Result<Vec<&'a [u8]>, ResourceError> {
+    // `maxsplit=0` (`n == 1`) permits no splits, so return before `finder_for`
+    // preprocesses the separator — that runs ahead of any `check_time()`.
+    if n <= 1 {
+        return Ok(vec![bytes]);
+    }
+    let Some(finder) = finder_for(sep, bytes) else {
+        return Ok(vec![bytes]);
+    };
     let mut parts = Vec::new();
     let mut start = 0;
     let mut count = 0;
 
     while count + 1 < n {
-        if let Some(pos) = find_subsequence(&bytes[start..], sep) {
+        if let Some(pos) = find_with(&finder, &bytes[start..], heap)? {
             parts.push(&bytes[start..start + pos]);
             start = start + pos + sep.len();
             count += 1;
@@ -1353,17 +1446,30 @@ fn bytes_splitn_by_seq<'a>(bytes: &'a [u8], sep: &[u8], n: usize) -> Vec<&'a [u8
     }
     parts.push(&bytes[start..]);
 
-    parts
+    Ok(parts)
 }
 
 /// Splits bytes by a separator sequence from the right, returning at most n parts.
-fn bytes_rsplitn_by_seq<'a>(bytes: &'a [u8], sep: &[u8], n: usize) -> Vec<&'a [u8]> {
+fn bytes_rsplitn_by_seq<'a>(
+    bytes: &'a [u8],
+    sep: &[u8],
+    n: usize,
+    heap: &Heap,
+) -> Result<Vec<&'a [u8]>, ResourceError> {
+    // `maxsplit=0` (`n == 1`) permits no splits, so return before `rfinder_for`
+    // preprocesses the separator — that runs ahead of any `check_time()`.
+    if n <= 1 {
+        return Ok(vec![bytes]);
+    }
+    let Some(finder) = rfinder_for(sep, bytes) else {
+        return Ok(vec![bytes]);
+    };
     let mut parts = Vec::new();
     let mut end = bytes.len();
     let mut count = 0;
 
     while count + 1 < n {
-        if let Some(pos) = rfind_subsequence(&bytes[..end], sep) {
+        if let Some(pos) = rfind_with(&finder, &bytes[..end], heap)? {
             parts.push(&bytes[pos + sep.len()..end]);
             end = pos;
             count += 1;
@@ -1374,7 +1480,7 @@ fn bytes_rsplitn_by_seq<'a>(bytes: &'a [u8], sep: &[u8], n: usize) -> Vec<&'a [u
     parts.push(&bytes[..end]);
     parts.reverse();
 
-    parts
+    Ok(parts)
 }
 
 /// Splits bytes by ASCII whitespace, filtering empty parts.
@@ -1475,7 +1581,7 @@ fn bytes_splitlines<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM
     let len = bytes.len();
 
     while start < len {
-        vm.heap.check_time()?;
+        vm.heap.tracker.check_memory_time_every(lines.len())?;
 
         let mut end = start;
         let mut line_end = start;
@@ -1507,13 +1613,13 @@ fn bytes_splitlines<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM
         } else {
             &bytes[start..line_end]
         };
-        lines.push(allocate_bytes(line.to_vec(), vm.heap)?);
+        lines.push(allocate_bytes(line.to_vec(), vm.heap));
         start = end;
     }
 
     let (lines, vm) = lines_guard.into_parts();
     let list = List::new(lines);
-    let heap_id = vm.heap.allocate(HeapData::List(list))?;
+    let heap_id = vm.heap.allocate(HeapData::List(list));
     Ok(Value::Ref(heap_id))
 }
 
@@ -1554,19 +1660,19 @@ fn bytes_partition<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<
     }
 
     let bytes = bytes.get(vm.heap);
-    let (before, sep_found, after) = match find_subsequence(bytes, sep) {
+    let (before, sep_found, after) = match find_subsequence(bytes, sep, vm.heap)? {
         Some(pos) => (bytes[..pos].to_vec(), sep.to_vec(), bytes[pos + sep.len()..].to_vec()),
         None => (bytes.to_vec(), Vec::new(), Vec::new()),
     };
 
-    let before_val = allocate_bytes(before, vm.heap)?;
-    let sep_val = allocate_bytes(sep_found, vm.heap)?;
-    let after_val = allocate_bytes(after, vm.heap)?;
+    let before_val = allocate_bytes(before, vm.heap);
+    let sep_val = allocate_bytes(sep_found, vm.heap);
+    let after_val = allocate_bytes(after, vm.heap);
 
     Ok(super::allocate_tuple(
         smallvec![before_val, sep_val, after_val],
         vm.heap,
-    )?)
+    ))
 }
 
 /// Implements Python's `bytes.rpartition(sep)` method.
@@ -1582,19 +1688,19 @@ fn bytes_rpartition<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM
     }
 
     let bytes = bytes.get(vm.heap);
-    let (before, sep_found, after) = match rfind_subsequence(bytes, sep) {
+    let (before, sep_found, after) = match rfind_subsequence(bytes, sep, vm.heap)? {
         Some(pos) => (bytes[..pos].to_vec(), sep.to_vec(), bytes[pos + sep.len()..].to_vec()),
         None => (Vec::new(), Vec::new(), bytes.to_vec()),
     };
 
-    let before_val = allocate_bytes(before, vm.heap)?;
-    let sep_val = allocate_bytes(sep_found, vm.heap)?;
-    let after_val = allocate_bytes(after, vm.heap)?;
+    let before_val = allocate_bytes(before, vm.heap);
+    let sep_val = allocate_bytes(sep_found, vm.heap);
+    let after_val = allocate_bytes(after, vm.heap);
 
     Ok(super::allocate_tuple(
         smallvec![before_val, sep_val, after_val],
         vm.heap,
-    )?)
+    ))
 }
 
 // =============================================================================
@@ -1609,7 +1715,7 @@ fn bytes_replace<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h
 
     let bytes = bytes.get(vm.heap);
 
-    check_replace_size(bytes.len(), old.len(), new.len(), count, vm.heap.tracker())?;
+    check_replace_size(bytes.len(), old.len(), new.len(), count, &vm.heap.tracker)?;
 
     let result = if count < 0 {
         bytes_replace_all(bytes, &old, &new, vm.heap)?
@@ -1618,7 +1724,7 @@ fn bytes_replace<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h
         bytes_replace_n(bytes, &old, &new, n, vm.heap)?
     };
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 /// Parses arguments for bytes.replace method.
@@ -1652,25 +1758,39 @@ fn bytes_replace_all(bytes: &[u8], old: &[u8], new: &[u8], heap: &Heap) -> Resul
     if old.is_empty() {
         // Empty pattern: insert new before each byte and at the end
         let mut result = Vec::with_capacity(bytes.len() + new.len() * (bytes.len() + 1));
-        for &b in bytes {
-            heap.check_time()?;
+        for (i, &b) in bytes.iter().enumerate() {
+            heap.tracker.check_memory_time_every(i)?;
             result.extend_from_slice(new);
             result.push(b);
         }
         result.extend_from_slice(new);
         Ok(result)
-    } else {
+    } else if let Some(finder) = finder_for(old, bytes) {
         let mut result = Vec::new();
         let mut start = 0;
-        while let Some(pos) = find_subsequence(&bytes[start..], old) {
-            heap.check_time()?;
+        let mut matches = 0usize;
+        while let Some(pos) = find_with(&finder, &bytes[start..], heap)? {
+            heap.tracker.check_memory_time_every(matches)?;
+            matches += 1;
             result.extend_from_slice(&bytes[start..start + pos]);
             result.extend_from_slice(new);
             start = start + pos + old.len();
         }
         result.extend_from_slice(&bytes[start..]);
         Ok(result)
+    } else {
+        replace_nothing(bytes, heap)
     }
+}
+
+/// Copies `bytes` unchanged, for a `replace` that cannot match anything.
+///
+/// Polls before copying: the callers reaching here skip the scan loop, and
+/// with it the `check_time()` it would have run first, so without this a
+/// no-match `replace` over a large input would never touch the clock.
+fn replace_nothing(bytes: &[u8], heap: &Heap) -> Result<Vec<u8>, ResourceError> {
+    heap.tracker.check_time()?;
+    Ok(bytes.to_vec())
 }
 
 /// Replaces at most n occurrences of `old` with `new` in bytes.
@@ -1678,12 +1798,17 @@ fn bytes_replace_all(bytes: &[u8], old: &[u8], new: &[u8], heap: &Heap) -> Resul
 /// Checks the time limit periodically to enforce `max_duration` during
 /// potentially long replacement operations on large byte sequences.
 fn bytes_replace_n(bytes: &[u8], old: &[u8], new: &[u8], n: usize, heap: &Heap) -> Result<Vec<u8>, ResourceError> {
+    // `count=0` permits no replacements, so return before `finder_for`
+    // preprocesses `old` — that runs ahead of any `check_time()`.
+    if n == 0 {
+        return replace_nothing(bytes, heap);
+    }
     if old.is_empty() {
         // Empty pattern: insert new before each byte (up to n times)
         let mut result = Vec::new();
         let mut count = 0;
-        for &b in bytes {
-            heap.check_time()?;
+        for (i, &b) in bytes.iter().enumerate() {
+            heap.tracker.check_memory_time_every(i)?;
             if count < n {
                 result.extend_from_slice(new);
                 count += 1;
@@ -1694,13 +1819,13 @@ fn bytes_replace_n(bytes: &[u8], old: &[u8], new: &[u8], n: usize, heap: &Heap) 
             result.extend_from_slice(new);
         }
         Ok(result)
-    } else {
+    } else if let Some(finder) = finder_for(old, bytes) {
         let mut result = Vec::new();
         let mut start = 0;
         let mut count = 0;
         while count < n {
-            heap.check_time()?;
-            if let Some(pos) = find_subsequence(&bytes[start..], old) {
+            heap.tracker.check_memory_time_every(count)?;
+            if let Some(pos) = find_with(&finder, &bytes[start..], heap)? {
                 result.extend_from_slice(&bytes[start..start + pos]);
                 result.extend_from_slice(new);
                 start = start + pos + old.len();
@@ -1711,6 +1836,8 @@ fn bytes_replace_n(bytes: &[u8], old: &[u8], new: &[u8], n: usize, heap: &Heap) 
         }
         result.extend_from_slice(&bytes[start..]);
         Ok(result)
+    } else {
+        replace_nothing(bytes, heap)
     }
 }
 
@@ -1726,7 +1853,7 @@ fn bytes_center<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
     let result = if width <= len {
         bytes.to_vec()
     } else {
-        check_repeat_size(width, 1, vm.heap.tracker())?;
+        check_repeat_size(width, 1, &vm.heap.tracker)?;
         let total_pad = width - len;
         let left_pad = total_pad / 2;
         let right_pad = total_pad - left_pad;
@@ -1741,7 +1868,7 @@ fn bytes_center<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>
         result
     };
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 /// Implements Python's `bytes.ljust(width[, fillbyte])` method.
@@ -1756,7 +1883,7 @@ fn bytes_ljust<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
     let result = if width <= len {
         bytes.to_vec()
     } else {
-        check_repeat_size(width, 1, vm.heap.tracker())?;
+        check_repeat_size(width, 1, &vm.heap.tracker)?;
         let pad = width - len;
         let mut result = Vec::with_capacity(width);
         result.extend_from_slice(bytes);
@@ -1766,7 +1893,7 @@ fn bytes_ljust<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         result
     };
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 /// Implements Python's `bytes.rjust(width[, fillbyte])` method.
@@ -1781,7 +1908,7 @@ fn bytes_rjust<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
     let result = if width <= len {
         bytes.to_vec()
     } else {
-        check_repeat_size(width, 1, vm.heap.tracker())?;
+        check_repeat_size(width, 1, &vm.heap.tracker)?;
         let pad = width - len;
         let mut result = Vec::with_capacity(width);
         for _ in 0..pad {
@@ -1791,7 +1918,7 @@ fn bytes_rjust<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         result
     };
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 /// Parses arguments for bytes justify methods (center, ljust, rjust).
@@ -1847,7 +1974,7 @@ fn bytes_zfill<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
     let result = if width <= len {
         bytes.to_vec()
     } else {
-        check_repeat_size(width, 1, vm.heap.tracker())?;
+        check_repeat_size(width, 1, &vm.heap.tracker)?;
         let pad = width - len;
         let mut result = Vec::with_capacity(width);
 
@@ -1863,7 +1990,7 @@ fn bytes_zfill<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>)
         result
     };
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 // =============================================================================
@@ -1919,7 +2046,7 @@ fn bytes_join<'h>(separator: &HeapRead<'h, [u8]>, iterable: Value, vm: &mut VM<'
         index += 1;
     }
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 // =============================================================================
@@ -1995,7 +2122,7 @@ fn bytes_hex<'h>(bytes: &HeapRead<'h, [u8]>, args: ArgValues, vm: &mut VM<'h>) -
         hex_chars.iter().collect()
     };
 
-    Ok(super::str::allocate_string(result, vm.heap)?)
+    Ok(super::str::allocate_string(result, vm.heap))
 }
 
 /// Parses arguments for bytes.hex method.
@@ -2142,7 +2269,7 @@ pub fn bytes_fromhex(args: ArgValues, vm: &mut VM<'_>) -> RunResult<Value> {
         result.push((hi_val << 4) | lo_val);
     }
 
-    allocate_bytes(result, vm.heap)
+    Ok(allocate_bytes(result, vm.heap))
 }
 
 /// Converts a hex character to its numeric value.
@@ -2160,9 +2287,9 @@ fn hex_char_to_value(c: char) -> Option<u8> {
 // =============================================================================
 
 /// Allocates bytes on the heap.
-fn allocate_bytes(bytes: Vec<u8>, heap: &Heap) -> RunResult<Value> {
-    let heap_id = heap.allocate(HeapData::Bytes(Bytes::new(bytes)))?;
-    Ok(Value::Ref(heap_id))
+fn allocate_bytes(bytes: Vec<u8>, heap: &Heap) -> Value {
+    let heap_id = heap.allocate(HeapData::Bytes(Bytes::new(bytes)));
+    Value::Ref(heap_id)
 }
 
 /// Source representation retained by a bytes iterator.
@@ -2181,12 +2308,12 @@ pub(crate) struct BytesIterator {
 
 impl BytesIterator {
     /// Allocates an iterator over interned bytes.
-    pub(crate) fn from_intern(id: BytesId, vm: &mut VM<'_>) -> RunResult<Value> {
+    pub(crate) fn from_intern(id: BytesId, vm: &mut VM<'_>) -> Value {
         Self::allocate(BytesIteratorSource::Intern(id), vm)
     }
 
     /// Allocates an iterator retaining heap bytes.
-    fn from_heap(id: HeapId, vm: &mut VM<'_>) -> RunResult<Value> {
+    fn from_heap(id: HeapId, vm: &mut VM<'_>) -> Value {
         Self::allocate(BytesIteratorSource::Heap(id), vm)
     }
 
@@ -2215,24 +2342,20 @@ impl BytesIterator {
     }
 
     /// Allocates an iterator and retains a heap source when present.
-    fn allocate(source: BytesIteratorSource, vm: &mut VM<'_>) -> RunResult<Value> {
+    fn allocate(source: BytesIteratorSource, vm: &mut VM<'_>) -> Value {
         let source_id = match source {
             BytesIteratorSource::Heap(id) => Some(id),
             BytesIteratorSource::Intern(_) => None,
         };
-        let id = vm.heap.allocate(HeapData::BytesIterator(Self { source, index: 0 }))?;
+        let id = vm.heap.allocate(HeapData::BytesIterator(Self { source, index: 0 }));
         if let Some(source_id) = source_id {
             vm.heap.inc_ref(source_id);
         }
-        Ok(Value::Ref(id))
+        Value::Ref(id)
     }
 }
 
 impl HeapItem for BytesIterator {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         if let Some(id) = self.source_id() {
             stack.push(id);
@@ -2240,7 +2363,7 @@ impl HeapItem for BytesIterator {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, BytesIterator> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, BytesIterator> {
     fn py_is_iterable(&self, _: &VM<'h>) -> bool {
         true
     }
@@ -2257,13 +2380,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, BytesIterator> {
         Ok(None)
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        let self_id = self_id.expect("heap values have an id");
-        vm.heap.inc_ref(self_id);
-        Ok(Value::Ref(self_id))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
     }
 
-    fn py_next(&mut self, _self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let byte = {
             let iter = self.get(vm.heap);
             iter.as_slice(vm).get(iter.index).copied()
@@ -2293,7 +2414,8 @@ pub(crate) fn bytes_contains(container: &[u8], item: &Value, vm: &VM<'_>) -> Run
         // A bytes-like probe is a substring test.
         Value::InternBytes(_) | Value::Ref(_) => {
             let needle = extract_bytes_only(item, vm)?;
-            return Ok(container.windows(needle.len().max(1)).any(|w| w == needle) || needle.is_empty());
+            // An empty needle is in everything, and `find_subsequence` rejects it.
+            return Ok(needle.is_empty() || find_subsequence(container, needle, vm.heap)?.is_some());
         }
         other => {
             return Err(ExcType::type_error(format!(

@@ -2,9 +2,14 @@
 //! headline scenarios: a worker dying mid-execution (kill, crash, timeout)
 //! must surface as a clean error and never poison the pool.
 
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir;
 use std::{
     env, fs,
     future::ready,
+    io,
     path::{Path, PathBuf},
     process::Command,
     sync::Once,
@@ -14,11 +19,17 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
+// only the unix-gated exit-code test snapshots a message
+#[cfg(unix)]
+use insta::assert_snapshot;
 use monty_pool::{
     MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig, ResumeValue, TurnEvent,
     on_print_sync,
 };
-use monty_types::{MontyObject, PrintStream, ResourceLimits};
+// only the unix-gated raw-path test forges worker frames
+#[cfg(unix)]
+use monty_proto::{encode_framed_into, pb};
+use monty_types::{MontyObject, PrintStream, ResourceLimits, TypeCheckingConfig, TypeCheckingFormat};
 use tokio::time::sleep;
 
 /// Locates (building once if needed) the `monty` CLI binary for tests.
@@ -84,6 +95,15 @@ async fn feed_with_mounts(
             None => return Ok(event),
         }
     }
+}
+
+/// Creates a directory symlink, reporting the failure a host without the
+/// privilege gives so the caller can skip rather than fail.
+fn try_symlink_dir(original: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return symlink(original, link);
+    #[cfg(windows)]
+    return symlink_dir(original, link);
 }
 
 /// Kills a process by pid with SIGKILL — simulates a hard crash.
@@ -245,13 +265,7 @@ async fn non_utf8_mount_path_works() {
         .feed(
             "from pathlib import Path\nPath('/mnt/data/data.txt').read_text()",
             vec![],
-            vec![MountSpec {
-                virtual_path: "/mnt/data".to_owned(),
-                host_path: weird_dir,
-                mode: MountSpecMode::ReadOnly,
-                write_bytes_limit: None,
-                memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-            }],
+            vec![MountSpec::new("/mnt/data", weird_dir, MountSpecMode::ReadOnly).unwrap()],
             false,
             &mut no_print,
         )
@@ -264,38 +278,27 @@ async fn non_utf8_mount_path_works() {
     session.finish().await.unwrap();
 }
 
-/// A mount whose host path does not exist fails at `feed()` — on the parent,
-/// before any frame is sent — as a session-preserving error.
+/// A mount whose host path does not exist is rejected where the directory is
+/// opened — building the [`MountSpec`] — so no feed inherits the failure.
 #[tokio::test]
 async fn invalid_mount_host_path_is_rejected_cleanly() {
-    let pool = Pool::new(config()).await.unwrap();
-    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
-    let err = session
-        .feed(
-            "1 + 1",
-            vec![],
-            vec![MountSpec {
-                virtual_path: "/mnt/data".to_owned(),
-                host_path: PathBuf::from("/nonexistent/monty/mount/dir"),
-                mode: MountSpecMode::ReadOnly,
-                write_bytes_limit: None,
-                memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-            }],
-            false,
-            &mut no_print,
-        )
-        .await
-        .unwrap_err();
+    let err = MountSpec::new(
+        "/mnt/data",
+        PathBuf::from("/nonexistent/monty/mount/dir"),
+        MountSpecMode::ReadOnly,
+    )
+    .unwrap_err();
     let PoolError::Runtime(exc) = err else {
         panic!("expected Runtime, got {err:?}");
     };
     assert!(
-        exc.message()
-            .is_some_and(|m| m.contains("cannot canonicalize host path")),
+        exc.message().is_some_and(|m| m.contains("cannot open host path")),
         "unexpected message: {:?}",
         exc.message()
     );
-    // nothing was sent, so the worker is still synced and the session usable
+
+    let pool = Pool::new(config()).await.unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     let event = session
         .feed("1 + 1", vec![], vec![], false, &mut no_print)
         .await
@@ -312,15 +315,7 @@ async fn mounted_filesystem_ops_are_serviced_by_the_parent() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("data.txt"), "mounted!").unwrap();
 
-    let mount = || {
-        vec![MountSpec {
-            virtual_path: "/mnt".to_owned(),
-            host_path: dir.path().to_path_buf(),
-            mode: MountSpecMode::ReadWrite,
-            write_bytes_limit: None,
-            memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-        }]
-    };
+    let mount = || vec![MountSpec::new("/mnt", dir.path(), MountSpecMode::ReadWrite).unwrap()];
     let pool = Pool::new(config()).await.unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
 
@@ -353,6 +348,62 @@ body";
     session.finish().await.unwrap();
 }
 
+/// A [`MountSpec`] reused across feeds stays bound to the directory it opened:
+/// the sandbox renaming a symlink over that directory's name, from inside a
+/// read-write mount of the parent, redirects the *path* and nothing else.
+///
+/// Skipped where the host cannot create symlinks (Windows without Developer
+/// Mode or elevation), since planting the link needs one.
+#[tokio::test]
+async fn a_reused_mount_spec_survives_a_rename_of_its_host_directory() {
+    let base = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let shared = base.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::write(shared.join("inside.txt"), "in-mount").unwrap();
+    fs::write(outside.path().join("secret.txt"), "HOST SECRET").unwrap();
+    // Host-planted link out of the tree; the sandbox only moves it.
+    if try_symlink_dir(outside.path(), &base.path().join("prepared-link")).is_err() {
+        eprintln!("skipping: this host cannot create symlinks");
+        return;
+    }
+
+    // Both built once, as a host holding long-lived mount objects would.
+    let child = MountSpec::new("/child", shared, MountSpecMode::ReadOnly).unwrap();
+    let parent = MountSpec::new("/parent", base.path(), MountSpecMode::ReadWrite).unwrap();
+
+    let pool = Pool::new(config()).await.unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+
+    // Feed 1: swap the real directory out and the link in, under one name.
+    let code = "\
+from pathlib import Path
+Path('/parent/shared').rename('/parent/old-shared')
+Path('/parent/prepared-link').rename('/parent/shared')
+'swapped'";
+    let result = session.feed(code, vec![], vec![parent], false, &mut no_print).await;
+    match feed_with_mounts(&mut session, result).await {
+        Ok(event) => assert_eq!(expect_complete(event), MontyObject::String("swapped".to_owned())),
+        // Windows refuses to rename a directory while a handle to it is open,
+        // and the child mount holds one — so the swap cannot even be staged
+        // there while the mount is alive.
+        #[cfg(windows)]
+        Err(_) => return,
+        #[cfg(not(windows))]
+        Err(err) => panic!("staging the swap failed: {err:?}"),
+    }
+
+    // Feed 2: the child mount, rebuilt from the same spec, still serves the
+    // original directory and cannot see the one the name now points at.
+    let code = "\
+from pathlib import Path
+f\"{Path('/child/inside.txt').read_text()}:{Path('/child/secret.txt').exists()}\"";
+    let result = session.feed(code, vec![], vec![child], false, &mut no_print).await;
+    let event = feed_with_mounts(&mut session, result).await.unwrap();
+    assert_eq!(expect_complete(event), MontyObject::String("in-mount:False".to_owned()));
+    session.finish().await.unwrap();
+}
+
 /// A write through a read-only mount raises `PermissionError` inside the
 /// sandbox (catchable, session-preserving); overlay writes are visible within
 /// the feed, never reach the host, and are discarded when the feed ends.
@@ -361,15 +412,7 @@ async fn read_only_and_overlay_mount_semantics() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("data.txt"), "original").unwrap();
 
-    let mount = |mode| {
-        vec![MountSpec {
-            virtual_path: "/mnt".to_owned(),
-            host_path: dir.path().to_path_buf(),
-            mode,
-            write_bytes_limit: None,
-            memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-        }]
-    };
+    let mount = |mode| vec![MountSpec::new("/mnt", dir.path(), mode).unwrap()];
     let pool = Pool::new(config()).await.unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
 
@@ -431,12 +474,10 @@ msg";
         .feed(
             code,
             vec![],
-            vec![MountSpec {
-                virtual_path: "/mnt".to_owned(),
-                host_path: dir.path().to_path_buf(),
-                mode: MountSpecMode::ReadWrite,
-                write_bytes_limit: Some(10),
-                memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
+            vec![{
+                let mut spec = MountSpec::new("/mnt", dir.path(), MountSpecMode::ReadWrite).unwrap();
+                spec.write_bytes_limit = Some(10);
+                spec
             }],
             false,
             &mut no_print,
@@ -468,7 +509,7 @@ try:
 except MemoryError as exc:
     msg = str(exc)
 msg";
-    let mut spec = MountSpec::new("/mnt".to_owned(), dir.path().to_path_buf(), MountSpecMode::Overlay);
+    let mut spec = MountSpec::new("/mnt", dir.path(), MountSpecMode::Overlay).unwrap();
     spec.memory_usage_limit = 1_000;
     let result = session.feed(code, vec![], vec![spec], false, &mut no_print).await;
     let event = feed_with_mounts(&mut session, result).await.unwrap();
@@ -496,13 +537,7 @@ covered + ':' + Path('/elsewhere/file.txt').read_text()";
         .feed(
             code,
             vec![],
-            vec![MountSpec {
-                virtual_path: "/mnt".to_owned(),
-                host_path: dir.path().to_path_buf(),
-                mode: MountSpecMode::ReadOnly,
-                write_bytes_limit: None,
-                memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-            }],
+            vec![MountSpec::new("/mnt", dir.path(), MountSpecMode::ReadOnly).unwrap()],
             false,
             &mut no_print,
         )
@@ -539,15 +574,7 @@ async fn suspended_feed_restores_with_mounts_re_supplied() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("data.txt"), "after resume").unwrap();
 
-    let mount = || {
-        vec![MountSpec {
-            virtual_path: "/mnt".to_owned(),
-            host_path: dir.path().to_path_buf(),
-            mode: MountSpecMode::ReadOnly,
-            write_bytes_limit: None,
-            memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-        }]
-    };
+    let mount = || vec![MountSpec::new("/mnt", dir.path(), MountSpecMode::ReadOnly).unwrap()];
     let pool = Pool::new(config()).await.unwrap();
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     // suspend on an *uncovered* call, dump, and restore into a fresh worker
@@ -620,13 +647,7 @@ async fn restored_os_call_is_serviced_by_restore_mounts() {
     let (event, _) = restored
         .restore(
             state,
-            vec![MountSpec {
-                virtual_path: "/mnt".to_owned(),
-                host_path: dir.path().to_path_buf(),
-                mode: MountSpecMode::ReadOnly,
-                write_bytes_limit: None,
-                memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-            }],
+            vec![MountSpec::new("/mnt", dir.path(), MountSpecMode::ReadOnly).unwrap()],
             &mut no_print,
         )
         .await
@@ -1020,6 +1041,14 @@ async fn hard_child_crash_does_not_harm_the_pool() {
         matches!(err, PoolError::Crashed { .. } | PoolError::Runtime(_)),
         "got {err:?}"
     );
+    // a stack overflow aborts with SIGABRT, which must never be mistaken for the
+    // allocator's dedicated out-of-memory exit — the reason that exit exists
+    if let PoolError::Runtime(exc) = &err {
+        assert_ne!(
+            exc.message(),
+            Some("the worker exceeded its memory limit and was terminated")
+        );
+    }
 
     let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
     assert_eq!(
@@ -1093,6 +1122,252 @@ async fn child_resource_limits_do_not_kill_the_worker() {
     assert_eq!(pool.idle_workers(), 1);
 }
 
+/// A session's `max_memory` must not disturb work that stays inside it.
+#[tokio::test]
+async fn max_memory_leaves_normal_work_alone() {
+    let pool = Pool::new(config()).await.unwrap();
+    let repl_config = ReplConfig {
+        limits: Some(ResourceLimits::default().max_memory(1024 * 1024)),
+        ..ReplConfig::default()
+    };
+    let mut session = pool.checkout(&repl_config).await.unwrap();
+    assert_eq!(
+        expect_complete(
+            session
+                .feed("1 + 1", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap()
+        ),
+        MontyObject::Int(2)
+    );
+    session.finish().await.unwrap();
+}
+
+/// Only `OOM_EXIT_CODE` carries a meaning: any other code a worker might return
+/// stays an opaque death rather than being read as a memory outcome.
+#[cfg(unix)]
+#[tokio::test]
+async fn unrecognised_exit_code_stays_an_opaque_death() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("monty");
+    // outlives the parent's first write, so the death is always observed while
+    // waiting for the reply rather than racing with `sending a request`
+    fs::write(&fake, "#!/bin/sh\nsleep 0.2\nexit 64\n").unwrap();
+    fs::set_permissions(&fake, PermissionsExt::from_mode(0o755)).unwrap();
+
+    let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
+    let err = match pool.checkout(&ReplConfig::default()).await {
+        Ok(mut session) => session
+            .feed("1 + 1", vec![], vec![], false, &mut no_print)
+            .await
+            .expect_err("expected the stand-in binary to fail the turn"),
+        Err(err) => err,
+    };
+    let PoolError::Crashed { cause, .. } = &err else {
+        panic!("expected Crashed, got {err:?}");
+    };
+    assert!(
+        matches!(cause, monty_pool::CrashCause::Vanished { .. }),
+        "an unrecognised exit code must not be classified, got {cause:?}"
+    );
+    // the message says only what the pool was doing and what it reaped — no
+    // memory wording, which is what `OOM_EXIT_CODE` alone earns
+    assert_snapshot!(err.to_string(), @"monty worker crashed while waiting for a reply (exit status: 64)");
+}
+
+/// A local child cannot pass a `ShutdownDump` off as a turn-ender on the raw
+/// path: only a serving relay sends one, and accepting it would let a
+/// compromised child hand a dump it minted itself out through a relay that
+/// signs whatever it forwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_subprocess_shutdown_dump_is_refused_on_the_raw_path() {
+    let dir = tempfile::tempdir().unwrap();
+    // the two frames the stand-in replays, in order: `Ok` answers the
+    // `Configure` that establishes the session, then the forged dump
+    let mut replies = framed(&child_event(pb::child_event::Kind::Ok(pb::Ok {})));
+    replies.extend(framed(&child_event(pb::child_event::Kind::Shutdown(
+        pb::ShutdownDump {
+            dump: Some(b"a dump the child minted itself".to_vec()),
+        },
+    ))));
+    let replies_path = dir.path().join("replies.bin");
+    fs::write(&replies_path, &replies).unwrap();
+
+    let fake = dir.path().join("monty");
+    // both frames are written up front and the process stays alive; the parent
+    // reads them in turn as it sends `Configure` and then the raw request
+    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\nsleep 5\n", replies_path.display())).unwrap();
+    fs::set_permissions(&fake, PermissionsExt::from_mode(0o755)).unwrap();
+
+    let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
+    let mut checkout = pool
+        .checkout(&ReplConfig::default())
+        .await
+        .expect("the stand-in answers Configure with Ok");
+    let request = pb::ParentRequest {
+        kind: Some(pb::parent_request::Kind::Feed(pb::Feed {
+            code: "1 + 1".to_owned(),
+            inputs: vec![],
+            skip_type_check: false,
+        })),
+        ..pb::ParentRequest::default()
+    };
+    let mut on_event = |_: &pb::ChildEvent| Box::pin(ready(())) as PrintFuture;
+    let err = checkout
+        .turn_raw(&request, &mut on_event)
+        .await
+        .expect_err("a subprocess ShutdownDump must not be accepted");
+    assert_snapshot!(
+        err.to_string(),
+        @"monty worker protocol error: subprocess worker sent a ShutdownDump"
+    );
+}
+
+/// An event with no `kind` ends no turn on the raw path. Every wire field is
+/// optional, so a hostile worker can send one whose oneof is unset — it must
+/// not reach the raw driver's client as a successful turn-ender.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_event_with_no_kind_is_refused_on_the_raw_path() {
+    let dir = tempfile::tempdir().unwrap();
+    // `Ok` answers the establishing `Configure`, then the kindless frame
+    let mut replies = framed(&child_event(pb::child_event::Kind::Ok(pb::Ok {})));
+    replies.extend(framed(&pb::ChildEvent::default()));
+    let replies_path = dir.path().join("replies.bin");
+    fs::write(&replies_path, &replies).unwrap();
+
+    let fake = dir.path().join("monty");
+    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\nsleep 5\n", replies_path.display())).unwrap();
+    fs::set_permissions(&fake, PermissionsExt::from_mode(0o755)).unwrap();
+
+    let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
+    let mut checkout = pool
+        .checkout(&ReplConfig::default())
+        .await
+        .expect("the stand-in answers Configure with Ok");
+    let request = pb::ParentRequest {
+        kind: Some(pb::parent_request::Kind::Feed(pb::Feed {
+            code: "1 + 1".to_owned(),
+            inputs: vec![],
+            skip_type_check: false,
+        })),
+        ..pb::ParentRequest::default()
+    };
+    let mut on_event = |_: &pb::ChildEvent| Box::pin(ready(())) as PrintFuture;
+    let err = checkout
+        .turn_raw(&request, &mut on_event)
+        .await
+        .expect_err("a kindless event must not be accepted as a turn-ender");
+    assert_snapshot!(
+        err.to_string(),
+        @"monty worker protocol error: worker sent an event with no kind"
+    );
+}
+
+/// A `FatalError` ends a raw turn *and* the worker behind it: the frame is
+/// handed back for the driver to forward, but the dead child is reaped and
+/// discarded rather than holding its pool slot until the next failure.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fatal_error_on_the_raw_path_discards_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    // `Ok` answers the establishing `Configure`, then the fatal frame
+    let mut replies = framed(&child_event(pb::child_event::Kind::Ok(pb::Ok {})));
+    replies.extend(framed(&child_event(pb::child_event::Kind::FatalError(
+        pb::FatalError {
+            message: "the child is done".to_owned(),
+        },
+    ))));
+    let replies_path = dir.path().join("replies.bin");
+    fs::write(&replies_path, &replies).unwrap();
+
+    let fake = dir.path().join("monty");
+    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\nsleep 5\n", replies_path.display())).unwrap();
+    fs::set_permissions(&fake, PermissionsExt::from_mode(0o755)).unwrap();
+
+    let pool = Pool::new(PoolConfig::subprocess(&fake)).await.unwrap();
+    let mut checkout = pool
+        .checkout(&ReplConfig::default())
+        .await
+        .expect("the stand-in answers Configure with Ok");
+    let request = pb::ParentRequest {
+        kind: Some(pb::parent_request::Kind::Feed(pb::Feed {
+            code: "1 + 1".to_owned(),
+            inputs: vec![],
+            skip_type_check: false,
+        })),
+        ..pb::ParentRequest::default()
+    };
+    let mut on_event = |_: &pb::ChildEvent| Box::pin(ready(())) as PrintFuture;
+    let event = checkout
+        .turn_raw(&request, &mut on_event)
+        .await
+        .expect("the fatal frame is the turn-ender");
+    let Some(pb::child_event::Kind::FatalError(fatal)) = event.kind else {
+        panic!("expected the FatalError frame back, got {:?}", event.kind);
+    };
+    assert_eq!(fatal.message, "the child is done");
+    // the worker was discarded with the frame, not kept until the next failure
+    let err = checkout.turn_raw(&request, &mut on_event).await.unwrap_err();
+    assert!(matches!(err, PoolError::Finished), "got {err:?}");
+}
+
+/// Length-prefixes one event exactly as a worker writes it.
+#[cfg(unix)]
+fn framed(event: &pb::ChildEvent) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_framed_into(event, &mut buf).expect("encode");
+    buf
+}
+
+/// A `ChildEvent` carrying `kind` and nothing else.
+#[cfg(unix)]
+fn child_event(kind: pb::child_event::Kind) -> pb::ChildEvent {
+    pb::ChildEvent {
+        kind: Some(kind),
+        ..pb::ChildEvent::default()
+    }
+}
+
+/// A refused allocation is the one `Runtime` error whose worker is already
+/// dead: it reports `MemoryError` (the worker's dedicated exit code, not an
+/// unclassifiable `SIGABRT`), the checkout is finished, and the pool recovers.
+/// Needs no limit: 1 EiB dwarfs the usable address space on any 64-bit host,
+/// so the allocator refuses it regardless of overcommit policy.
+#[tokio::test]
+async fn refused_allocation_is_a_memory_error_and_the_pool_recovers() {
+    let pool = Pool::new(config()).await.unwrap();
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    // no `max_memory`, so the sandbox tracker allows this outright
+    let err = session
+        .feed("x = ' ' * (1 << 60)", vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap_err();
+    let PoolError::Runtime(exc) = err else {
+        panic!("expected Runtime, got {err:?}");
+    };
+    assert_eq!(exc.exc_type().to_string(), "MemoryError");
+    assert_eq!(
+        exc.message(),
+        Some("the worker exceeded its memory limit and was terminated")
+    );
+    // unlike an in-sandbox exception, the worker is gone with it
+    assert!(matches!(session.finish().await, Err(PoolError::Finished)));
+
+    let mut session = pool.checkout(&ReplConfig::default()).await.unwrap();
+    assert_eq!(
+        expect_complete(
+            session
+                .feed("3 + 3", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap()
+        ),
+        MontyObject::Int(6)
+    );
+    session.finish().await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn special_files_in_mounts_are_rejected_without_blocking() {
@@ -1110,13 +1385,7 @@ async fn special_files_in_mounts_are_rejected_without_blocking() {
         .feed(
             "from pathlib import Path\nPath('/mnt/pipe').read_text()",
             vec![],
-            vec![MountSpec {
-                virtual_path: "/mnt".to_owned(),
-                host_path: dir.path().to_path_buf(),
-                mode: MountSpecMode::ReadOnly,
-                write_bytes_limit: None,
-                memory_usage_limit: monty_fs::DEFAULT_MEMORY_USAGE_LIMIT,
-            }],
+            vec![MountSpec::new("/mnt", dir.path(), MountSpecMode::ReadOnly).unwrap()],
             false,
             &mut no_print,
         )
@@ -1319,6 +1588,79 @@ async fn typing_error_via_pool() {
         ),
         MontyObject::Int(2)
     );
+    session.finish().await.unwrap();
+}
+
+/// Security-critical: a reused worker's type checker must not let one
+/// session's files (script or stubs) influence the next session's checks.
+/// The same pid is asserted so this cannot pass vacuously on a fresh worker —
+/// the exact regression a broken `Reset`-time scrub would cause.
+#[tokio::test]
+async fn type_check_state_is_scrubbed_between_checkouts_on_the_same_worker() {
+    let concise = TypeCheckingConfig {
+        format: TypeCheckingFormat::Concise,
+        color: false,
+    };
+    let pool = Pool::new(config()).await.unwrap();
+
+    // Session A: commits a module-level name into `a.py` and carries stubs.
+    let mut session = pool
+        .checkout(&ReplConfig {
+            script_name: "a.py".to_owned(),
+            type_check: true,
+            type_check_stubs: Some("STUB_SECRET: str = 'from-stubs'".to_owned()),
+            type_check_config: concise,
+            ..ReplConfig::default()
+        })
+        .await
+        .unwrap();
+    let first_pid = session.pid().unwrap();
+    let event = session
+        .feed("SECRET = 'hunter2'", vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap();
+    assert_eq!(expect_complete(event), MontyObject::None);
+    session.finish().await.unwrap();
+    assert_eq!(pool.idle_workers(), 1);
+
+    // Session B runs in the SAME process; A's files must be gone.
+    let mut session = pool
+        .checkout(&ReplConfig {
+            script_name: "b.py".to_owned(),
+            type_check: true,
+            type_check_config: concise,
+            ..ReplConfig::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session.pid().unwrap(),
+        first_pid,
+        "worker was not reused — test is vacuous"
+    );
+
+    let mut probe = async |code: &str| match session.feed(code, vec![], vec![], false, &mut no_print).await {
+        Err(PoolError::Typing(diagnostics)) => diagnostics,
+        other => panic!("expected a typing rejection for {code:?}, got {other:?}"),
+    };
+    assert_eq!(
+        probe("from a import SECRET").await,
+        "b.py:1:6: error[unresolved-import] Cannot resolve imported module `a`\n"
+    );
+    assert_eq!(
+        probe("from repl_type_stubs import STUB_SECRET").await,
+        "b.py:1:6: error[unresolved-import] Cannot resolve imported module `repl_type_stubs`\n"
+    );
+    assert_eq!(
+        probe("x = STUB_SECRET").await,
+        "b.py:1:5: error[unresolved-reference] Name `STUB_SECRET` used when not defined\n"
+    );
+    // and the scrub did not damage the checker itself
+    let event = session
+        .feed("x: int = 1\nx", vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap();
+    assert_eq!(expect_complete(event), MontyObject::Int(1));
     session.finish().await.unwrap();
 }
 

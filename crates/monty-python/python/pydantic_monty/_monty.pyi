@@ -11,11 +11,13 @@ from . import (
     PrintCallback,
     ResourceLimits,
     SyncSnapshot,
+    TypeCheckFormat,
 )
 from .os_access import AbstractOS, OsFunction
 
 __all__ = [
     '__version__',
+    '_install_telemetry_adapter',
     'NOT_HANDLED',
     'AsyncMonty',
     'AsyncMontySession',
@@ -44,6 +46,9 @@ __all__ = [
     'AsyncFutureSnapshot',
 ]
 __version__: str
+
+# Private versioned hook used by the Python Logfire integration.
+def _install_telemetry_adapter(version: int, adapter: Any) -> None: ...
 
 NOT_HANDLED = object()
 
@@ -76,7 +81,46 @@ class CollectString:
 
 @final
 class MountDir:
-    """A mount point mapping a virtual path to a host directory."""
+    """A mount point mapping a virtual path to a host directory.
+
+    The directory is opened here, and every feed this mount is passed to serves
+    that same directory — so build one and reuse it. `'overlay'` writes live in
+    each feed's own table and are discarded when the feed ends.
+
+    **Warning: `mode='read-write'` writes files from untrusted code to your
+    real filesystem.**
+
+    Those files are untrusted input; do not execute them. Importing counts as
+    executing, and the import can be indirect: with a directory on `sys.path`
+    mounted, sandboxed code can write `json.py`, or any module not yet
+    imported, and the next `import` runs it. That includes imports made by
+    `pydantic_monty` itself. `sys.path[0]` is the script's directory, or the
+    cwd for `python -m`, `python -c` and the REPL.
+
+    Tools also read files without an explicit import: `conftest.py`,
+    `sitecustomize.py`, `.git/hooks/*`, `Makefile`, `.env`, `__pycache__`.
+
+    The `'overlay'` default keeps writes in memory, so nothing reaches the host
+    filesystem. Use `'read-write'` only with a directory that contains no code
+    or config and is not on `sys.path` or any other execution path.
+
+    ```python
+    from pathlib import Path
+
+    from pydantic_monty import Monty, MountDir
+
+    with Monty() as pool, MountDir(host_path=Path('host-dir'), virtual_path='/data') as mount:
+        with pool.checkout() as session:
+            contents = session.feed_run("open('/data/notes.txt').read()", mount=mount)
+    ```
+
+    The directory is held open from construction until the mount is closed, not
+    for the duration of a feed — so reusing one across feeds is free, and works
+    the same inside a `with` block or outside it. `with` (or `close()`) is what
+    hands the directory back; feeds passed a closed mount raise `ValueError`.
+    Without it the directory stays open until the object is collected: a file
+    descriptor on Unix, but on Windows that blocks renaming or deleting it.
+    """
 
     host_path: str
     virtual_path: str
@@ -100,14 +144,23 @@ class MountDir:
         names removes the ambiguity.
 
         Arguments:
-            host_path: Real host directory to expose. Canonicalized at
-                construction; raises if it doesn't exist or isn't a directory.
-                Sandbox code can never see this path or reach outside it.
+            host_path: Real host directory to expose. Opened at construction;
+                raises if it doesn't exist, isn't a directory, or cannot be
+                opened — on macOS/BSD a search-only (`0o111`) directory is not
+                mountable, though Linux accepts one. Sandbox code can never see
+                this path or reach outside it. The mount tracks the directory
+                itself rather than its name, so renaming it on the host does
+                not detach the mount; on Windows the open handle prevents the
+                host renaming or deleting it at all while the mount lives.
+                Symlinks inside it are followed only if their targets are
+                relative — an absolute target raises `PermissionError` in the
+                sandbox even when it points back into the same mount.
             virtual_path: Absolute POSIX-style path prefix inside the sandbox
                 (e.g. `'/data'`), regardless of host OS. Raises `ValueError`
                 if not absolute.
             mode: `'read-only'` — reads only, writes raise `PermissionError`;
-                `'read-write'` — writes through to the host directory;
+                `'read-write'` — writes through to the host directory, where
+                the files persist after the feed (see the warning above);
                 `'overlay'` (default) — reads fall through to the host, writes
                 are captured in memory per feed and discarded when it ends.
             write_bytes_limit: Cap on cumulative bytes written through the
@@ -118,6 +171,18 @@ class MountDir:
                 overlay data and transient filesystem results; an operation that
                 would exceed it raises `MemoryError` in the sandbox.
         """
+
+    def close(self) -> None:
+        """Release the open host directory. Idempotent.
+
+        Feeds passed this mount afterwards raise `ValueError`; the attributes
+        above keep answering. Only Windows needs this — it refuses to rename or
+        delete a directory while a handle to it is open — but `MountDir` also
+        works as a context manager, which closes on exit.
+        """
+
+    def __enter__(self) -> MountDir: ...
+    def __exit__(self, *args: object) -> bool: ...
 
 class MontyError(Exception):
     """Base exception for all Monty interpreter errors.
@@ -156,7 +221,7 @@ class MontyTypingError(MontyError):
     """Raised when type checking rejects a fed snippet.
 
     Type checking runs inside the worker subprocess; the diagnostics arrive
-    pre-rendered as text.
+    pre-rendered as text, in the `type_check_format` chosen at checkout.
 
     Inherits exception(), __str__() from MontyError.
     Cannot be constructed directly from Python.
@@ -390,9 +455,10 @@ class Monty:
                 checkouts beyond it wait for a worker to be returned.
             checkout_timeout: Seconds `checkout()` waits for a free worker
                 before raising `TimeoutError`. `None` waits forever.
-            request_timeout: Hard per-call deadline in seconds — a worker that
+            request_timeout: Parent-side deadline in seconds — a worker that
                 exceeds it is killed and the call raises `MontyCrashedError`
-                with `timed_out=True`. Backstops the sandbox `limits`.
+                with `timed_out=True`. Trusted synchronous telemetry callbacks
+                delay enforcement while they run. Backstops sandbox `limits`.
             max_checkouts_per_worker: Recycle a worker after this many sessions.
         """
 
@@ -405,6 +471,8 @@ class Monty:
         limits: ResourceLimits | None = None,
         type_check: bool = False,
         type_check_stubs: str | None = None,
+        type_check_format: TypeCheckFormat | None = None,
+        type_check_color: bool = False,
         assert_message_annotations: bool | int = ...,
         dataclass_registry: list[type] | None = None,
     ) -> MontySession:
@@ -421,6 +489,12 @@ class Monty:
                 successfully executed snippet is appended to the accumulated
                 context used for type-checking subsequent snippets.
             type_check_stubs: Stub declarations made available to type checking.
+            type_check_format: How `MontyTypingError` diagnostics are rendered;
+                `None` (the default) means `'full'`. Chosen here rather than on
+                the error because the checker's structured diagnostics never
+                leave the worker.
+            type_check_color: Render diagnostics with ANSI colour escapes; only
+                `'full'` and `'concise'` carry colour.
             assert_message_annotations: Give failed `assert` statements
                 pytest-style introspected messages, e.g.
                 `AssertionError: assert 2 == 5` — a deliberate divergence from
@@ -673,6 +747,8 @@ class AsyncMonty:
         limits: ResourceLimits | None = None,
         type_check: bool = False,
         type_check_stubs: str | None = None,
+        type_check_format: TypeCheckFormat | None = None,
+        type_check_color: bool = False,
         assert_message_annotations: bool | int = ...,
         dataclass_registry: list[type] | None = None,
     ) -> AsyncMontySession:
@@ -753,6 +829,8 @@ class AsyncMontyWebsocket:
         limits: ResourceLimits | None = None,
         type_check: bool = False,
         type_check_stubs: str | None = None,
+        type_check_format: TypeCheckFormat | None = None,
+        type_check_color: bool = False,
         assert_message_annotations: bool | int = ...,
         dataclass_registry: list[type] | None = None,
     ) -> AsyncMontySession:

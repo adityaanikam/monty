@@ -62,7 +62,7 @@
 //! Any code path that needs one of these should be added explicitly
 //! rather than relying on CPython parity.
 
-use std::{fmt::Write, mem};
+use std::fmt::Write;
 
 use monty_types::{MontyPath, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs};
 
@@ -76,7 +76,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
-    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
     intern::StaticStrings,
     os_dispatch::PendingOsEffect,
     types::str::StringRepr,
@@ -290,10 +290,6 @@ impl OpenFile {
 }
 
 impl HeapItem for OpenFile {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.path.len()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // The buffer holds a heap reference (Str/Bytes) that must be released
         // when the file is dropped. Everything else is plain Rust data.
@@ -303,7 +299,7 @@ impl HeapItem for OpenFile {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, OpenFile> {
     fn py_type(&self, vm: &VM<'h>) -> Type {
         self.get(vm.heap).file_type()
     }
@@ -333,13 +329,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
         Ok(())
     }
 
-    fn py_call_attr(
-        &mut self,
-        self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let Some(method) = attr.static_string() else {
             args.drop_with(vm);
             return Err(ExcType::attribute_error(
@@ -348,6 +338,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
             ));
         };
 
+        let self_id = self.id();
         match method {
             StaticStrings::Read => self.read(self_id, vm, args),
             StaticStrings::Readline => self.readline(self_id, vm, args),
@@ -374,7 +365,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
         true
     }
 
-    fn py_enter(&mut self, self_id: HeapId, vm: &mut VM<'h>) -> RunResult<CallResult> {
+    fn py_enter(&mut self, vm: &mut VM<'h>) -> RunResult<CallResult> {
         // Match CPython: entering on a closed file raises before the body runs.
         // (Reusing a closed file as a context manager is rare but the error
         // message is part of the user contract.)
@@ -383,11 +374,10 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
         // Value::Ref its own count — constructing a fresh Value::Ref without
         // an inc_ref would let the Drop impl panic when an in-flight value
         // is later discarded without a matching drop_with.
-        vm.heap.inc_ref(self_id);
-        Ok(CallResult::Value(Value::Ref(self_id)))
+        Ok(CallResult::Value(self.clone_value(vm.heap)))
     }
 
-    fn py_exit(&mut self, _self_id: HeapId, vm: &mut VM<'h>, _exc: Option<HeapId>) -> RunResult<CallResult> {
+    fn py_exit(&mut self, vm: &mut VM<'h>, _exc: Option<HeapId>) -> RunResult<CallResult> {
         // `with open(...) as f:` always closes the file on exit, success or
         // failure. We don't suppress exceptions: returning `None` is falsy, so
         // any in-flight exception propagates as it would in CPython.
@@ -408,10 +398,10 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
 
         let file = self.get(vm.heap);
         let value = match method {
-            StaticStrings::Name => allocate_string(file.path.clone(), vm.heap)?,
-            StaticStrings::Mode => allocate_string(file.mode.as_str().to_owned(), vm.heap)?,
+            StaticStrings::Name => allocate_string(file.path.clone(), vm.heap),
+            StaticStrings::Mode => allocate_string(file.mode.as_str().to_owned(), vm.heap),
             StaticStrings::Closed => Value::Bool(file.closed),
-            StaticStrings::Encoding if !file.mode.is_binary() => allocate_string("utf-8", vm.heap)?,
+            StaticStrings::Encoding if !file.mode.is_binary() => allocate_string("utf-8", vm.heap),
             _ => {
                 return Err(ExcType::attribute_error(
                     self.py_type(vm).name(vm.heap, vm.interns),
@@ -444,7 +434,7 @@ impl<'h> HeapRead<'h, OpenFile> {
                 }
                 file.mode.is_binary()
             };
-            Ok(CallResult::Value(empty_result(binary, vm.heap)?))
+            Ok(CallResult::Value(empty_result(binary, vm.heap)))
         } else {
             self.read_with_spec(self_id, vm, spec)
         }
@@ -616,15 +606,10 @@ impl<'h> HeapRead<'h, OpenFile> {
 
     /// Marks the file wrapper as closed and releases the cached read buffer.
     ///
-    /// Releasing the buffer matters for **resource accounting**: the
-    /// full-file buffer is a separate heap entry whose `py_estimate_size`
-    /// counts against `max_memory`. Without an explicit release here a
-    /// closed file would keep its (potentially large) buffer alive until
-    /// the file object's Python-level refcount drops to zero — long after
-    /// the user has signalled they're done with it. By `dec_ref`ing the
-    /// buffer here, `current_memory()` drops by the buffer size as soon as
-    /// `close()` returns, matching CPython's behaviour and giving the user
-    /// a deterministic way to free file-cache memory.
+    /// Without an explicit release, a closed file would keep its potentially
+    /// large buffer alive until the file object's Python refcount reaches zero.
+    /// Releasing it here promptly returns allocator-backed memory when no other
+    /// value owns the buffered data.
     ///
     /// Other holders (e.g. a `data = f.read()` reference) keep the entry
     /// alive via their own refcounts, so this release is safe — it only
@@ -766,12 +751,12 @@ pub(crate) fn apply_buffer_store(file_id: HeapId, result: Value, vm: &mut VM<'_>
         // promote interned strings to heap-resident Str
         &mut Value::InternString(string_id) => {
             let s = vm.interns.get_str(string_id).to_owned();
-            *result = allocate_string_no_interning(s, vm.heap)?;
+            *result = allocate_string_no_interning(s, vm.heap);
         }
         // promote interned bytes to heap-resident Bytes
         &mut Value::InternBytes(bytes_id) => {
             let b = vm.interns.get_bytes(bytes_id).to_vec();
-            *result = Value::Ref(vm.heap.allocate(HeapData::Bytes(Bytes::new(b)))?);
+            *result = Value::Ref(vm.heap.allocate(HeapData::Bytes(Bytes::new(b))));
         }
         _ => {
             return Err(RunError::internal(
@@ -930,7 +915,7 @@ fn compute_slice_text<'h>(
                     vm.heap.inc_ref(buffer_id);
                     Value::Ref(buffer_id)
                 } else {
-                    allocate_string(tail.to_owned(), vm.heap)?
+                    allocate_string(tail.to_owned(), vm.heap)
                 };
                 // Preserve `position` if it was already past `buffer_total`
                 // (set there by `seek()`) — CPython's read-at-EOF leaves the
@@ -943,7 +928,7 @@ fn compute_slice_text<'h>(
                 let take = buffer_total.saturating_sub(position).min(n);
                 let bytes_taken = tail.char_indices().nth(take).map_or(tail.len(), |(i, _)| i);
                 let slice = &tail[..bytes_taken];
-                let value = allocate_string(slice.to_owned(), vm.heap)?;
+                let value = allocate_string(slice.to_owned(), vm.heap);
                 let new_pos = position + take;
                 let new_byte_pos = byte_position + bytes_taken;
                 (value, new_pos, new_byte_pos, new_pos >= buffer_total)
@@ -956,7 +941,7 @@ fn compute_slice_text<'h>(
                     }
                     None => (tail, tail.chars().count()),
                 };
-                let value = allocate_string(slice.to_owned(), vm.heap)?;
+                let value = allocate_string(slice.to_owned(), vm.heap);
                 let new_pos = position + chars_consumed;
                 let new_byte_pos = byte_position + slice.len();
                 (value, new_pos, new_byte_pos, new_pos >= buffer_total)
@@ -968,10 +953,10 @@ fn compute_slice_text<'h>(
                     let rest = &tail[start..];
                     let end = rest.find('\n').map_or(rest.len(), |i| i + 1);
                     let line = &rest[..end];
-                    items.push(allocate_string(line.to_owned(), vm.heap)?);
+                    items.push(allocate_string(line.to_owned(), vm.heap));
                     start += end;
                 }
-                let list_id = vm.heap.allocate(HeapData::List(List::new(items)))?;
+                let list_id = vm.heap.allocate(HeapData::List(List::new(items)));
                 // Past-EOF preservation: matches `ReadSpec::All`.
                 (Value::Ref(list_id), position.max(buffer_total), buffer.len(), true)
             }
@@ -1032,7 +1017,7 @@ fn compute_slice_binary<'h>(
                     vm.heap.inc_ref(buffer_id);
                     Value::Ref(buffer_id)
                 } else {
-                    let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail.to_vec())))?;
+                    let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail.to_vec())));
                     Value::Ref(id)
                 };
                 // Preserve `position` if it was already past `buffer_total`
@@ -1042,7 +1027,7 @@ fn compute_slice_binary<'h>(
             }
             ReadSpec::Size(n) => {
                 let take = tail.len().min(n);
-                let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail[..take].to_vec())))?;
+                let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail[..take].to_vec())));
                 // Advance from the un-clamped user position so a past-EOF
                 // `read(N)` (which yields no bytes) leaves `position` alone
                 // instead of snapping it back to `buffer_total`.
@@ -1051,7 +1036,7 @@ fn compute_slice_binary<'h>(
             }
             ReadSpec::Line => {
                 let end = tail.iter().position(|b| *b == b'\n').map_or(tail.len(), |i| i + 1);
-                let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail[..end].to_vec())))?;
+                let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(tail[..end].to_vec())));
                 // See `Size` above — past-EOF `readline()` returns `b''`
                 // without rewinding `position`.
                 let new_pos = position + end;
@@ -1063,11 +1048,11 @@ fn compute_slice_binary<'h>(
                 while start < tail.len() {
                     let rest = &tail[start..];
                     let end = rest.iter().position(|b| *b == b'\n').map_or(rest.len(), |i| i + 1);
-                    let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(rest[..end].to_vec())))?;
+                    let id = vm.heap.allocate(HeapData::Bytes(Bytes::new(rest[..end].to_vec())));
                     items.push(Value::Ref(id));
                     start += end;
                 }
-                let list_id = vm.heap.allocate(HeapData::List(List::new(items)))?;
+                let list_id = vm.heap.allocate(HeapData::List(List::new(items)));
                 // Past-EOF preservation: matches `ReadSpec::All`.
                 (Value::Ref(list_id), position.max(buffer_total), true)
             }
@@ -1268,12 +1253,11 @@ fn parse_read_size_arg(size_arg: Option<Value>, vm: &mut VM<'_>) -> RunResult<Re
 /// path so a hot `read(0)` does not allocate. Binary mode still allocates
 /// a fresh empty `Bytes` because there is no equivalent interned bytes
 /// singleton.
-fn empty_result(binary: bool, heap: &mut Heap) -> RunResult<Value> {
+fn empty_result(binary: bool, heap: &mut Heap) -> Value {
     if binary {
-        let id = heap.allocate(HeapData::Bytes(Bytes::new(Vec::new())))?;
-        Ok(Value::Ref(id))
+        Value::Ref(heap.allocate(HeapData::Bytes(Bytes::new(Vec::new()))))
     } else {
-        Ok(Value::InternString(StaticStrings::EmptyString.into()))
+        Value::InternString(StaticStrings::EmptyString.into())
     }
 }
 

@@ -4,14 +4,15 @@
 //! consumes semantic WIT requests and returns semantic events. The child still
 //! shares `monty-proto`'s state machine, but protobuf bytes never cross the
 //! component boundary or enter the TypeScript host.
+#![expect(unsafe_code, reason = "generated canonical-ABI exports require unsafe code")]
 
 use std::{cell::RefCell, io};
 
 use monty_proto::{
-    DEFAULT_MAX_DECODE_BYTES, FrameError, MAX_FRAME_LEN, MONTY_VERSION, exceeds_max_frame_len, pb,
+    DEFAULT_MAX_DECODE_BYTES, FrameError, MAX_FRAME_LEN, PROTOCOL_VERSION, exceeds_max_frame_len, pb,
     worker::{Child, EventSink, HandleOutcome, protocol_violation},
 };
-use monty_types::{ExcType, MontyException, MontyObject, OsFunctionCall};
+use monty_types::{ExcType, MONTY_VERSION, MontyException, MontyObject, OsFunctionCall};
 
 #[expect(
     clippy::same_length_and_capacity,
@@ -25,20 +26,40 @@ mod value;
 
 use bindings::exports::pydantic::monty::worker::{
     CallResult, ConfigureRequest, DispatchResult, Event, FunctionCallEvent, Guest, NameLookupResult, OsCallEvent,
-    PrintEvent, RaisedException, Request, StackFrame, Status, ValuePair,
+    PrintEvent, RaisedException, Request, StackFrame, Status, TypeCheckFormat, ValuePair,
 };
 
 thread_local! {
     /// The session worker, retained for the lifetime of this component instance.
-    static CHILD: RefCell<Child> = RefCell::new(Child::new());
+    static CHILD: RefCell<Child> = RefCell::new(Child::default());
 }
+
+/// Counts component allocations against the session's `max_memory` limit.
+///
+/// Linear memory does not shrink, so the allocator tracks live allocations;
+/// crossing its hard ceiling traps the instance and lets the pool replace it.
+#[global_allocator]
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 
 /// Implements the typed component export over Monty's protocol child.
 struct Component;
 
 impl Guest for Component {
     fn dispatch(request: Request) -> DispatchResult {
-        CHILD.with_borrow_mut(|child| dispatch(child, request))
+        let (result, allocator_ready) = CHILD.with_borrow_mut(|child| {
+            let result = dispatch(child, request);
+            let budget = child.session_budget();
+            let allocator_ready = monty_alloc::set_limit(budget.max_memory, budget.type_check);
+            (result, allocator_ready)
+        });
+        if let Err(error) = allocator_ready {
+            DispatchResult {
+                status: Status::Shutdown,
+                events: vec![Event::FatalError(error.to_owned())],
+            }
+        } else {
+            result
+        }
     }
 }
 
@@ -227,6 +248,24 @@ fn configure_from_component(request: ConfigureRequest) -> pb::Configure {
         type_check_stubs: request.type_check_stubs,
         monty_version: MONTY_VERSION.to_owned(),
         assert_message_annotations: request.assert_message_annotations,
+        type_check_format: i32::from(type_check_format_from_component(request.type_check_format)),
+        type_check_color: request.type_check_color,
+        protocol_version: PROTOCOL_VERSION,
+    }
+}
+
+/// Converts the component's diagnostic format into the protocol enum.
+fn type_check_format_from_component(format: TypeCheckFormat) -> pb::TypeCheckFormat {
+    match format {
+        TypeCheckFormat::Full => pb::TypeCheckFormat::Full,
+        TypeCheckFormat::Concise => pb::TypeCheckFormat::Concise,
+        TypeCheckFormat::Azure => pb::TypeCheckFormat::Azure,
+        TypeCheckFormat::Json => pb::TypeCheckFormat::Json,
+        TypeCheckFormat::JsonLines => pb::TypeCheckFormat::JsonLines,
+        TypeCheckFormat::Rdjson => pb::TypeCheckFormat::Rdjson,
+        TypeCheckFormat::Pylint => pb::TypeCheckFormat::Pylint,
+        TypeCheckFormat::Gitlab => pb::TypeCheckFormat::Gitlab,
+        TypeCheckFormat::Github => pb::TypeCheckFormat::Github,
     }
 }
 

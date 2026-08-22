@@ -21,7 +21,7 @@ use crate::{
     heap_data::CellValue,
     intern::{FunctionId, StaticStrings, StringId},
     modules::dataclasses,
-    os_dispatch::PendingOsEffect,
+    os_dispatch::{PendingOsEffect, release_pending_effect},
     types::{
         Dict, Instance, PyTrait, Type, bytes::call_bytes_method, construct_namedtuple, instance::class_name,
         str::call_str_method,
@@ -68,11 +68,9 @@ pub(crate) enum CallResult {
     /// [`PendingOsEffect`] instead of being pushed onto the operand stack raw.
     ///
     /// Used by buffered file reads (`BufferStore`), buffered writes
-    /// (`WritePosition`), and `os.listdir` (`ListdirNames`). Carrying the
-    /// effect *in* the result — armed on the VM only at dispatch — guarantees
-    /// a call that is rejected and dropped without dispatch (e.g. inside a
-    /// synchronous nested-call context, see `unsupported_call_result`) cannot
-    /// leave a stale effect behind to corrupt the next OS call's resume.
+    /// (`WritePosition`), and `os.listdir` (`ListdirNames`). The effect stays
+    /// *in* the value, handed on to `FrameExit::OsCall`, so a call rejected on
+    /// the way out cannot corrupt the next OS call's resume.
     OsCallWithEffect {
         call: OsFunctionCall,
         effect: PendingOsEffect,
@@ -90,12 +88,8 @@ impl<C: ContainsHeap> DropWithContext<C> for CallResult {
             Self::FramePushed => {}
             Self::OsCallWithEffect { call, effect } => {
                 call.drop_with(heap);
-                // Single pin (see `inc_ref_for_pending_oscall`): release one
-                // ref if the call is discarded before dispatch arms the
-                // effect on `pending_os_effect`.
-                if let Some(file_id) = effect.pinned_file() {
-                    heap.heap_mut().dec_ref(file_id);
-                }
+                // Discarded before it ever became a `FrameExit`.
+                release_pending_effect(Some(effect), heap);
             }
         }
     }
@@ -341,7 +335,7 @@ impl VM<'_> {
         match obj {
             Value::Ref(heap_id) => {
                 defer_drop!(obj, this);
-                this.heap.read(heap_id).py_call_attr(heap_id, this, &attr, args)
+                this.heap.read(heap_id).py_call_attr(this, &attr, args)
             }
             Value::InternString(string_id) => {
                 // Call string method on interned string literal using the unified dispatcher
@@ -793,12 +787,12 @@ impl VM<'_> {
         func.signature.bind(args, defaults, this, func.name, namespace)?;
 
         // 3. Install owned cells and captured free-var cells at their slots.
-        this.install_closure_cells(func, cells, namespace)?;
+        this.install_closure_cells(func, cells, namespace);
 
         // 4. Create Coroutine on heap
         let (namespace, this) = namespace_guard.into_parts();
         let coroutine = Coroutine::new(func_id, namespace);
-        let coroutine_id = this.heap.allocate(HeapData::Coroutine(coroutine))?;
+        let coroutine_id = this.heap.allocate(HeapData::Coroutine(coroutine));
 
         Ok(CallResult::Value(Value::Ref(coroutine_id)))
     }
@@ -819,12 +813,7 @@ impl VM<'_> {
     /// during preparation, outside the contiguous param/cell/free region — so a
     /// positional `push` would place it wrong. Shared by sync calls and
     /// coroutine creation.
-    fn install_closure_cells(
-        &mut self,
-        func: &Function,
-        cells: &[HeapId],
-        namespace: &mut Vec<Value>,
-    ) -> Result<(), RunError> {
+    fn install_closure_cells(&mut self, func: &Function, cells: &[HeapId], namespace: &mut Vec<Value>) {
         namespace.resize_with(func.namespace_size, || Value::Undefined);
 
         for (i, &slot) in func.cell_var_slots.iter().enumerate() {
@@ -832,7 +821,7 @@ impl VM<'_> {
                 Some(param_idx) => namespace[param_idx].clone_with_heap(self),
                 None => Value::Undefined,
             };
-            let cell_id = self.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
+            let cell_id = self.heap.allocate(HeapData::Cell(CellValue(cell_value)));
             namespace[slot.index()] = Value::Ref(cell_id);
         }
 
@@ -840,8 +829,6 @@ impl VM<'_> {
             self.heap.inc_ref(cell_id);
             namespace[func.free_var_slots[i].index()] = Value::Ref(cell_id);
         }
-
-        Ok(())
     }
 
     /// Calls a sync function by pushing a new frame.
@@ -866,13 +853,6 @@ impl VM<'_> {
         let namespace_size = func.namespace_size;
         let locals_count = u16::try_from(namespace_size).expect("function namespace size exceeds u16");
 
-        // Track memory for this frame's locals. Symmetric with
-        // `cleanup_frame_state`. Comprehension variables live on the operand
-        // stack (pushed per-comp), not in any frame-level region, so they
-        // don't enter this accounting.
-        let size = namespace_size * mem::size_of::<Value>();
-        self.heap.tracker_mut().on_grow(|| size)?;
-
         // 1. Build the namespace in the reusable scratch buffer to avoid a
         //    per-call allocation. On error `DropGuard` drops the buffer, so the
         //    pool just restarts empty next call.
@@ -885,14 +865,11 @@ impl VM<'_> {
         {
             let bind_result = func.signature.bind(args, defaults, this, func.name, namespace);
 
-            if let Err(e) = bind_result {
-                this.heap.tracker_mut().on_free(|| size);
-                return Err(e);
-            }
+            bind_result?;
         }
 
         // 3. Install owned cells and captured free-var cells at their slots.
-        this.install_closure_cells(func, cells, namespace)?;
+        this.install_closure_cells(func, cells, namespace);
 
         let code = &func.code;
 
@@ -942,17 +919,9 @@ impl VM<'_> {
     /// on external/OS calls; the `is_initializer` flag is threaded through frame
     /// serialization so a suspended initializer resumes correctly.
     fn instantiate_class(&mut self, class_id: HeapId, args: ArgValues) -> Result<CallResult, RunError> {
-        // Allocate the instance. On allocation failure drop the args we own.
-        let instance_id = match self
+        let instance_id = self
             .heap
-            .allocate(HeapData::Instance(Box::new(Instance::new(class_id, Dict::new()))))
-        {
-            Ok(id) => id,
-            Err(e) => {
-                args.drop_with(self);
-                return Err(e.into());
-            }
-        };
+            .allocate(HeapData::Instance(Box::new(Instance::new(class_id, Dict::new()))));
         // The instance now owns a reference to its class object.
         self.heap.inc_ref(class_id);
 
@@ -1109,7 +1078,7 @@ fn dispatch_dunder(
         StaticStrings::Enter => {
             let args = args.take().expect("dispatch_dunder called with empty args slot");
             args.check_zero_args("__enter__", vm.heap)
-                .and_then(|()| vm.heap.read(heap_id).py_enter(heap_id, vm))
+                .and_then(|()| vm.heap.read(heap_id).py_enter(vm))
         }
         StaticStrings::Exit => {
             let args = args.take().expect("dispatch_dunder called with empty args slot");
@@ -1149,5 +1118,5 @@ fn dispatch_exit(heap_id: HeapId, vm: &mut VM<'_>, args: ArgValues) -> Result<Ca
         Value::Ref(id) => Some(*id),
         _ => None,
     };
-    vm.heap.read(heap_id).py_exit(heap_id, vm, exc)
+    vm.heap.read(heap_id).py_exit(vm, exc)
 }

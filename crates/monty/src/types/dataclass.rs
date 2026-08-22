@@ -1,7 +1,6 @@
 use std::{
     fmt::Write,
     hash::{DefaultHasher, Hash, Hasher},
-    mem,
 };
 
 use serde::ser::SerializeStruct;
@@ -14,8 +13,8 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunResult, SimpleException},
     hash::HashValue,
     heap::{
-        BorrowedHeapRead, BorrowedHeapReadMut, DropGuard, DropWithContext, HeapId, HeapItem, HeapRead, HeapReadOutput,
-        heap_read_ref_as_field, heap_read_ref_as_field_mut,
+        BorrowedHeapRead, BorrowedHeapReadMut, DropGuard, DropWithContext, HeapId, HeapItem, HeapObjectRead, HeapRead,
+        HeapReadOutput, heap_read_ref_as_field, heap_read_ref_as_field_mut,
     },
     intern::Interns,
     types::Type,
@@ -148,7 +147,7 @@ impl<'h> HeapRead<'h, Dataclass> {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, Dataclass> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Dataclass
     }
@@ -160,7 +159,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
 
     fn py_set_attr(&mut self, name: &EitherStr, value: Value, vm: &mut VM<'h>) -> RunResult<()> {
         let mut value_guard = DropGuard::new(value, vm);
-        let name = attribute_name_value(name, value_guard.ctx())?;
+        let name = attribute_name_value(name, value_guard.ctx());
         let (value, vm) = value_guard.into_parts();
         let old_value = self.set_attr(name, value, vm)?;
         old_value.drop_with(vm);
@@ -181,7 +180,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
     /// Hashes a frozen dataclass by its class name and the values of declared fields.
     ///
     /// Mutable (non-frozen) dataclasses return `None` (unhashable).
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         // Only frozen (immutable) dataclasses are hashable
         if !self.get(vm.heap).frozen {
             return Ok(None);
@@ -235,13 +234,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
     /// Otherwise handles the call directly:
     /// - Attributes that exist in attrs but aren't callable produce `TypeError`
     /// - Private/dunder attributes that aren't in attrs produce `AttributeError`
-    fn py_call_attr(
-        &mut self,
-        self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let attr_str = attr.as_str(vm.interns);
         // Only public methods (no underscore prefix = no dunders, no private)
         if !attr_str.starts_with('_')
@@ -253,8 +246,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
         {
             // Clone self and prepend to args for the method call
             // inc_ref works even when data is taken out (refcount metadata is separate)
-            vm.heap.inc_ref(self_id);
-            let self_arg = Value::Ref(self_id);
+            let self_arg = self.clone_value(vm.heap);
             let args_with_self = args.prepend(self_arg);
             Ok(CallResult::MethodCall(attr.clone(), args_with_self))
         } else {
@@ -314,7 +306,7 @@ pub(crate) fn write_dataclass_repr<'h>(
         if i > 0 {
             // Same between-item checkpoint as sequence repr, so a wide dataclass
             // cannot outrun `max_duration`.
-            if vm.heap.check_time().is_err() {
+            if vm.heap.tracker.check_memory_time_every(i).is_err() {
                 f.write_str(", ...[timeout]")?;
                 break;
             }
@@ -335,13 +327,6 @@ pub(crate) fn write_dataclass_repr<'h>(
 }
 
 impl HeapItem for Dataclass {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.name.py_estimate_size()
-            + self.field_names.iter().map(String::len).sum::<usize>()
-            + self.attrs.py_estimate_size()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Delegate to the attrs Dict which handles all nested heap references
         self.attrs.py_dec_ref_ids(stack);

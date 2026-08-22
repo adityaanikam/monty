@@ -28,7 +28,7 @@ impl VM<'_> {
             result.push_str(part_str.to_str(this)?);
         }
 
-        let value = allocate_string(result, this.heap)?;
+        let value = allocate_string(result, this.heap);
         this.push(value);
         Ok(())
     }
@@ -81,7 +81,7 @@ impl VM<'_> {
 
                 // Pre-check: reject format specs with huge width before pad_string
                 // allocates an untracked Rust String.
-                check_repeat_size(spec.width, spec.fill.len_utf8(), this.heap.tracker())?;
+                check_repeat_size(spec.width, spec.fill.len_utf8(), &this.heap.tracker)?;
 
                 if conversion == 0 {
                     // No conversion: format the original value through its own
@@ -114,7 +114,7 @@ impl VM<'_> {
             }
         };
 
-        let result = allocate_string(formatted, this.heap)?;
+        let result = allocate_string(formatted, this.heap);
         this.push(result);
         Ok(())
     }

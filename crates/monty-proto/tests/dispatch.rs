@@ -5,13 +5,13 @@
 //! `Child` state machine over the message-based transport without any wasm
 //! toolchain.
 
-use monty::{MontyRepl, ReplProgress};
+use monty::{DUMP_VERSION, MontyRepl, ReplProgress, SessionRef, dump};
 use monty_proto::{
-    FrameReader, MONTY_VERSION, WireObject, pb,
-    worker::{Child, DUMP_VERSION, HandleOutcome, dispatch_frame},
+    FrameReader, PROTOCOL_VERSION, WireObject, pb,
+    worker::{Child, HandleOutcome, dispatch_frame},
     write_frame,
 };
-use monty_types::{CompileOptions, MontyObject, PrintWriter, ResourceTracker};
+use monty_types::{CompileOptions, MONTY_VERSION, MontyObject, PrintWriter, ResourceTracker};
 
 /// Frames one request the way a host transport would before posting it.
 fn frame_request(kind: pb::parent_request::Kind) -> Vec<u8> {
@@ -60,6 +60,8 @@ fn create_repl(child: &mut Child) {
         type_check_stubs: None,
         assert_message_annotations: None,
         monty_version: MONTY_VERSION.to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        ..Default::default()
     }));
     let (bytes, outcome) = dispatch_frame(child, &request);
     assert_eq!(outcome, HandleOutcome::Continue);
@@ -93,7 +95,7 @@ fn expect_complete(event: pb::child_event::Kind) -> MontyObject {
 
 #[test]
 fn feed_round_trips_a_value() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let (_, event) = feed(&mut child, "1 + 2");
@@ -102,7 +104,7 @@ fn feed_round_trips_a_value() {
 
 #[test]
 fn session_state_persists_across_feeds() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let (_, first) = feed(&mut child, "x = 21");
@@ -114,7 +116,7 @@ fn session_state_persists_across_feeds() {
 
 #[test]
 fn print_output_is_streamed_before_the_terminator() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let (prints, event) = feed(&mut child, "print('hello'); print('world')");
@@ -125,7 +127,7 @@ fn print_output_is_streamed_before_the_terminator() {
 
 #[test]
 fn inputs_are_injected() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let request = frame_request(pb::parent_request::Kind::Feed(pb::Feed {
@@ -144,7 +146,7 @@ fn inputs_are_injected() {
 
 #[test]
 fn malformed_request_frame_is_recoverable() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     // a length prefix claiming bytes that aren't there: structurally broken
     // framing, not a decode error
     let (bytes, outcome) = dispatch_frame(&mut child, &[0xff, 0xff, 0xff, 0x7f]);
@@ -157,7 +159,7 @@ fn malformed_request_frame_is_recoverable() {
 
 #[test]
 fn shutdown_request_reports_shutdown() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let request = frame_request(pb::parent_request::Kind::Shutdown(pb::Shutdown {}));
@@ -169,14 +171,18 @@ fn shutdown_request_reports_shutdown() {
     );
 }
 
-/// Dumps from the generic-iterator format are explicitly rejected.
+/// A dump written by a different `DUMP_VERSION` is rejected, and the error
+/// names both versions so a host can tell a stale snapshot from a corrupt one.
 #[test]
 fn load_rejects_old_dump_version() {
-    let mut child = Child::new();
+    // a real dump rewound to the previous version, so only the version is wrong
+    let repl = MontyRepl::new("main.py", ResourceTracker::default(), CompileOptions::default());
+    let mut state = dump("main.py", None, SessionRef::Idle(&repl)).expect("dumping an idle repl succeeds");
+    state[6..8].copy_from_slice(&(DUMP_VERSION - 1).to_le_bytes());
+
+    let mut child = Child::default();
     create_repl(&mut child);
-    let request = frame_request(pb::parent_request::Kind::Load(pb::Load {
-        state: 5u16.to_le_bytes().to_vec(),
-    }));
+    let request = frame_request(pb::parent_request::Kind::Load(pb::Load { state }));
     let (bytes, outcome) = dispatch_frame(&mut child, &request);
     assert_eq!(outcome, HandleOutcome::Continue);
     let (_, event) = split_turn(&bytes);
@@ -185,7 +191,10 @@ fn load_rejects_old_dump_version() {
     };
     assert_eq!(
         error.exception.unwrap().message.unwrap(),
-        "protocol violation: unsupported dump version 5 (expected 6)"
+        format!(
+            "protocol violation: failed to load session: dump format version {}, this build reads {DUMP_VERSION}",
+            DUMP_VERSION - 1
+        )
     );
 }
 
@@ -206,19 +215,9 @@ fn load_rejects_dump_with_over_deep_suspension_args() {
         matches!(progress, ReplProgress::FunctionCall(_)),
         "expected a FunctionCall suspension"
     );
-    let payload = progress.dump().expect("in-process dump has no depth bound");
+    let state = dump("main.py", None, SessionRef::Suspended(&progress)).expect("in-process dump has no depth bound");
 
-    // Assemble the dump envelope the way `Dump` does: [version u16 LE]
-    // [tag u8 = 1 (suspended)][script_name str][type_check u8 = 0][payload].
-    let mut state = DUMP_VERSION.to_le_bytes().to_vec();
-    state.push(1);
-    let script_name = b"main.py";
-    state.extend_from_slice(&u32::try_from(script_name.len()).unwrap().to_le_bytes());
-    state.extend_from_slice(script_name);
-    state.push(0);
-    state.extend_from_slice(&payload);
-
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
     let request = frame_request(pb::parent_request::Kind::Load(pb::Load { state }));
     let (bytes, outcome) = dispatch_frame(&mut child, &request);

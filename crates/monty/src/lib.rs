@@ -23,6 +23,7 @@ mod namespace;
 mod object_bridge;
 mod os_dispatch;
 mod parse;
+mod predicate;
 mod prepare;
 mod repl;
 mod resource_checks;
@@ -38,6 +39,7 @@ mod value;
 #[cfg(feature = "ref-count-return")]
 pub use crate::run::RefCountOutput;
 pub use crate::{
+    dump_format::{DUMP_VERSION, Dump, DumpError, Session, SessionRef, dump},
     repl::{
         MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
         ReplResolveFutures, ReplStartError, detect_repl_continuation_mode,

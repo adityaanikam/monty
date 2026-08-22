@@ -3,7 +3,13 @@
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::Instant;
-use std::{cell::Cell, error::Error, fmt, time::Duration};
+use std::{
+    cell::Cell,
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 // `std::time::Instant::now()` panics ("time not implemented on this platform")
 // on `wasm32-unknown-unknown`, so any `max_duration` limit aborts there. Swap in
@@ -12,6 +18,18 @@ use std::{cell::Cell, error::Error, fmt, time::Duration};
 // dependency is pulled in only where it's needed (see Cargo.toml).
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::Instant;
+
+/// Exit code a worker uses when it exceeded its memory limit or the allocator
+/// refused an allocation, so the parent can report `MemoryError` instead of an
+/// unclassifiable `SIGABRT`.
+///
+/// `EX_DATAERR` from BSD `sysexits.h`. See <https://man.freebsd.org/cgi/man.cgi?query=sysexits>.
+pub const OOM_EXIT_CODE: i32 = 65;
+/// Allocator-backed live bytes requested through the global allocator
+pub static LIVE_MEMORY: AtomicUsize = AtomicUsize::new(0);
+/// The leanest the process has ever been at an arming point: what the worker
+/// costs to exist, before any session ran.
+pub static BASELINE_MEMORY: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Threshold in bytes above which `check_large_result` is called.
 ///
@@ -68,7 +86,9 @@ impl Error for ResourceError {}
 pub struct ResourceLimits {
     /// Maximum execution time.
     pub max_duration: Option<Duration>,
-    /// Maximum heap memory in bytes (approximate).
+    /// Maximum allocator-backed memory in bytes.
+    ///
+    /// Requires the executable to install and arm `monty-alloc`.
     pub max_memory: Option<usize>,
     /// Run garbage collection every N GC-tracked allocations.
     pub gc_interval: Option<usize>,
@@ -99,7 +119,10 @@ impl ResourceLimits {
         self
     }
 
-    /// Sets the maximum memory usage in bytes.
+    /// Sets allocator-backed maximum memory usage in bytes.
+    ///
+    /// Requires the executable to install and arm `monty-alloc`; otherwise
+    /// the limit is silently not enforced.
     #[must_use]
     pub fn max_memory(mut self, limit: usize) -> Self {
         self.max_memory = Some(limit);
@@ -121,22 +144,12 @@ impl ResourceLimits {
     }
 }
 
-/// How often to actually check `Instant::elapsed()` in `check_time`.
-///
-/// Calling `Instant::elapsed()` on every `check_time` invocation adds measurable
-/// overhead in tight loops (the VM calls `check_time` on every instruction).
-/// By only checking every N calls, we reduce this overhead while still catching
-/// timeouts promptly.
-const TIME_CHECK_INTERVAL: u16 = 10;
-
 /// A resource tracker that enforces configurable limits.
 ///
-/// Tracks memory usage and execution time, returning errors when limits
-/// are exceeded. Also schedules garbage collection at configurable
-/// intervals.
+/// Checks allocator-backed memory usage and tracks execution time, returning
+/// errors when limits are exceeded. It also schedules garbage collection.
 ///
-/// Uses `Cell` for interior mutability to allow many methods which take
-/// `&self` (enabling `&self` on critical methods such as `Heap::allocate`).
+/// Uses `Cell` for mutable timing and recursion state behind shared references.
 ///
 /// `max_duration` limits *cumulative execution time*: the clock runs only
 /// while the VM is executing bytecode (between the outermost
@@ -159,10 +172,6 @@ pub struct ResourceTracker {
     /// executing.
     #[serde(skip)]
     running_since: Cell<Option<Instant>>,
-    /// Current approximate memory usage in bytes.
-    current_memory: Cell<usize>,
-    /// Counter for rate-limiting `Instant::elapsed()` calls in `check_time`.
-    check_counter: Cell<u16>,
     /// Optional override applied on top of `limits.max_recursion_depth`.
     ///
     /// `None` (the default — also the value any pre-`test-hooks` snapshot
@@ -192,15 +201,15 @@ impl ResourceTracker {
     ///
     /// The execution-time clock starts at zero and only runs while the VM
     /// executes, so the tracker can be created any amount of time before
-    /// the first run without consuming the duration budget.
+    /// the first run without consuming the duration budget. A configured
+    /// `max_memory` requires `monty-alloc` installed as the global allocator
+    /// and armed via its `set_limit`; otherwise it is silently not enforced.
     #[must_use]
     pub fn new(limits: ResourceLimits) -> Self {
         Self {
             limits,
             total_execution_time: Cell::new(Duration::ZERO),
             running_since: Cell::new(None),
-            current_memory: Cell::new(0),
-            check_counter: Cell::new(0),
             recursion_limit_override: Cell::new(None),
         }
     }
@@ -212,15 +221,6 @@ impl ResourceTracker {
         self.recursion_limit_override
             .get()
             .unwrap_or(self.limits.max_recursion_depth)
-    }
-
-    /// Returns the current approximate memory usage.
-    ///
-    /// Only meaningful when a `max_memory` limit is configured — without one
-    /// the tracker skips memory accounting entirely and this stays 0.
-    #[must_use]
-    pub fn current_memory(&self) -> usize {
-        self.current_memory.get()
     }
 
     /// Returns the cumulative execution time: bytecode-execution wall time
@@ -239,6 +239,19 @@ impl ResourceTracker {
         self.limits.max_duration
     }
 
+    /// Returns the configured memory budget, if any. Hosts that bound a worker
+    /// process from outside the interpreter size that bound from this.
+    #[must_use]
+    pub fn max_memory(&self) -> Option<usize> {
+        self.limits.max_memory
+    }
+
+    /// Returns whether the VM has a memory or time limit configured.
+    #[must_use]
+    pub fn has_memory_time_limit(&self) -> bool {
+        self.limits.max_memory.is_some() || self.limits.max_duration.is_some()
+    }
+
     /// Sets the maximum execution duration as a fresh budget from now,
     /// resetting the accumulated execution time to zero.
     ///
@@ -251,74 +264,87 @@ impl ResourceTracker {
         self.total_execution_time.set(Duration::ZERO);
     }
 
-    /// Called when memory is freed (during dec_ref or garbage collection).
+    /// Checks whether one up-front allocation fits the memory budget.
     ///
-    /// `get_size` lazily computes the size in bytes of the freed allocation;
-    /// it is never called when no memory limit is configured.
+    /// Use this before reserving a buffer that could cross both the soft and
+    /// hard allocator limits before execution reaches another checkpoint.
     #[inline]
-    pub fn on_free(&self, get_size: impl FnOnce() -> usize) {
-        // Memory is only tracked when a limit is configured (`on_grow` skips
-        // the size computation otherwise), so skip symmetrically here.
-        if self.limits.max_memory.is_some() {
-            let current = self.current_memory.get();
-            self.current_memory.set(current.saturating_sub(get_size()));
-        }
-    }
-
-    /// Called before tracked memory grows: a new heap allocation, in-place
-    /// container growth (`list.append`, `dict[k] = v`), or a `StringBuilder`
-    /// reservation.
-    ///
-    /// Returns `Ok(())` if the growth should proceed, or `Err(ResourceError)`
-    /// if a limit would be exceeded. Balanced by [`on_free`](Self::on_free):
-    /// entry release reads `py_estimate_size()`, which includes in-place growth.
-    /// `get_additional` lazily computes the approximate growth in bytes and is
-    /// never called when no memory limit is configured.
-    #[inline]
-    pub fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        if let Some(max) = self.limits.max_memory {
-            // Saturating: a wrapping add on 32-bit targets must not slip past
-            // the limit.
-            let new_memory = self.current_memory.get().saturating_add(get_additional());
-            if new_memory > max {
-                return Err(ResourceError::Memory {
-                    limit: max,
-                    used: new_memory,
-                });
+    pub fn check_allocation(&self, additional: usize) -> Result<(), ResourceError> {
+        if let Some(limit) = self.limits.max_memory {
+            let used = probe_memory().saturating_add(additional);
+            if used > limit {
+                return Err(ResourceError::Memory { limit, used });
             }
-            self.current_memory.set(new_memory);
         }
-        // No memory limit: skip the check AND the (possibly costly) size
-        // computation — `get_additional` is never called.
         Ok(())
     }
 
-    /// Called periodically (at statement boundaries) to check time limits.
+    /// Called periodically to check allocator-backed memory and time limits.
     ///
-    /// Returns `Ok(())` if within time limit, or `Err(ResourceError::Time)`
-    /// if the limit is exceeded.
+    /// Returns `Ok(())` while configured limits are respected, or the relevant
+    /// resource error once either limit is exceeded.
     ///
     /// Takes `&self` rather than `&mut self` because checking elapsed time is a
     /// read-only operation. This allows time checks in contexts that only have
     /// an immutable heap reference, such as `py_repr_fmt`.
     #[inline]
+    pub fn check_memory_time(&self) -> Result<(), ResourceError> {
+        if let Some(limit) = self.limits.max_memory {
+            let used = probe_memory();
+            if used > limit {
+                return Err(ResourceError::Memory { limit, used });
+            }
+        }
+
+        self.check_time()
+    }
+
+    /// Called periodically to check the time limit. Elapsed execution time is
+    /// monotonic, so once the budget is exceeded every later call fails too.
+    #[inline]
     pub fn check_time(&self) -> Result<(), ResourceError> {
         if let Some(max) = self.limits.max_duration {
-            self.check_counter.update(|c| c.wrapping_add(1));
-            if self.check_counter.get().is_multiple_of(TIME_CHECK_INTERVAL) {
-                // Only call Instant::elapsed() every TIME_CHECK_INTERVAL calls
-                let elapsed = self.elapsed();
-                if elapsed > max {
-                    // Reset counter so the very next check_time call also triggers
-                    // an elapsed check. This is important because some callers
-                    // (e.g. repr_sequence_fmt) catch the error and return normally,
-                    // and we need the VM loop's next check_time to re-detect timeout.
-                    self.check_counter.set(TIME_CHECK_INTERVAL.wrapping_sub(1));
-                    return Err(ResourceError::Time { limit: max, elapsed });
-                }
+            let elapsed = self.elapsed();
+            if elapsed > max {
+                return Err(ResourceError::Time { limit: max, elapsed });
             }
         }
         Ok(())
+    }
+
+    /// Items processed between full checks in amortized per-item Rust loops
+    /// (see [`check_time_every`](Self::check_time_every)). A limit can be
+    /// overshot by up to this many items' work before the next check — an
+    /// accepted trade for cheap loops; the process-level hard limits backstop
+    /// pathological cases.
+    pub const LOOP_CHECK_INTERVAL: usize = 64;
+
+    /// Amortized per-item time check for Rust-side loops: a full clock read
+    /// once per [`LOOP_CHECK_INTERVAL`](Self::LOOP_CHECK_INTERVAL) calls,
+    /// free otherwise. Key `i` on the loop's index or a monotonically
+    /// increasing counter. Fires at the *end* of each block (`i % N == N-1`)
+    /// so loops shorter than the interval pay no clock read at all — the VM
+    /// dispatch checkpoint covers cadence between short calls.
+    #[inline]
+    pub fn check_time_every(&self, i: usize) -> Result<(), ResourceError> {
+        if i % Self::LOOP_CHECK_INTERVAL == Self::LOOP_CHECK_INTERVAL - 1 {
+            self.check_time()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Amortized per-item memory + time check; the memory-probing sibling of
+    /// [`check_time_every`](Self::check_time_every), for loops that allocate
+    /// per item. Between full checks the allocator's hard limit still bounds
+    /// runaway growth.
+    #[inline]
+    pub fn check_memory_time_every(&self, i: usize) -> Result<(), ResourceError> {
+        if i % Self::LOOP_CHECK_INTERVAL == Self::LOOP_CHECK_INTERVAL - 1 {
+            self.check_memory_time()
+        } else {
+            Ok(())
+        }
     }
 
     /// Called before pushing a new call frame to check recursion depth.
@@ -347,16 +373,7 @@ impl ResourceTracker {
     /// on small operations.
     #[inline]
     pub fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError> {
-        if let Some(max) = self.limits.max_memory {
-            let new_memory = self.current_memory.get().saturating_add(estimated_bytes);
-            if new_memory > max {
-                return Err(ResourceError::Memory {
-                    limit: max,
-                    used: new_memory,
-                });
-            }
-        }
-        Ok(())
+        self.check_allocation(estimated_bytes)
     }
 
     /// Returns the configured garbage collection interval, in GC-tracked
@@ -417,4 +434,11 @@ impl ResourceTracker {
         self.recursion_limit_override.set(Some(new_limit));
         Ok(())
     }
+}
+
+/// Returns memory used in bytes
+fn probe_memory() -> usize {
+    LIVE_MEMORY
+        .load(Ordering::Relaxed)
+        .saturating_sub(BASELINE_MEMORY.load(Ordering::Relaxed))
 }

@@ -34,7 +34,7 @@ use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
     hash::{HashValue, identity_hash},
-    heap::{DropWithContext, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
+    heap::{DropWithContext, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     resource_checks::check_repeat_size,
     types::{
@@ -46,7 +46,7 @@ use crate::{
         str::allocate_string,
         tuple::TupleVec,
     },
-    value::{EitherStr, Value},
+    value::{EitherStr, VALUE_SIZE, Value},
 };
 
 /// Python named tuple value stored on the heap.
@@ -224,9 +224,13 @@ impl<'h> HeapRead<'h, NamedTuple> {
     }
 
     /// Clones every item, for the orderings in [`cmp_item_seqs`].
-    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> Vec<Value> {
+    ///
+    /// Preflights the slot bytes so an over-budget clone raises a graceful
+    /// `MemoryError` instead of bursting past the allocator's hard limit.
+    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> RunResult<Vec<Value>> {
         let len = self.get(vm.heap).len();
-        (0..len).map(|i| self.clone_item(i, vm)).collect()
+        vm.heap.tracker.check_allocation(len.saturating_mul(VALUE_SIZE))?;
+        Ok((0..len).map(|i| self.clone_item(i, vm)).collect())
     }
 
     /// Returns a stack-borrowed lending iterator over the named tuple's items,
@@ -296,12 +300,12 @@ impl<'a, 'h> NamedTupleIter<'a, 'h> {
     /// The returned reference is valid until the next call to `next` (or
     /// until the iterator itself is dropped).
     ///
-    /// Performs a [`check_time`](Heap::check_time) on every call so long
-    /// Rust-side loops cannot bypass the configured timeout.
+    /// Performs an amortized time-limit check (a clock read every 64th
+    /// call) so long Rust-side loops cannot bypass the configured timeout.
     pub(crate) fn next<'i>(&'i mut self, vm: &mut VM<'h>) -> RunResult<Option<&'i Value>> {
         // Drop the previously-yielded item (no-op when `current` is `Undefined`).
         mem::replace(&mut self.current, Value::Undefined).drop_with(vm.heap);
-        vm.heap.check_time()?;
+        vm.heap.tracker.check_time_every(self.index)?;
         let items = &self.tuple.get(vm.heap).items;
         if self.index >= items.len() {
             return Ok(None);
@@ -327,9 +331,9 @@ impl<'h, C: ContainsVM<'h>> DropWithContext<C> for NamedTupleIter<'_, 'h> {
     }
 }
 
-/// `PyTrait` implementation for `HeapRead<NamedTuple>`, providing all Python operations
-/// on heap-allocated named tuples via short-lived borrow patterns.
-impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
+/// `PyTrait` implementation for `HeapObjectRead<NamedTuple>`, providing all Python
+/// operations on heap-allocated named tuples via short-lived borrow patterns.
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTuple> {
     fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
         true
     }
@@ -338,7 +342,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
     /// tuple subclass in CPython and inherits `tuplecontains`. Without this, `in`
     /// falls back to iteration and allocates a heap `TupleIterator`, which can
     /// trip the allocation limit on a tight heap.
-    fn py_contains_impl(&self, _self_id: HeapId, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         let iter = self.iter(vm)?;
         defer_drop_mut!(iter, vm);
         while let Some(el) = iter.next(vm)? {
@@ -353,8 +357,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         Type::NamedTuple
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        TupleIterator::from_named_tuple(self_id.expect("heap values have an id"), vm)
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(TupleIterator::from_named_tuple(self.id(), vm))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -370,7 +374,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
             let items = slice_collect_iterator(vm, slice_obj, self.get(vm.heap).as_vec().iter(), |v| {
                 v.clone_with_heap(vm)
             })?;
-            return Ok(allocate_tuple(items, vm.heap)?);
+            return Ok(allocate_tuple(items, vm.heap));
         }
 
         // Extract integer index from key, returning TypeError if not an int
@@ -391,24 +395,24 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
     /// `namedtuple + tuple-like` — concatenation into a plain tuple, as in
     /// CPython (the field names describe one instance only, so they cannot
     /// survive concatenation). A non-tuple-like right operand returns `None`.
-    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
-        let Some(mut other_items) = cloned_tuple_like_items(other, vm) else {
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let Some(mut other_items) = cloned_tuple_like_items(other, vm)? else {
             return Ok(None);
         };
-        let mut items = self.cloned_items(vm);
+        let mut items = self.cloned_items(vm)?;
         items.append(&mut other_items);
-        Ok(Some(allocate_tuple(SmallVec::from_vec(items), vm.heap)?))
+        Ok(Some(allocate_tuple(SmallVec::from_vec(items), vm.heap)))
     }
 
     /// Reflected concatenation (`tuple + namedtuple`), reached when the left
     /// tuple's `py_add_impl` declined the namedtuple right operand.
     fn py_radd_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
-        let Some(mut items) = cloned_tuple_like_items(other, vm) else {
+        let Some(mut items) = cloned_tuple_like_items(other, vm)? else {
             return Ok(None);
         };
-        let mut self_items = self.cloned_items(vm);
+        let mut self_items = self.cloned_items(vm)?;
         items.append(&mut self_items);
-        Ok(Some(allocate_tuple(SmallVec::from_vec(items), vm.heap)?))
+        Ok(Some(allocate_tuple(SmallVec::from_vec(items), vm.heap)))
     }
 
     /// `namedtuple * int` — repetition into a plain tuple, matching CPython's
@@ -421,16 +425,16 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         if count == 0 || len == 0 {
             return Ok(Some(vm.heap.get_empty_tuple()));
         }
-        check_repeat_size(len.saturating_mul(mem::size_of::<Value>()), count, vm.heap.tracker())?;
+        check_repeat_size(len.saturating_mul(mem::size_of::<Value>()), count, &vm.heap.tracker)?;
         let mut result: TupleVec = SmallVec::with_capacity(len * count);
-        for _ in 0..count {
+        for rep in 0..count {
             for i in 0..len {
                 let item = self.get(vm.heap).as_vec()[i].clone_with_heap(vm.heap);
                 result.push(item);
             }
-            vm.heap.check_time()?;
+            vm.heap.tracker.check_time_every(rep)?;
         }
-        Ok(Some(allocate_tuple(result, vm.heap)?))
+        Ok(Some(allocate_tuple(result, vm.heap)))
     }
 
     fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -467,7 +471,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
     /// so a `NamedTuple` and a `Tuple` with equal elements share the same hash.
     /// Caches the computed hash on first call (see `Tuple::py_hash` for the
     /// caching rationale).
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         if let Some(cached) = self.get(vm.heap).cached_hash.get() {
             return Ok(Some(cached));
         }
@@ -522,7 +526,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         // host imports) model CPython *structseqs*, which expose none of the
         // `collections.namedtuple` API.
         if attr.static_string() == Some(StaticStrings::UnderFields) && self.get(vm.heap).class_id().is_some() {
-            return Ok(Some(CallResult::Value(self.fields_tuple(vm)?)));
+            return Ok(Some(CallResult::Value(self.fields_tuple(vm))));
         }
         // `_field_defaults` lives only on the class (an instance stores field
         // *names* but not defaults), so it is read through `class_id` rather than
@@ -541,7 +545,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         {
             let value = if static_attr == StaticStrings::DunderDoc {
                 let doc = synthesise_doc(class, vm.interns);
-                allocate_string(doc, vm.heap)?
+                allocate_string(doc, vm.heap)
             } else {
                 class.module().clone_with_heap(vm.heap)
             };
@@ -555,13 +559,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         }
     }
 
-    fn py_call_attr(
-        &mut self,
-        _self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         // The `_`-prefixed namedtuple methods. Field names cannot start with `_`,
         // so these never collide with a real field. Only instances built from a
         // `collections.namedtuple` class have them — see the note in `py_getattr`.
@@ -593,13 +591,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
 }
 
 impl HeapItem for NamedTuple {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.name.py_estimate_size()
-            + field_names_size(&self.field_names)
-            + self.items.len() * mem::size_of::<Value>()
-    }
-
     /// Pushes all heap IDs contained in this named tuple onto the stack.
     ///
     /// Called during garbage collection to decrement refcounts of nested values.
@@ -629,7 +620,7 @@ impl HeapItem for NamedTuple {
 
 impl<'h> HeapRead<'h, NamedTuple> {
     /// `p._fields` — a tuple of the field names, in order.
-    fn fields_tuple(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+    fn fields_tuple(&self, vm: &mut VM<'h>) -> Value {
         let names = self.get(vm.heap).field_names.clone();
         fields_tuple_from(&names, vm)
     }
@@ -643,8 +634,8 @@ impl<'h> HeapRead<'h, NamedTuple> {
     /// `sys.version_info.__getnewargs__()` is `((3, 14, ...),)`, one level deeper.
     fn method_getnewargs(&self, vm: &mut VM<'h>, args: ArgValues, from_factory: bool) -> RunResult<Value> {
         args.check_zero_args("__getnewargs__", vm.heap)?;
-        let items: TupleVec = self.cloned_items(vm).into_iter().collect();
-        let values = allocate_tuple(items, vm.heap)?;
+        let items: TupleVec = self.cloned_items(vm)?.into_iter().collect();
+        let values = allocate_tuple(items, vm.heap);
         if from_factory {
             Ok(values)
         } else {
@@ -652,7 +643,7 @@ impl<'h> HeapRead<'h, NamedTuple> {
             // the one-element wrapper by pushing rather than `from_elem`.
             let mut wrapper = TupleVec::new();
             wrapper.push(values);
-            allocate_tuple(wrapper, vm.heap).map_err(Into::into)
+            Ok(allocate_tuple(wrapper, vm.heap))
         }
     }
 
@@ -714,12 +705,12 @@ impl<'h> HeapRead<'h, NamedTuple> {
         let names = self.get(vm.heap).field_names.clone();
         let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(names.len());
         for (i, name) in names.iter().enumerate() {
-            let key = field_name_value(name, vm)?;
+            let key = field_name_value(name, vm);
             let value = self.get(vm.heap).items[i].clone_with_heap(vm.heap);
             pairs.push((key, value));
         }
         let dict = Dict::from_pairs(pairs, vm)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
     }
 
     /// `p._replace(**kwargs)` — a copy with the named fields overridden.
@@ -765,7 +756,7 @@ impl<'h> HeapRead<'h, NamedTuple> {
                 py_list_repr(&unexpected)
             )));
         }
-        build_namedtuple(name, field_names, items, class_id, vm)
+        Ok(build_namedtuple(name, field_names, items, class_id, vm))
     }
 
     /// `p._make(iterable)` — a new instance of the same class from an iterable.
@@ -833,7 +824,7 @@ impl NamedTupleClass {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, NamedTupleClass> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTupleClass> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         // The type of a class object is `type` (matching `type(Point) is type`).
         Type::Type
@@ -848,8 +839,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTupleClass> {
         Ok(None)
     }
 
-    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        Ok(Some(identity_hash(self_id)))
+    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        Ok(Some(identity_hash(self.id())))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
@@ -862,16 +853,16 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTupleClass> {
             // equals `__name__` and never picks up a dotted path from an enclosing scope.
             Some(StaticStrings::DunderName | StaticStrings::DunderQualname) => {
                 let name = self.get(vm.heap).name.as_str(vm.interns).to_owned();
-                allocate_string(name, vm.heap)?
+                allocate_string(name, vm.heap)
             }
             Some(StaticStrings::UnderFields) => {
                 let names = self.get(vm.heap).field_names.clone();
-                fields_tuple_from(&names, vm)?
+                fields_tuple_from(&names, vm)
             }
             Some(StaticStrings::UnderFieldDefaults) => self.field_defaults_dict(vm)?,
             Some(StaticStrings::DunderDoc) => {
                 let doc = synthesise_doc(self.get(vm.heap), vm.interns);
-                allocate_string(doc, vm.heap)?
+                allocate_string(doc, vm.heap)
             }
             Some(StaticStrings::DunderModule) => self.get(vm.heap).module.clone_with_heap(vm.heap),
             _ => {
@@ -884,15 +875,9 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTupleClass> {
         Ok(Some(CallResult::Value(value)))
     }
 
-    fn py_call_attr(
-        &mut self,
-        self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         if attr.static_string() == Some(StaticStrings::UnderMake) {
-            make_namedtuple(self_id, vm, args).map(CallResult::Value)
+            make_namedtuple(self.id(), vm, args).map(CallResult::Value)
         } else {
             args.drop_with(vm);
             Err(ExcType::attribute_error_type(
@@ -912,12 +897,12 @@ impl<'h> HeapRead<'h, NamedTupleClass> {
         let start = n - n_defaults;
         let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(n_defaults);
         for j in 0..n_defaults {
-            let key = field_name_value(&self.get(vm.heap).field_names[start + j].clone(), vm)?;
+            let key = field_name_value(&self.get(vm.heap).field_names[start + j].clone(), vm);
             let value = self.get(vm.heap).defaults[j].clone_with_heap(vm.heap);
             pairs.push((key, value));
         }
         let dict = Dict::from_pairs(pairs, vm)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
     }
 }
 
@@ -936,13 +921,6 @@ impl NamedTupleClass {
 }
 
 impl HeapItem for NamedTupleClass {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.name.py_estimate_size()
-            + field_names_size(&self.field_names)
-            + self.defaults.len() * mem::size_of::<Value>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         if !self.contains_refs {
             return;
@@ -977,7 +955,24 @@ impl HeapItem for NamedTupleClass {
 /// Element-level results propagate exactly as in [`Tuple::py_cmp`]: a `NaN`
 /// yields [`CmpOrder::Unordered`] rather than an error, while a genuinely
 /// type-mismatched pair yields [`CmpOrder::Incomparable`].
+///
+/// Charges one recursion level: unlike equality/repr, ordering does not walk a
+/// token-bearing `NamedTupleIter` (it compares detached item vecs), so nested
+/// namedtuples (`a < b` where each wraps the last) would otherwise recurse
+/// through here per level and overflow the host stack instead of raising
+/// `RecursionError`. A [`RecursionToken`] rather than a `recursion_guard()` is
+/// used because both vecs are still owned on the failure path — the token does
+/// not borrow the VM, so they can be dropped before returning the error.
 pub(crate) fn cmp_item_seqs(a: Vec<Value>, b: Vec<Value>, vm: &mut VM<'_>) -> RunResult<CmpOrder> {
+    let token = match vm.recursion_token() {
+        Ok(token) => token,
+        Err(err) => {
+            a.drop_with(vm);
+            b.drop_with(vm);
+            return Err(err.into());
+        }
+    };
+
     let (a_len, b_len) = (a.len(), b.len());
     let mut result = None;
     for (av, bv) in a.iter().zip(b.iter()) {
@@ -1015,25 +1010,28 @@ pub(crate) fn cmp_item_seqs(a: Vec<Value>, b: Vec<Value>, vm: &mut VM<'_>) -> Ru
     }
     a.drop_with(vm);
     b.drop_with(vm);
+    token.drop_with(vm);
     // All compared pairs were equal, so the shorter sequence sorts first.
     result.unwrap_or_else(|| Ok(CmpOrder::Ordered(a_len.cmp(&b_len))))
 }
 
 /// Clones the items of a tuple-like value (`tuple` or `namedtuple`) into an
-/// owned `Vec`, incrementing refcounts, or returns `None` for anything else.
+/// owned `Vec`, incrementing refcounts, or returns `Ok(None)` for anything
+/// else. Preflights the slot bytes like [`HeapRead::cloned_items`].
 ///
 /// Shared by named-tuple concatenation (`+`), whose result is always a plain
 /// tuple regardless of which operand is the namedtuple.
-fn cloned_tuple_like_items(value: &Value, vm: &VM<'_>) -> Option<Vec<Value>> {
+fn cloned_tuple_like_items(value: &Value, vm: &VM<'_>) -> RunResult<Option<Vec<Value>>> {
     let Value::Ref(id) = value else {
-        return None;
+        return Ok(None);
     };
     let id = *id;
     let len = match vm.heap.get(id) {
         HeapData::Tuple(t) => t.as_slice().len(),
         HeapData::NamedTuple(nt) => nt.as_vec().len(),
-        _ => return None,
+        _ => return Ok(None),
     };
+    vm.heap.tracker.check_allocation(len.saturating_mul(VALUE_SIZE))?;
     let mut items = Vec::with_capacity(len);
     for i in 0..len {
         let item = match vm.heap.get(id) {
@@ -1043,20 +1041,7 @@ fn cloned_tuple_like_items(value: &Value, vm: &VM<'_>) -> Option<Vec<Value>> {
         };
         items.push(item);
     }
-    Some(items)
-}
-
-/// Memory footprint of a field-name list, for [`HeapItem::py_estimate_size`].
-///
-/// Factory-made namedtuples hold `EitherStr::Heap` names (only Monty's internal
-/// ones are interned), and every instance deep-clones the whole list, so the
-/// owned `String` capacity MUST be charged — sizing these as bare `StringId`s
-/// would let a class with long field names amplify far past the memory limit.
-fn field_names_size(field_names: &[EitherStr]) -> usize {
-    field_names
-        .iter()
-        .map(|name| mem::size_of::<EitherStr>() + name.py_estimate_size())
-        .sum()
+    Ok(Some(items))
 }
 
 /// Builds the synthesised class docstring, e.g. `Point(x, y)`.
@@ -1173,7 +1158,7 @@ pub(crate) fn construct_namedtuple(class_id: HeapId, vm: &mut VM<'_>, args: ArgV
     }
 
     let items: Vec<Value> = slots.into_iter().map(|s| s.expect("all slots bound")).collect();
-    build_namedtuple(name, field_names, items, Some(class_id), vm)
+    Ok(build_namedtuple(name, field_names, items, Some(class_id), vm))
 }
 
 /// `Point._make(iterable)` — builds an instance from an iterable of values.
@@ -1202,7 +1187,7 @@ fn make_from_iterable(
         items.drop_with(vm);
         return Err(ExcType::type_error(format!("Expected {n} arguments, got {got}")));
     }
-    build_namedtuple(name, field_names, items, class_id, vm)
+    Ok(build_namedtuple(name, field_names, items, class_id, vm))
 }
 
 /// Allocates a [`NamedTuple`] instance, taking ownership of `items` and, when
@@ -1213,30 +1198,27 @@ pub(crate) fn build_namedtuple(
     items: Vec<Value>,
     class_id: Option<HeapId>,
     vm: &mut VM<'_>,
-) -> RunResult<Value> {
+) -> Value {
     let nt = NamedTuple::with_class(name, field_names, items, class_id);
-    let id = vm.heap.allocate(HeapData::NamedTuple(Box::new(nt)))?;
+    let id = vm.heap.allocate(HeapData::NamedTuple(Box::new(nt)));
     // The instance owns a reference to its class object (see `py_dec_ref_ids`).
     if let Some(cid) = class_id {
         vm.heap.inc_ref(cid);
     }
-    Ok(Value::Ref(id))
+    Value::Ref(id)
 }
 
 /// Builds a tuple `Value` of the given field names (as string values).
-fn fields_tuple_from(names: &[EitherStr], vm: &mut VM<'_>) -> RunResult<Value> {
-    let mut items: Vec<Value> = Vec::with_capacity(names.len());
-    for name in names {
-        items.push(field_name_value(name, vm)?);
-    }
-    Ok(allocate_tuple(SmallVec::from_vec(items), vm.heap)?)
+fn fields_tuple_from(names: &[EitherStr], vm: &mut VM<'_>) -> Value {
+    let items: Vec<Value> = names.iter().map(|name| field_name_value(name, vm)).collect();
+    allocate_tuple(SmallVec::from_vec(items), vm.heap)
 }
 
 /// Converts an interned/heap field name into a string `Value`.
-fn field_name_value(name: &EitherStr, vm: &mut VM<'_>) -> RunResult<Value> {
+fn field_name_value(name: &EitherStr, vm: &mut VM<'_>) -> Value {
     match name {
-        EitherStr::Interned(id) => Ok(Value::InternString(*id)),
-        EitherStr::Heap(s) => Ok(allocate_string(s.clone(), vm.heap)?),
+        EitherStr::Interned(id) => Value::InternString(*id),
+        EitherStr::Heap(s) => allocate_string(s.clone(), vm.heap),
     }
 }
 

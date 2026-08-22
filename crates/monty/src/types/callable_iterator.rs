@@ -14,7 +14,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::RunResult,
-    heap::{DropGuard, HeapId, HeapItem, HeapRead},
+    heap::{DropGuard, HeapId, HeapItem, HeapObjectRead},
     types::{PyTrait, Type},
     value::Value,
 };
@@ -56,17 +56,13 @@ impl CallableIterator {
 }
 
 impl HeapItem for CallableIterator {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         self.callable.py_dec_ref_ids(stack);
         self.sentinel.py_dec_ref_ids(stack);
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, CallableIterator> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, CallableIterator> {
     fn py_is_iterator(&self, _: &VM<'h>) -> bool {
         true
     }
@@ -87,10 +83,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, CallableIterator> {
         Ok(None)
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        let self_id = self_id.expect("heap values have an id");
-        vm.heap.inc_ref(self_id);
-        Ok(Value::Ref(self_id))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
     }
 
     /// Calls `callable()` and yields the result unless it `==` `sentinel`.
@@ -99,7 +93,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, CallableIterator> {
     /// `callable` re-enters Python and may reach this same iterator through a
     /// nested `next()`, which would alias the `UnsafeCell` if a borrow were held
     /// across it (`iter__reentrant.py` covers exactly that).
-    fn py_next(&mut self, _: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let resolved = {
             let this = self.get(vm.heap);
             if this.done {

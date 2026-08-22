@@ -55,7 +55,9 @@ name = "dispatch"
 required-features = ["worker"]
 
 [dev-dependencies]
+insta = { workspace = true }
 monty = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

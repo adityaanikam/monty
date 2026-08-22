@@ -37,7 +37,7 @@ use crate::{
     intern::{FunctionId, Interns, StaticStrings, StringId},
     modules::{StandardLib, json::JsonStringCache, re::RePatternCache},
     object_bridge::MontyObjectExt,
-    os_dispatch::{PendingOsEffect, listdir_names},
+    os_dispatch::{PendingOsEffect, listdir_names, release_pending_effect},
     parse::CodeRange,
     types::{
         Dict, LongInt, PyTrait,
@@ -171,19 +171,22 @@ macro_rules! handle_call_result {
                 let call_id = $self.allocate_call_id();
                 // Sync cached IP back to frame before snapshot for resume
                 $self.current_frame_mut().ip = $cached_frame.ip;
-                return Ok(FrameExit::OsCall { function_call, call_id });
+                return Ok(FrameExit::OsCall {
+                    function_call,
+                    call_id,
+                    effect: None,
+                });
             }
             Ok(CallResult::OsCallWithEffect { call, effect }) => {
                 let call_id = $self.allocate_call_id();
-                // Arm the resume effect only here, at dispatch — a rejected
-                // and dropped `CallResult` must never leave a stale effect
-                // (see `CallResult::OsCallWithEffect`).
-                $self.pending_os_effect = Some(effect);
                 // Sync cached IP back to frame before snapshot for resume
                 $self.current_frame_mut().ip = $cached_frame.ip;
+                // Not armed here — this exit may still be rejected on its
+                // way out, and only a dispatched call earns a `resume`.
                 return Ok(FrameExit::OsCall {
                     function_call: call,
                     call_id,
+                    effect: Some(effect),
                 });
             }
             Ok(CallResult::MethodCall(method_name, args)) => {
@@ -258,6 +261,10 @@ pub enum FrameExit {
         function_call: OsFunctionCall,
         /// Unique ID for this call, used for async correlation.
         call_id: CallId,
+        /// Post-processing for this call's result, armed on
+        /// [`VM::pending_os_effect`] only once the call reaches the host
+        /// (`convert_frame_exit`); dropping the exit releases it instead.
+        effect: Option<PendingOsEffect>,
     },
 
     /// Execution paused for a dataclass method call.
@@ -308,7 +315,13 @@ impl<C: ContainsHeap> DropWithContext<C> for FrameExit {
             Self::ExternalCall { args, .. } | Self::MethodCall { args, .. } => {
                 args.drop_with(heap);
             }
-            Self::OsCall { function_call, .. } => function_call.drop_with(heap),
+            Self::OsCall {
+                function_call, effect, ..
+            } => {
+                function_call.drop_with(heap);
+                // Never reached the host, so no `resume` will consume it.
+                release_pending_effect(effect, heap);
+            }
             Self::ResolveFutures(_) | Self::NameLookup { .. } => {}
         }
     }
@@ -936,10 +949,65 @@ impl<'h> VM<'h> {
     /// (task switches, `evaluate_function`) uses the raw private [`Self::run`]
     /// instead, whose time is already inside the enclosing window.
     pub(crate) fn run_external(&mut self) -> Result<FrameExit, RunError> {
-        self.heap.tracker().on_execution_start();
+        self.heap.tracker.on_execution_start();
         let result = self.run();
-        self.heap.tracker().on_execution_stop();
-        result
+        self.heap.tracker.on_execution_stop();
+        self.finish_host_turn(result)
+    }
+
+    /// Epilogue for every host-boundary execution window (here and
+    /// `MontyRepl::call_function`): re-checks both resource limits so an
+    /// overshoot that arose after the run loop's last amortized check — or
+    /// was swallowed by a truncating caller (repr's `...[timeout]`) — cannot
+    /// escape as a successful result. Consumes a discarded success so its
+    /// heap refcounts are released rather than leaked.
+    pub(crate) fn finish_host_turn<T: DropWithContext<Self>>(
+        &mut self,
+        result: Result<T, RunError>,
+    ) -> Result<T, RunError> {
+        // A turn shorter than the dispatch-checkpoint interval never probes
+        // GC inside the run loop, so a stream of tiny feeds could otherwise
+        // accumulate eligible cyclic garbage indefinitely — and the memory
+        // check below could trip on memory a collection would reclaim. The
+        // collection is charged to the execution clock like dispatch-loop GC,
+        // so the limit check sees post-GC elapsed time as well as memory.
+        // Skipped after a resource error, where refcounts are unreliable and
+        // trial deletion could free live entries; ordinary Python exceptions
+        // unwind through the drop machinery, so they still collect.
+        if !matches!(result, Err(RunError::UncatchableExc(_))) && self.heap.should_gc() {
+            self.heap.tracker.on_execution_start();
+            self.run_gc();
+            self.heap.tracker.on_execution_stop();
+        }
+        // Checked for erroring turns too: session state survives Python
+        // exceptions, so allocate-then-raise feeds must not evade the limits.
+        // The uncatchable resource error out-ranks the turn's own error.
+        match self.heap.tracker.check_memory_time() {
+            Ok(()) => result,
+            Err(e) => {
+                if let Ok(value) = result {
+                    value.drop_with(self);
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Periodic dispatch-loop work, outlined (`#[inline(never)]`) so the hot
+    /// loop stays small: the amortized memory + time check — where a timeout
+    /// swallowed by a truncating caller re-detects (elapsed time is
+    /// monotonic), backstopped by the `run_external` exit check — and the
+    /// GC-scheduling probe, with the frame IP synced before a collection.
+    #[inline(never)]
+    fn dispatch_checkpoint(&mut self, check_limits: bool, ip: usize) -> Result<(), RunError> {
+        if check_limits {
+            self.heap.tracker.check_memory_time()?;
+        }
+        if self.heap.should_gc() {
+            self.current_frame_mut().ip = ip;
+            self.run_gc();
+        }
+        Ok(())
     }
 
     /// Main execution loop.
@@ -957,19 +1025,40 @@ impl<'h> VM<'h> {
     /// `frames.last_mut().expect()` calls during operand fetching. The cache
     /// is reloaded after any operation that modifies the frame stack.
     fn run(&mut self) -> Result<FrameExit, RunError> {
+        /// How often (in instructions) the dispatch loop runs its periodic
+        /// work: the full `check_memory_time` and the GC-scheduling probe.
+        /// The checkpoint reads the clock when limits are armed, so this sets
+        /// the entire cost of limit enforcement — ~40% on tight loops at 10,
+        /// ~2% at u8::MAX (see the `_limits` benchmarks) — while detection
+        /// latency stays sub-µs. Native ops poll internally and the host-turn
+        /// epilogue re-checks, so only this dispatch cadence rides on it.
+        /// The countdown is per-`run()`, so `evaluate_function` re-entry
+        /// restarts it — a native loop calling a shorter callback reaches no
+        /// checkpoint at all and must poll the tracker itself.
+        const CHECK_INTERVAL: u8 = u8::MAX;
+
         // Cache frame state locally to avoid repeated frames.last_mut() calls.
         // The Code reference has lifetime 'h (lives in Interns), independent of frame borrow.
         let mut cached_frame: CachedFrame<'h> = self.new_cached_frame();
 
-        loop {
-            // Check time limit and trigger GC if needed at each instruction.
-            // With no limits configured these reduce to a single branch each.
-            self.heap.check_time()?;
+        // Limits cannot change mid-run (`set_max_duration` needs `&mut` at the
+        // host boundary), so with none configured the whole checkpoint reduces
+        // to this one hoisted, well-predicted branch per instruction.
+        let check_limits = self.heap.tracker.has_memory_time_limit();
 
-            if self.heap.should_gc() {
-                // Sync IP before GC for safety
-                self.current_frame_mut().ip = cached_frame.ip;
-                self.run_gc();
+        let mut countdown = CHECK_INTERVAL;
+
+        loop {
+            // One decrement-and-branch per instruction; the periodic work
+            // runs every `CHECK_INTERVAL`-th, outlined to keep the hot loop
+            // small. GC triggering is allocation-count-based (intervals in
+            // the hundreds), so probing it a few instructions late is
+            // immaterial.
+            if let Some(c) = countdown.checked_sub(1) {
+                countdown = c;
+            } else {
+                countdown = CHECK_INTERVAL;
+                self.dispatch_checkpoint(check_limits, cached_frame.ip)?;
             }
 
             // Track instruction IP for exception table lookup
@@ -1021,10 +1110,8 @@ impl<'h> VM<'h> {
                     // Handle InternLongInt specially - convert to heap-allocated LongInt
                     if let Value::InternLongInt(long_int_id) = value {
                         let bi = self.interns.get_long_int(*long_int_id).clone();
-                        match LongInt::new(bi).into_value(self.heap) {
-                            Ok(v) => self.push(v),
-                            Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
-                        }
+                        let long_value = LongInt::new(bi).into_value(self.heap);
+                        self.push(long_value);
                     } else {
                         self.push(value.clone_with_heap(self));
                     }
@@ -1033,7 +1120,7 @@ impl<'h> VM<'h> {
                 Opcode::LoadTrue => self.push(Value::Bool(true)),
                 Opcode::LoadFalse => self.push(Value::Bool(false)),
                 Opcode::BuildCell => {
-                    let cell_id = self.heap.allocate(HeapData::Cell(CellValue(Value::Undefined)))?;
+                    let cell_id = self.heap.allocate(HeapData::Cell(CellValue(Value::Undefined)));
                     self.push(Value::Ref(cell_id));
                 }
                 Opcode::LoadSmallInt => {
@@ -1092,7 +1179,7 @@ impl<'h> VM<'h> {
                 Opcode::LoadGlobalCallable => {
                     let (slot, name_idx) = cached_frame.fetch_u16_u16();
                     let name_id = StringId::from_index(name_idx);
-                    try_catch_sync!(self, cached_frame, self.load_global_callable(slot, name_id));
+                    self.load_global_callable(slot, name_id);
                 }
                 Opcode::StoreGlobal => {
                     let slot = cached_frame.fetch_u16();
@@ -1164,10 +1251,8 @@ impl<'h> VM<'h> {
                                 // LongInt bitwise NOT: ~x = -(x + 1)
                                 let inverted = -(li.inner() + 1i32);
                                 value.drop_with(self);
-                                match LongInt::new(inverted).into_value(self.heap) {
-                                    Ok(v) => self.push(v),
-                                    Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
-                                }
+                                let inverted_value = LongInt::new(inverted).into_value(self.heap);
+                                self.push(inverted_value);
                             } else {
                                 let value_type = value.py_type_name(self);
                                 value.drop_with(self);
@@ -1209,11 +1294,11 @@ impl<'h> VM<'h> {
                 // Collection Building - route through exception handling
                 Opcode::BuildList => {
                     let count = cached_frame.fetch_u16() as usize;
-                    try_catch_sync!(self, cached_frame, self.build_list(count));
+                    self.build_list(count);
                 }
                 Opcode::BuildTuple => {
                     let count = cached_frame.fetch_u16() as usize;
-                    try_catch_sync!(self, cached_frame, self.build_tuple(count));
+                    self.build_tuple(count);
                 }
                 Opcode::BuildDict => {
                     let count = cached_frame.fetch_u16() as usize;
@@ -1383,7 +1468,7 @@ impl<'h> VM<'h> {
                     };
                     let mut iter = self.heap.read(heap_id);
 
-                    match iter.py_next(Some(heap_id), self) {
+                    match iter.py_next(self) {
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
                             // Drop the HeapRead before dec_ref to release the reader count
@@ -1518,7 +1603,7 @@ impl<'h> VM<'h> {
                         // Create FunctionDefaults on heap and push reference
                         let heap_id = self
                             .heap
-                            .allocate(HeapData::FunctionDefaults(FunctionDefaults { func_id, defaults }))?;
+                            .allocate(HeapData::FunctionDefaults(FunctionDefaults { func_id, defaults }));
                         self.push(Value::Ref(heap_id));
                     }
                 }
@@ -1561,7 +1646,7 @@ impl<'h> VM<'h> {
                         func_id,
                         cells,
                         defaults,
-                    }))?;
+                    }));
                     self.push(Value::Ref(heap_id));
                 }
                 // Exception Handling
@@ -1752,7 +1837,7 @@ impl<'h> VM<'h> {
                 // Module Operations
                 Opcode::LoadModule => {
                     let module_id = cached_frame.fetch_u8();
-                    try_catch_sync!(self, cached_frame, self.load_module(module_id));
+                    self.load_module(module_id);
                 }
                 Opcode::RaiseImportError => {
                     // Fetch the module name from the constant pool and raise ModuleNotFoundError
@@ -1785,13 +1870,12 @@ impl<'h> VM<'h> {
     }
 
     /// Loads a built-in module and pushes it onto the stack.
-    fn load_module(&mut self, module_id: u8) -> RunResult<()> {
+    fn load_module(&mut self, module_id: u8) {
         let module = StandardLib::from_repr(module_id).expect("unknown module id");
 
         // Create the module on the heap using pre-interned strings
-        let heap_id = module.create(self)?;
+        let heap_id = module.create(self);
         self.push(Value::Ref(heap_id));
-        Ok(())
     }
 
     /// Resumes execution after an external call completes.
@@ -1990,14 +2074,6 @@ impl<'h> VM<'h> {
         self.stack
             .drain(frame.stack_base..)
             .for_each(|value| value.drop_with(&mut *self.heap));
-
-        // Track freed memory for the locals region. Matches the `on_grow`
-        // at each frame-entry site (sync function, module, sync coroutine,
-        // spawned coroutine).
-        if frame.locals_count > 0 {
-            let size = usize::from(frame.locals_count) * mem::size_of::<Value>();
-            self.heap.tracker_mut().on_free(|| size);
-        }
     }
 
     /// Cleans up all frames and stack values for the current task.
@@ -2102,29 +2178,28 @@ impl<'h> VM<'h> {
     /// (see [`builtin_for_name`]) so `f()` style calls into a builtin still work when
     /// the name happens to have a module slot allocated (e.g. because the module also
     /// `def`-binds the same name elsewhere) but that slot is currently `Undefined`.
-    fn load_global_callable(&mut self, slot: u16, name_id: StringId) -> RunResult<()> {
+    fn load_global_callable(&mut self, slot: u16, name_id: StringId) {
         let value = self.globals[slot as usize].clone_with_heap(self);
 
         if matches!(value, Value::Undefined) {
             if let Some(builtin) = self.builtin_for_name(name_id) {
                 self.push(builtin);
-                return Ok(());
+                return;
             }
             // A reserved module dunder (e.g. `__name__`) in call position resolves
             // to its fixed value; the subsequent call then fails with the usual
             // "object is not callable" error, matching CPython.
-            if let Some(value) = self.module_dunder(name_id)? {
+            if let Some(value) = self.module_dunder(name_id) {
                 self.push(value);
-                return Ok(());
+                return;
             }
             // Save the load instruction's IP so NameError tracebacks point to the name
             self.ext_function_load_ip = Some(self.instruction_ip);
-            let function = self.heap.get_ext_function(self.interns.get_str(name_id))?;
+            let function = self.heap.get_ext_function(self.interns.get_str(name_id));
             self.push(function);
         } else {
             self.push(value);
         }
-        Ok(())
     }
 
     /// Creates an UnboundLocalError for a local variable accessed before assignment.
@@ -2170,15 +2245,15 @@ impl<'h> VM<'h> {
     /// ever puts a loader object there (never `None`), so rather than diverge
     /// on the type we let it raise `NameError` like other unexposed dunders
     /// (`__file__`, `__cached__`, …).
-    fn module_dunder(&self, name_id: StringId) -> RunResult<Option<Value>> {
+    fn module_dunder(&self, name_id: StringId) -> Option<Value> {
         let value = match self.interns.get_str(name_id) {
             "__name__" => Value::InternString(StaticStrings::DunderMain.into()),
             "__debug__" => Value::Bool(true),
-            "__annotations__" => Value::Ref(self.heap.allocate(HeapData::Dict(Dict::new()))?),
+            "__annotations__" => Value::Ref(self.heap.allocate(HeapData::Dict(Dict::new()))),
             "__doc__" | "__spec__" | "__package__" => Value::None,
-            _ => return Ok(None),
+            _ => return None,
         };
-        Ok(Some(value))
+        Some(value)
     }
 
     /// Creates a NameError for an undefined global variable.
@@ -2225,7 +2300,7 @@ impl<'h> VM<'h> {
                 self.push(builtin);
                 return Ok(None);
             }
-            if let Some(value) = self.module_dunder(name_id)? {
+            if let Some(value) = self.module_dunder(name_id) {
                 self.push(value);
                 return Ok(None);
             }
@@ -2391,9 +2466,7 @@ impl ContainsHeap for VM<'_> {
 /// `take_globals`) are harmlessly drained as empty.
 impl Drop for VM<'_> {
     fn drop(&mut self) {
-        if let Some(file_id) = self.pending_os_effect.take().and_then(PendingOsEffect::pinned_file) {
-            self.heap.dec_ref(file_id);
-        }
+        release_pending_effect(self.pending_os_effect.take(), self.heap);
         self.exception_stack.drain(..).drop_with(self.heap);
         self.cleanup_current_task();
         self.scheduler.cleanup(self.heap);

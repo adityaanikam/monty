@@ -43,7 +43,10 @@ use monty_pool::{
     Checkout, MountSpec, OnPrint, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig, ResumeValue, TurnEvent,
 };
 use monty_proto::python::{DcRegistry, exc_py_to_monty, monty_to_py, py_to_monty_value};
-use monty_types::{AssertMessageAnnotations, ExtFunctionResult, MontyException, MontyObject, PrintStream};
+use monty_types::{
+    AssertMessageAnnotations, ExtFunctionResult, MontyException, MontyObject, PrintStream, TypeCheckingConfig,
+    TypeCheckingFormat,
+};
 use pyo3::{
     Borrowed,
     exceptions::{PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError},
@@ -67,6 +70,7 @@ use crate::{
     mount::PyMountDir,
     print_target::PrintTarget,
     snapshot::{DriveContext, build_snapshot, feed_start_async, feed_start_sync},
+    telemetry::capture_telemetry_context,
 };
 
 /// The pool handle shared between a pool object and its sessions. `None`
@@ -165,6 +169,8 @@ impl PyMonty {
         limits = None,
         type_check = false,
         type_check_stubs = None,
+        type_check_format = None,
+        type_check_color = false,
         assert_message_annotations = AssertAnnotationsArg::default(),
         dataclass_registry = None,
     ))]
@@ -176,6 +182,8 @@ impl PyMonty {
         limits: Option<&Bound<'_, PyDict>>,
         type_check: bool,
         type_check_stubs: Option<&Bound<'_, PyString>>,
+        type_check_format: Option<TypeCheckFormatArg>,
+        type_check_color: bool,
         assert_message_annotations: AssertAnnotationsArg,
         dataclass_registry: Option<&Bound<'_, PyList>>,
     ) -> PyResult<PyMontySession> {
@@ -187,6 +195,10 @@ impl PyMonty {
                 limits,
                 type_check,
                 type_check_stubs,
+                TypeCheckingConfig {
+                    format: type_check_format.unwrap_or_default().0,
+                    color: type_check_color,
+                },
                 assert_message_annotations,
             )?,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
@@ -223,9 +235,14 @@ impl PyMontySession {
         let pool = active_pool(&this.pool)?;
         let repl_config = this.repl_config.clone();
         let slot = Arc::clone(&this.checkout);
-        py.detach(|| {
-            block_on_sync(async {
-                let checkout = pool.checkout(&repl_config).await?;
+        let telemetry = capture_telemetry_context(py);
+        py.detach(move || {
+            block_on_sync(async move {
+                let checkout = if let Some(telemetry) = telemetry {
+                    pool.checkout_with_telemetry(&repl_config, telemetry).await?
+                } else {
+                    pool.checkout(&repl_config).await?
+                };
                 *slot.lock().await = Some(checkout);
                 Ok(())
             })
@@ -529,6 +546,8 @@ impl PyAsyncMonty {
         limits = None,
         type_check = false,
         type_check_stubs = None,
+        type_check_format = None,
+        type_check_color = false,
         assert_message_annotations = AssertAnnotationsArg::default(),
         dataclass_registry = None,
     ))]
@@ -540,6 +559,8 @@ impl PyAsyncMonty {
         limits: Option<&Bound<'_, PyDict>>,
         type_check: bool,
         type_check_stubs: Option<&Bound<'_, PyString>>,
+        type_check_format: Option<TypeCheckFormatArg>,
+        type_check_color: bool,
         assert_message_annotations: AssertAnnotationsArg,
         dataclass_registry: Option<&Bound<'_, PyList>>,
     ) -> PyResult<PyAsyncMontySession> {
@@ -551,6 +572,10 @@ impl PyAsyncMonty {
                 limits,
                 type_check,
                 type_check_stubs,
+                TypeCheckingConfig {
+                    format: type_check_format.unwrap_or_default().0,
+                    color: type_check_color,
+                },
                 assert_message_annotations,
             )?,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
@@ -642,6 +667,8 @@ impl PyAsyncMontyWebsocket {
         limits = None,
         type_check = false,
         type_check_stubs = None,
+        type_check_format = None,
+        type_check_color = false,
         assert_message_annotations = AssertAnnotationsArg::default(),
         dataclass_registry = None,
     ))]
@@ -653,6 +680,8 @@ impl PyAsyncMontyWebsocket {
         limits: Option<&Bound<'_, PyDict>>,
         type_check: bool,
         type_check_stubs: Option<&Bound<'_, PyString>>,
+        type_check_format: Option<TypeCheckFormatArg>,
+        type_check_color: bool,
         assert_message_annotations: AssertAnnotationsArg,
         dataclass_registry: Option<&Bound<'_, PyList>>,
     ) -> PyResult<PyAsyncMontySession> {
@@ -664,6 +693,10 @@ impl PyAsyncMontyWebsocket {
                 limits,
                 type_check,
                 type_check_stubs,
+                TypeCheckingConfig {
+                    format: type_check_format.unwrap_or_default().0,
+                    color: type_check_color,
+                },
                 assert_message_annotations,
             )?,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
@@ -697,15 +730,18 @@ impl PyAsyncMontySession {
     /// the REPL session in it.
     fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         let this = slf.get();
-        let pool = Arc::clone(&this.pool);
+        let pool_slot = Arc::clone(&this.pool);
         let repl_config = this.repl_config.clone();
         let slot = Arc::clone(&this.checkout);
+        let telemetry = capture_telemetry_context(py);
         future_into_py(py, async move {
-            let pool = active_pool(&pool)?;
-            let checkout = pool
-                .checkout(&repl_config)
-                .await
-                .map_err(|e| Python::attach(|py| pool_err_to_py(py, e)))?;
+            let pool = active_pool(&pool_slot)?;
+            let checkout = if let Some(telemetry) = telemetry {
+                pool.checkout_with_telemetry(&repl_config, telemetry).await
+            } else {
+                pool.checkout(&repl_config).await
+            }
+            .map_err(|e| Python::attach(|py| pool_err_to_py(py, e)))?;
             *slot.lock().await = Some(checkout);
             Ok(slf)
         })
@@ -1062,6 +1098,7 @@ pub(crate) fn parse_repl_config(
     limits: Option<&Bound<'_, PyDict>>,
     type_check: bool,
     type_check_stubs: Option<&Bound<'_, PyString>>,
+    type_check_config: TypeCheckingConfig,
     assert_message_annotations: AssertAnnotationsArg,
 ) -> PyResult<ReplConfig> {
     Ok(ReplConfig {
@@ -1069,8 +1106,32 @@ pub(crate) fn parse_repl_config(
         limits: limits.map(extract_limits).transpose()?,
         type_check,
         type_check_stubs: extract_type_check_stubs(py, type_check_stubs)?,
+        type_check_config,
         assert_message_annotations: assert_message_annotations.0,
     })
+}
+
+/// The `type_check_format` checkout argument: the name of one of ty's
+/// diagnostic formats, e.g. `'full'` or `'concise'`. Absent (`None`) means the
+/// default, `'full'`.
+///
+/// A newtype (rather than a plain `&str` argument) so an unknown name is
+/// rejected at argument-extraction time with the list of valid names, instead
+/// of surfacing later as a worker error.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TypeCheckFormatArg(pub TypeCheckingFormat);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for TypeCheckFormatArg {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let name = ob
+            .cast::<PyString>()
+            .map_err(|_| PyTypeError::new_err("type_check_format must be a str"))?;
+        TypeCheckingFormat::from_name(&name.to_cow()?)
+            .map(Self)
+            .map_err(PyValueError::new_err)
+    }
 }
 
 /// The `assert_message_annotations` checkout argument: `True`/`False`, or an
@@ -1689,14 +1750,14 @@ fn extract_mount_specs(mount: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<MountSp
         return Ok(vec![]);
     };
     if let Ok(single) = mount.extract::<PyRef<'_, PyMountDir>>() {
-        return Ok(vec![single.spec()]);
+        return Ok(vec![single.spec()?]);
     }
     if let Ok(list) = mount.cast::<PyList>() {
         return list
             .iter()
             .map(|item| {
                 let dir = item.extract::<PyRef<'_, PyMountDir>>()?;
-                Ok(dir.spec())
+                dir.spec()
             })
             .collect();
     }

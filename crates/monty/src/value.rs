@@ -10,7 +10,7 @@ use num_bigint::{BigInt, Sign};
 use num_traits::FromPrimitive;
 
 use crate::{
-    builtins::Builtins,
+    builtins::{Builtins, BuiltinsFunctions},
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult, SimpleException},
@@ -98,26 +98,33 @@ pub(crate) enum Value {
 pub(crate) enum ValueRead<'h, 'v> {
     /// Immediate values need no heap access.
     Immediate(&'v Value),
-    /// Heap values retain both their owner and the typed heap read handle.
+    /// Heap values retain the typed heap object handle.
     Heap {
-        /// The `Value::Ref` this view was taken from. Keeps the entry alive for
-        /// the view's lifetime, and supplies the `HeapId` that `py_next` needs
-        /// to drive a user-defined `__next__`.
-        owner: &'v Value,
         value: HeapReadOutput<'h>,
+        /// `py_next` calls made through this view, keying its amortized
+        /// time check.
+        steps: usize,
     },
 }
 
 impl<'h> ValueRead<'h, '_> {
     /// Advances this value without reacquiring its heap entry.
     ///
-    /// This is the timeout boundary for Rust-side loops over retained iterators.
-    /// Bytecode iteration dispatches directly after the VM's per-opcode check.
+    /// This is the timeout boundary for Rust-side loops over retained iterators
+    /// (amortized on the view's step count). Bytecode iteration dispatches
+    /// directly after the VM's per-opcode check.
+    ///
+    /// The step count lives on the view, so a loop must hold one across its
+    /// iterations; rebuilding one per call (as `itertools.chain` does) never
+    /// polls, and is only safe under a caller whose own view counts.
     pub(crate) fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
-        vm.heap.check_time()?;
         match self {
             Self::Immediate(value) => Err(ExcType::type_error_not_iterator(&value.py_type_name(vm))),
-            Self::Heap { owner, value } => value.py_next(owner.ref_id(), vm),
+            Self::Heap { value, steps } => {
+                vm.heap.tracker.check_memory_time_every(*steps)?;
+                *steps += 1;
+                value.py_next(vm)
+            }
         }
     }
 
@@ -175,8 +182,7 @@ impl<'h> ValueRead<'h, '_> {
 
 /// Size of a single `Value` slot in bytes.
 ///
-/// Used for memory tracking when containers grow (e.g., `list.append`, `list.extend`).
-/// Must match the per-element unit used by `py_estimate_size` implementations.
+/// Used to preflight operations that allocate many value slots at once.
 pub(crate) const VALUE_SIZE: usize = mem::size_of::<Value>();
 
 /// Borrowed integer payload used to format a Python `id()` in callable reprs.
@@ -384,15 +390,15 @@ impl<'h> PyTrait<'h> for Value {
                 // cloned first because the comparison needs `&mut VM`, which
                 // cannot coexist with two live `HeapRead`s.
                 (HeapReadOutput::NamedTuple(a), HeapReadOutput::NamedTuple(b)) => {
-                    let (a, b) = (a.cloned_items(vm), b.cloned_items(vm));
+                    let (a, b) = (a.cloned_items(vm)?, b.cloned_items(vm)?);
                     cmp_item_seqs(a, b, vm)
                 }
                 (HeapReadOutput::NamedTuple(a), HeapReadOutput::Tuple(b)) => {
-                    let (a, b) = (a.cloned_items(vm), b.cloned_items(vm));
+                    let (a, b) = (a.cloned_items(vm)?, b.cloned_items(vm)?);
                     cmp_item_seqs(a, b, vm)
                 }
                 (HeapReadOutput::Tuple(a), HeapReadOutput::NamedTuple(b)) => {
-                    let (a, b) = (a.cloned_items(vm), b.cloned_items(vm));
+                    let (a, b) = (a.cloned_items(vm)?, b.cloned_items(vm)?);
                     cmp_item_seqs(a, b, vm)
                 }
                 (HeapReadOutput::List(a), HeapReadOutput::List(b)) => a.py_cmp(&b, vm),
@@ -469,12 +475,12 @@ impl<'h> PyTrait<'h> for Value {
             Self::Float(v) => Ok(write!(f, "{}", FormatFloat(*v))?),
             Self::Builtin(b) => Ok(b.py_repr_fmt(f)?),
             Self::ModuleFunction(mf) => {
-                let py_id = self.id().into_value(vm.heap)?;
+                let py_id = self.id().into_value(vm.heap);
                 defer_drop!(py_id, vm);
                 Ok(mf.py_repr_fmt(f, PythonIdDisplay::new(py_id, vm.heap))?)
             }
             Self::DefFunction(f_id) => {
-                let py_id = self.id().into_value(vm.heap)?;
+                let py_id = self.id().into_value(vm.heap);
                 defer_drop!(py_id, vm);
                 Ok(interns
                     .get_function(*f_id)
@@ -533,12 +539,12 @@ impl<'h> PyTrait<'h> for Value {
             Self::Bool(false) => Ok(Self::InternString(StaticStrings::FalseRepr.into())),
             Self::Ellipsis => Ok(Self::InternString(StaticStrings::EllipsisRepr.into())),
             Self::NotImplemented => Ok(Self::InternString(StaticStrings::NotImplementedRepr.into())),
-            Self::Int(i) => Ok(allocate_string(itoa::Buffer::new().format(*i), vm.heap)?),
+            Self::Int(i) => Ok(allocate_string(itoa::Buffer::new().format(*i), vm.heap)),
             _ => {
                 let mut s = String::new();
                 let mut heap_ids = LazyHeapSet::default();
                 self.py_repr_fmt(&mut s, vm, &mut heap_ids)?;
-                Ok(allocate_string(s, vm.heap)?)
+                Ok(allocate_string(s, vm.heap))
             }
         }
     }
@@ -557,79 +563,73 @@ impl<'h> PyTrait<'h> for Value {
         }
     }
 
-    fn py_iadd_impl(&mut self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<bool> {
+    fn py_iadd_impl(&mut self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_iadd_impl(other, vm, Some(*id))
+            vm.heap.read(*id).py_iadd_impl(other, vm)
         } else {
             Ok(false)
         }
     }
 
-    fn py_isub_impl(&mut self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<bool> {
+    fn py_isub_impl(&mut self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_isub_impl(other, vm, Some(*id))
+            vm.heap.read(*id).py_isub_impl(other, vm)
         } else {
             Ok(false)
         }
     }
 
-    fn py_iand_impl(&mut self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<bool> {
+    fn py_iand_impl(&mut self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_iand_impl(other, vm, Some(*id))
+            vm.heap.read(*id).py_iand_impl(other, vm)
         } else {
             Ok(false)
         }
     }
 
-    fn py_ior_impl(&mut self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<bool> {
+    fn py_ior_impl(&mut self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_ior_impl(other, vm, Some(*id))
+            vm.heap.read(*id).py_ior_impl(other, vm)
         } else {
             Ok(false)
         }
     }
 
-    fn py_cmp_op(
-        &self,
-        other: &Self,
-        op: CmpOperator,
-        vm: &mut VM<'_>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Option<bool>> {
+    fn py_cmp_op(&self, other: &Self, op: CmpOperator, vm: &mut VM<'_>) -> RunResult<Option<bool>> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_cmp_op(other, op, vm, Some(*id))
+            vm.heap.read(*id).py_cmp_op(other, op, vm)
         } else {
             Ok(None)
         }
     }
 
-    fn py_neg_impl(&self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_neg_impl(&self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         match self {
             // `checked_neg` catches `i64::MIN`, whose negation only fits a LongInt.
             Self::Int(n) => match n.checked_neg() {
                 Some(negated) => Ok(Some(Self::Int(negated))),
-                None => Ok(Some((-LongInt::from(*n)).into_value(vm.heap)?)),
+                None => Ok(Some((-LongInt::from(*n)).into_value(vm.heap))),
             },
             Self::Float(f) => Ok(Some(Self::Float(-f))),
             Self::Bool(b) => Ok(Some(Self::Int(if *b { -1 } else { 0 }))),
-            Self::Ref(id) => vm.heap.read(*id).py_neg_impl(vm, Some(*id)),
+            Self::Ref(id) => vm.heap.read(*id).py_neg_impl(vm),
             _ => Ok(None),
         }
     }
 
-    fn py_pos_impl(&self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_pos_impl(&self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         match self {
             // `+x` leaves a number as it is; the clone is what the caller pushes
             // in place of the operand it drops.
             Self::Int(_) | Self::Float(_) => Ok(Some(self.clone_with_heap(vm.heap))),
             Self::Bool(b) => Ok(Some(Self::Int(i64::from(*b)))),
-            Self::Ref(id) => vm.heap.read(*id).py_pos_impl(vm, Some(*id)),
+            Self::Ref(id) => vm.heap.read(*id).py_pos_impl(vm),
             _ => Ok(None),
         }
     }
 
     /// One-sided implementation of Python `+`.
-    fn py_add_impl(&self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_add_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         let interns = vm.interns;
         match (self, other) {
             // Int + Int with overflow detection
@@ -637,7 +637,7 @@ impl<'h> PyTrait<'h> for Value {
                 if let Some(result) = a.checked_add(*b) {
                     Ok(Some(Self::Int(result)))
                 } else {
-                    Ok(Some(wide_i128_into_value(i128::from(*a) + i128::from(*b), vm.heap)?))
+                    Ok(Some(wide_i128_into_value(i128::from(*a) + i128::from(*b), vm.heap)))
                 }
             }
             (Self::Float(v1), Self::Float(v2)) => Ok(Some(Self::Float(v1 + v2))),
@@ -662,7 +662,7 @@ impl<'h> PyTrait<'h> for Value {
             (Self::InternBytes(lhs), Self::Ref(rhs)) if let HeapData::Bytes(rhs) = vm.heap.get(*rhs) => {
                 Ok(Some(concat_bytes(interns.get_bytes(*lhs), rhs.as_slice(), vm.heap)?))
             }
-            (Self::Ref(id), _) => vm.heap.read(*id).py_add_impl(other, vm, Some(*id)),
+            (Self::Ref(id), _) => vm.heap.read(*id).py_add_impl(other, vm),
             _ => Ok(None),
         }
     }
@@ -677,14 +677,14 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     /// One-sided implementation of Python `-`.
-    fn py_sub_impl(&self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_sub_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         match (self, other) {
             // Int - Int with overflow detection
             (Self::Int(a), Self::Int(b)) => {
                 if let Some(result) = a.checked_sub(*b) {
                     Ok(Some(Self::Int(result)))
                 } else {
-                    Ok(Some(wide_i128_into_value(i128::from(*a) - i128::from(*b), vm.heap)?))
+                    Ok(Some(wide_i128_into_value(i128::from(*a) - i128::from(*b), vm.heap)))
                 }
             }
             // Float - Float
@@ -692,7 +692,7 @@ impl<'h> PyTrait<'h> for Value {
             // Int - Float and Float - Int
             (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 - b))),
             (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a - *b as f64))),
-            (Self::Ref(id), _) => vm.heap.read(*id).py_sub_impl(other, vm, Some(*id)),
+            (Self::Ref(id), _) => vm.heap.read(*id).py_sub_impl(other, vm),
             _ => Ok(None),
         }
     }
@@ -713,7 +713,7 @@ impl<'h> PyTrait<'h> for Value {
                 if let Some(result) = a.checked_mul(*b) {
                     Ok(Some(Self::Int(result)))
                 } else {
-                    Ok(Some(wide_i128_into_value(i128::from(*a) * i128::from(*b), vm.heap)?))
+                    Ok(Some(wide_i128_into_value(i128::from(*a) * i128::from(*b), vm.heap)))
                 }
             }
             (Self::Float(a), Self::Float(b)) => Ok(Some(Self::Float(a * b))),
@@ -845,7 +845,7 @@ impl<'h> PyTrait<'h> for Value {
                     Ok(Some(wide_i128_into_value(
                         i128::from(*a).div_euclid(i128::from(*b)),
                         vm.heap,
-                    )?))
+                    )))
                 }
             }
             // Float floor division returns float
@@ -994,11 +994,11 @@ impl<'h> PyTrait<'h> for Value {
                             if let Some(result) = base.checked_pow(exp_u32) {
                                 Ok(Some(Self::Int(result)))
                             } else if let Some(result) = i128::from(*base).checked_pow(exp_u32) {
-                                Ok(Some(wide_i128_into_value(result, vm.heap)?))
+                                Ok(Some(wide_i128_into_value(result, vm.heap)))
                             } else {
-                                check_pow_size(i64_bits(*base), u64::from(exp_u32), vm.heap.tracker())?;
+                                check_pow_size(i64_bits(*base), u64::from(exp_u32), &vm.heap.tracker)?;
                                 let bi = BigInt::from(*base).pow(exp_u32);
-                                Ok(Some(LongInt::new(bi).into_value(vm.heap)?))
+                                Ok(Some(LongInt::new(bi).into_value(vm.heap)))
                             }
                         } else {
                             // exp > u32::MAX - use BigInt with modpow-style exponentiation
@@ -1007,9 +1007,9 @@ impl<'h> PyTrait<'h> for Value {
                             #[expect(clippy::cast_sign_loss)]
                             let exp_u64 = *exp as u64;
                             // Check size before computing to prevent DoS
-                            check_pow_size(i64_bits(*base), exp_u64, vm.heap.tracker())?;
+                            check_pow_size(i64_bits(*base), exp_u64, &vm.heap.tracker)?;
                             let bi = bigint_pow(BigInt::from(*base), exp_u64);
-                            Ok(Some(LongInt::new(bi).into_value(vm.heap)?))
+                            Ok(Some(LongInt::new(bi).into_value(vm.heap)))
                         }
                     } else {
                         // Negative exponent: return float
@@ -1120,13 +1120,13 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     /// One-sided implementation of Python `&`.
-    fn py_and_impl(&self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_and_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         if let (Self::Bool(lhs), Self::Bool(rhs)) = (self, other) {
             Ok(Some(Self::Bool(*lhs && *rhs)))
         } else if let (Some(lhs), Some(rhs)) = (immediate_int(self), immediate_int(other)) {
             Ok(Some(Self::Int(lhs & rhs)))
         } else if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_and_impl(other, vm, Some(*id))
+            vm.heap.read(*id).py_and_impl(other, vm)
         } else {
             Ok(None)
         }
@@ -1142,13 +1142,13 @@ impl<'h> PyTrait<'h> for Value {
     }
 
     /// One-sided implementation of Python `|`.
-    fn py_or_impl(&self, other: &Self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_or_impl(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         if let (Self::Bool(lhs), Self::Bool(rhs)) = (self, other) {
             Ok(Some(Self::Bool(*lhs || *rhs)))
         } else if let (Some(lhs), Some(rhs)) = (immediate_int(self), immediate_int(other)) {
             Ok(Some(Self::Int(lhs | rhs)))
         } else if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_or_impl(other, vm, Some(*id))
+            vm.heap.read(*id).py_or_impl(other, vm)
         } else {
             Ok(None)
         }
@@ -1261,7 +1261,7 @@ impl<'h> PyTrait<'h> for Value {
                 {
                     let s = interns.get_str(*string_id);
                     let result_str: Box<str> = slice_collect_iterator(vm, slice_obj, s.chars(), |c| c)?;
-                    return Ok(allocate_string(result_str, vm.heap)?);
+                    return Ok(allocate_string(result_str, vm.heap));
                 }
 
                 // Handle interned string indexing, accepting Int and Bool
@@ -1273,7 +1273,7 @@ impl<'h> PyTrait<'h> for Value {
 
                 let s = interns.get_str(*string_id);
                 let c = get_char_at_index(s, index).ok_or_else(ExcType::str_index_error)?;
-                Ok(allocate_char(c, vm.heap)?)
+                Ok(allocate_char(c, vm.heap))
             }
             Self::InternBytes(bytes_id) => {
                 // Check for slice first
@@ -1282,7 +1282,7 @@ impl<'h> PyTrait<'h> for Value {
                 {
                     let bytes = interns.get_bytes(*bytes_id);
                     let result_bytes = slice_collect_iterator(vm, slice_obj, bytes.iter(), |b| *b)?;
-                    let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(result_bytes)))?;
+                    let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(result_bytes)));
                     return Ok(Self::Ref(heap_id));
                 }
 
@@ -1330,21 +1330,21 @@ impl<'h> PyTrait<'h> for Value {
         }
     }
 
-    fn py_iter(&self, _: Option<HeapId>, vm: &mut VM<'_>) -> RunResult<Self> {
+    fn py_iter(&self, vm: &mut VM<'_>) -> RunResult<Self> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_iter(Some(*id), vm)
+            vm.heap.read(*id).py_iter(vm)
         } else {
             match self {
-                Self::InternString(id) => StringIterator::from_intern(*id, vm),
-                Self::InternBytes(id) => BytesIterator::from_intern(*id, vm),
+                Self::InternString(id) => Ok(StringIterator::from_intern(*id, vm)),
+                Self::InternBytes(id) => Ok(BytesIterator::from_intern(*id, vm)),
                 _ => Err(ExcType::type_error_not_iterable(&self.py_type_name(vm))),
             }
         }
     }
 
-    fn py_next(&mut self, _: Option<HeapId>, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
+    fn py_next(&mut self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         if let Self::Ref(id) = self {
-            vm.heap.read(*id).py_next(Some(*id), vm)
+            vm.heap.read(*id).py_next(vm)
         } else {
             Err(ExcType::type_error_not_iterator(&self.py_type_name(vm)))
         }
@@ -1563,15 +1563,12 @@ impl Value {
 
     /// Returns an iterator for this value using its type-specific protocol when available.
     pub fn py_iter(&self, vm: &mut VM<'_>) -> RunResult<Self> {
-        <Self as PyTrait<'_>>::py_iter(self, None, vm)
+        <Self as PyTrait<'_>>::py_iter(self, vm)
     }
 
     /// Advances this value as an iterator, mirroring the inherent [`Value::py_iter`].
-    ///
-    /// The trait method's `self_id` is redundant for a `Value`, which already
-    /// carries its own `HeapId`, so callers use this and let the impl resolve it.
     pub(crate) fn py_next(&mut self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
-        <Self as PyTrait<'_>>::py_next(self, None, vm)
+        <Self as PyTrait<'_>>::py_next(self, vm)
     }
 
     /// Converts an owned value into its Python iterator and releases the original reference.
@@ -1588,8 +1585,8 @@ impl Value {
     pub(crate) fn read<'h, 'v>(&'v self, vm: &VM<'h>) -> ValueRead<'h, 'v> {
         match self {
             Self::Ref(id) => ValueRead::Heap {
-                owner: self,
                 value: vm.heap.read(*id),
+                steps: 0,
             },
             _ => ValueRead::Immediate(self),
         }
@@ -1650,7 +1647,7 @@ impl Value {
             // impl. Types that benefit from caching (Str/Bytes/Tuple/
             // NamedTuple/FrozenSet/Path) carry an inline `cached_hash`;
             // cheap-to-hash types recompute each call.
-            Self::Ref(id) => vm.heap.read(*id).py_hash(*id, vm),
+            Self::Ref(id) => vm.heap.read(*id).py_hash(vm),
             // Singleton values hash by discriminant
             Self::Undefined | Self::Ellipsis | Self::NotImplemented | Self::None => {
                 Ok(Some(hash_one(discriminant(self))))
@@ -1676,7 +1673,7 @@ impl Value {
     /// (`tp_iter`), then `TypeError`.
     pub fn py_contains(&self, item: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         match self {
-            Self::Ref(heap_id) => match vm.heap.read(*heap_id).py_contains_impl(*heap_id, item, vm)? {
+            Self::Ref(heap_id) => match vm.heap.read(*heap_id).py_contains_impl(item, vm)? {
                 Some(found) => Ok(found),
                 None if self.py_is_iterable(vm) => self.contains_by_iteration(item, vm),
                 None => Err(ExcType::type_error_not_container(&self.py_type_name(vm))),
@@ -1741,13 +1738,18 @@ impl Value {
                     |ss| ss == StaticStrings::DunderName,
                 );
                 if is_dunder_name {
-                    return Ok(CallResult::Value(allocate_string(
-                        t.name(vm.heap, vm.interns),
-                        vm.heap,
-                    )?));
+                    return Ok(CallResult::Value(allocate_string(t.name(vm.heap, vm.interns), vm.heap)));
                 }
                 if *t == Type::TimeZone && attr.as_str(vm.interns) == "utc" {
-                    return Ok(CallResult::Value(vm.heap.get_timezone_utc()?));
+                    return Ok(CallResult::Value(vm.heap.get_timezone_utc()));
+                }
+                // `object.__setattr__` is the only member `object` carries: it
+                // exists so a class that hooks attribute writes has a way to
+                // perform one (see `limitations/classes.md`).
+                if *t == Type::Object && attr.as_str(vm.interns) == "__setattr__" {
+                    return Ok(CallResult::Value(Self::Builtin(Builtins::Function(
+                        BuiltinsFunctions::ObjectSetattr,
+                    ))));
                 }
             }
             _ => {}
@@ -1850,7 +1852,7 @@ impl Value {
 
     /// Tries direct and reflected addition without producing the final type error.
     pub(crate) fn py_add_result(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
-        if let Some(result) = self.py_add_impl(other, vm, self.ref_id())? {
+        if let Some(result) = self.py_add_impl(other, vm)? {
             Ok(Some(result))
         } else {
             other.py_radd_impl(self, vm)
@@ -1862,7 +1864,7 @@ impl Value {
         self.binary_op(
             other,
             vm,
-            |vm| self.py_sub_impl(other, vm, self.ref_id()),
+            |vm| self.py_sub_impl(other, vm),
             |vm| other.py_rsub_impl(self, vm),
             "-",
         )
@@ -1939,7 +1941,7 @@ impl Value {
         self.binary_op(
             other,
             vm,
-            |vm| self.py_and_impl(other, vm, self.ref_id()),
+            |vm| self.py_and_impl(other, vm),
             |vm| other.py_rand_impl(self, vm),
             "&",
         )
@@ -1950,7 +1952,7 @@ impl Value {
         self.binary_op(
             other,
             vm,
-            |vm| self.py_or_impl(other, vm, self.ref_id()),
+            |vm| self.py_or_impl(other, vm),
             |vm| other.py_ror_impl(self, vm),
             "|",
         )
@@ -2330,13 +2332,6 @@ impl EitherStr {
             Self::Heap(s) => s,
         }
     }
-
-    pub fn py_estimate_size(&self) -> usize {
-        match self {
-            Self::Interned(_) => 0,
-            Self::Heap(s) => s.capacity(),
-        }
-    }
 }
 
 /// Marker values for special objects that exist but have minimal functionality.
@@ -2482,7 +2477,7 @@ mod tests {
     fn create_heap_with_longint(value: BigInt) -> (Heap, HeapId) {
         let heap = Heap::new(16, ResourceTracker::default());
         let long_int = LongInt::new(value);
-        let heap_id = heap.allocate(HeapData::LongInt(long_int)).unwrap();
+        let heap_id = heap.allocate(HeapData::LongInt(long_int));
         (heap, heap_id)
     }
 

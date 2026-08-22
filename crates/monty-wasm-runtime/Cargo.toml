@@ -18,6 +18,7 @@ repository = { workspace = true }
 crate-type = ["cdylib"]
 
 [dependencies]
+monty-alloc = { workspace = true }
 monty-proto = { workspace = true, features = ["worker"] }
 monty-types = { workspace = true }
 wit-bindgen = "0.46"

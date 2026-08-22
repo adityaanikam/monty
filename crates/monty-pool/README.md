@@ -72,16 +72,47 @@ and restored later — including on a different worker or machine — with `Chec
   worker, and spawns a replacement; the parent process and every other session stay healthy.
 - **Hard timeouts** — a parent-side deadline kills any worker whose turn exceeds
   `request_timeout` (`PoolError::Timeout`), backstopping the sandbox's own resource limits
-  and catching hangs those limits cannot see. When a session has a `max_duration` budget,
+  and catching hangs those limits cannot see. Synchronous host telemetry processors delay
+  enforcement while they run because the timer cannot be polled. When a session has a `max_duration` budget,
   the deadline also enforces it (plus `duration_limit_grace`) from outside the child.
 - **Untrusted children** — the parent treats every frame from a (possibly compromised)
   worker as untrusted: wire decoding validates everything and never panics, and a worker
   that violates the protocol is discarded.
 - **Worker recycling** — `max_checkouts_per_worker` recycles long-lived children to bound
   the impact of any slow leak.
+- **Memory limits** — a session's `max_memory` also caps the worker's live allocations,
+  enforced in the worker's own global allocator
+  ([`monty-alloc`](https://crates.io/crates/monty-alloc)) plus 4 MB of headroom (32 MB with
+  type checking), rather than letting a worker grow the host until the OOM killer
+  intervenes. Exceeding it, or a refused allocation, exits the worker with a dedicated code
+  so it is reported as `PoolError::Runtime`/`MemoryError` instead of an unclassifiable
+  abort — the one `Runtime` error whose worker does not survive.
 
 Runtime errors inside the sandbox (`PoolError::Runtime`) are not crashes: the worker and its
-session remain alive and usable.
+session remain alive and usable — the one exception being the `MemoryError` above, raised for
+a worker that has already exited.
+
+## Observability
+
+The optional `telemetry-adapter` feature records semantic execution for language bindings
+and other hosts. `monty-pool` never selects an exporter, reads credentials or environment
+variables, or shuts an exporter down; the host SDK owns those choices and its final
+flush/shutdown.
+
+Recording happens in the host process, which builds every request and decodes every event
+anyway, so both transports are covered and the workers stay uninstrumented. Each instrumented checkout
+becomes one session span; each feed is a nested span held across suspension round-trips, with
+a child span per suspension whose duration is the host round-trip. Fed code, inputs, call
+arguments and results, exceptions and `print` output are recorded in full — values encoded
+the way the Python logfire SDK encodes attributes, capped at 64KB per value — while
+`Load`/`Dump` snapshot blobs are recorded by size only. Supplying an SDK is therefore an
+explicit opt-in to recording potentially sensitive values.
+
+The adapter configures an exporter-free process-global Rust pipeline and returns a handle
+that creates each checkout's serialized parent context. Records are emitted through
+`TelemetryAdapter`; Python, Node, and third-party bindings retain ownership of their native
+SDK and exporter. Without the feature, workers contain no telemetry recorder or telemetry
+hot path.
 
 ## Transports
 

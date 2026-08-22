@@ -8,9 +8,15 @@ authors = { workspace = true }
 description = "Benchmarks for the Monty interpreter — compares Monty vs CPython"
 publish = false
 
+[features]
+# Runs the `main` bench under the worker's global allocator (`monty-alloc`)
+# instead of `System`, to price the hard memory ceiling on real workloads.
+worker-alloc = ["dep:monty-alloc"]
+
 [dependencies]
 monty = { workspace = true, features = ["test-hooks"] }
 monty-types = { workspace = true }
+monty-alloc = { workspace = true, optional = true }
 monty-pool = { workspace = true }
 monty-proto = { workspace = true }
 # The pool benchmarks use Criterion's Tokio async executor.

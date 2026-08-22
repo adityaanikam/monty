@@ -2,6 +2,12 @@
 
 mod checkout;
 mod pool;
+#[cfg(feature = "telemetry-adapter")]
+mod telemetry;
+#[cfg(feature = "telemetry-adapter")]
+pub mod telemetry_adapter;
+#[cfg(feature = "telemetry-adapter")]
+mod telemetry_json;
 mod worker;
 
 use std::{borrow::Cow, error, fmt, io, num::NonZero, path::PathBuf, process::ExitStatus, thread, time::Duration};
@@ -11,7 +17,8 @@ use monty_types::MontyException;
 
 pub use crate::{
     checkout::{
-        Checkout, MountSpec, MountSpecMode, OnPrint, PrintFuture, ReplConfig, ResumeValue, TurnEvent, on_print_sync,
+        Checkout, MountSpec, MountSpecMode, OnPrint, OnRawEvent, PrintFuture, ReplConfig, ResumeValue, TurnEvent,
+        on_print_sync,
     },
     pool::Pool,
 };
@@ -57,7 +64,8 @@ pub struct PoolConfig {
     /// Parent-side hard deadline per protocol turn: when it expires the
     /// worker is killed and the call fails with [`PoolError::Timeout`]. This
     /// backstops the child-side `ResourceLimits` — it also catches a child
-    /// that hangs in ways the sandbox limits cannot see.
+    /// that hangs in ways the sandbox limits cannot see. Synchronous host
+    /// telemetry callbacks prevent the timer from being polled while they run.
     pub request_timeout: Option<Duration>,
     /// Grace period for the automatic `max_duration` backstop.
     ///
@@ -128,7 +136,10 @@ pub enum PoolError {
     /// mid-flight, where the abandoned worker is discarded too.
     Protocol(Cow<'static, str>),
     /// The sandboxed code raised a Python exception. The worker and its
-    /// session remain alive and usable.
+    /// session remain alive and usable — except for the one `MemoryError` a
+    /// worker exceeding its memory limit produces, where the worker is already
+    /// dead and the checkout finished (its distinct message distinguishes it
+    /// from the interpreter's own `MemoryError`).
     Runtime(MontyException),
     /// Type checking rejected the fed snippet (sessions created with
     /// `type_check`). The worker and session remain alive; the snippet did
@@ -179,7 +190,9 @@ pub enum CrashCause {
     },
     /// It announced a `FatalError` and exited, so its own account replaces
     /// the pool's. A serving relay also uses this to report that it could not
-    /// start a worker at all.
+    /// start a worker at all. A worker that exceeded its memory limit is not
+    /// here at all: that exit code classifies into
+    /// [`PoolError::Runtime`] carrying a `MemoryError`.
     Announced {
         /// What the worker said before dying.
         reason: String,

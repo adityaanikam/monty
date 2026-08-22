@@ -9,7 +9,7 @@
 //! is held as a single refcounted heap reference shared across every match from
 //! one `finditer`/`findall` call, so `py_dec_ref_ids` releases that reference.
 
-use std::{cell::OnceCell, cmp::Ordering, fmt::Write, mem};
+use std::{cell::OnceCell, cmp::Ordering, fmt::Write};
 
 use smallvec::smallvec;
 
@@ -18,7 +18,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunResult},
-    heap::{DropGuard, Heap, HeapData, HeapId, HeapItem, HeapRead},
+    heap::{DropGuard, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead},
     intern::StaticStrings,
     types::{
         Dict, LazyHeapSet, PyTrait, Type, allocate_tuple,
@@ -173,7 +173,7 @@ impl ReMatch {
     /// Raises `IndexError` for invalid group numbers.
     fn get_group(&self, n: i64, heap: &Heap) -> RunResult<Value> {
         match n.cmp(&0) {
-            Ordering::Equal => Ok(allocate_string(self.full_match.as_str(), heap)?),
+            Ordering::Equal => Ok(allocate_string(self.full_match.as_str(), heap)),
             Ordering::Less => Err(ExcType::re_match_group_index_error()),
             Ordering::Greater => {
                 let idx = group_index(n);
@@ -181,7 +181,7 @@ impl ReMatch {
                     return Err(ExcType::re_match_group_index_error());
                 }
                 match &self.groups[idx] {
-                    Some(s) => Ok(allocate_string(s.as_str(), heap)?),
+                    Some(s) => Ok(allocate_string(s.as_str(), heap)),
                     None => Ok(Value::None),
                 }
             }
@@ -212,11 +212,11 @@ impl<'h> HeapRead<'h, ReMatch> {
         let this = self.get(vm.heap);
         let mut pairs = Vec::with_capacity(this.named_groups.len());
         for (name, idx) in &this.named_groups {
-            let key = allocate_string(name.as_str(), vm.heap)?;
+            let key = allocate_string(name.as_str(), vm.heap);
             // idx is 1-based, groups vec is 0-based (index 0 = group 1)
             let value = if *idx > 0 && (*idx - 1) < this.groups.len() {
                 match &this.groups[*idx - 1] {
-                    Some(s) => allocate_string(s.as_str(), vm.heap)?,
+                    Some(s) => allocate_string(s.as_str(), vm.heap),
                     None => default.clone_with_heap(vm),
                 }
             } else {
@@ -225,7 +225,7 @@ impl<'h> HeapRead<'h, ReMatch> {
             pairs.push((key, value));
         }
         let dict = Dict::from_pairs(pairs, vm)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Dict(dict))))
     }
 }
 
@@ -233,15 +233,15 @@ impl ReMatch {
     /// Returns a tuple of all capture group strings.
     ///
     /// Unmatched optional groups appear as `None`.
-    fn get_groups(&self, heap: &Heap) -> RunResult<Value> {
+    fn get_groups(&self, heap: &Heap) -> Value {
         let mut elements = smallvec![];
         for group in &self.groups {
             match group {
-                Some(s) => elements.push(allocate_string(s.as_str(), heap)?),
+                Some(s) => elements.push(allocate_string(s.as_str(), heap)),
                 None => elements.push(Value::None),
             }
         }
-        Ok(allocate_tuple(elements, heap)?)
+        allocate_tuple(elements, heap)
     }
 
     /// Returns the start character position for a given group.
@@ -291,7 +291,7 @@ impl ReMatch {
         match n.cmp(&0) {
             Ordering::Equal => {
                 let (start, end) = self.char_span(vm);
-                Ok(allocate_tuple(smallvec![Value::Int(start), Value::Int(end)], vm.heap)?)
+                Ok(allocate_tuple(smallvec![Value::Int(start), Value::Int(end)], vm.heap))
             }
             Ordering::Less => Err(ExcType::re_match_group_index_error()),
             Ordering::Greater => {
@@ -303,13 +303,13 @@ impl ReMatch {
                     Some((s, e)) => (self.char_offset(*s, vm), self.char_offset(*e, vm)),
                     None => (-1, -1),
                 };
-                Ok(allocate_tuple(smallvec![Value::Int(s), Value::Int(e)], vm.heap)?)
+                Ok(allocate_tuple(smallvec![Value::Int(s), Value::Int(e)], vm.heap))
             }
         }
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, ReMatch> {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, ReMatch> {
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::ReMatch
     }
@@ -348,18 +348,12 @@ impl<'h> PyTrait<'h> for HeapRead<'h, ReMatch> {
         }
     }
 
-    fn py_call_attr(
-        &mut self,
-        _self_id: HeapId,
-        vm: &mut VM<'h>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let result = match attr.static_string() {
             Some(StaticStrings::Group) => call_group(self, args, vm)?,
             Some(StaticStrings::Groups) => {
                 args.check_zero_args("re.Match.groups", vm.heap)?;
-                self.get(vm.heap).get_groups(vm.heap)?
+                self.get(vm.heap).get_groups(vm.heap)
             }
             Some(StaticStrings::Groupdict) => {
                 let GroupdictArgs { default } = GroupdictArgs::from_args(args, vm)?;
@@ -408,24 +402,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, ReMatch> {
 }
 
 impl HeapItem for ReMatch {
-    fn py_estimate_size(&self) -> usize {
-        // The subject is NOT counted here: it is a shared refcounted heap `Str`
-        // charged once as its own entry, so counting it per match would inflate
-        // a `finditer` of N matches to N× the subject size (see `subject`).
-        mem::size_of::<Self>()
-            + self.full_match.len()
-            + self
-                .groups
-                .iter()
-                .map(|g| g.as_ref().map_or(0, String::len))
-                .sum::<usize>()
-            + self
-                .named_groups
-                .iter()
-                .map(|(name, _)| name.len() + mem::size_of::<usize>())
-                .sum::<usize>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Release the shared subject reference (no-op for an interned subject).
         // `dec_ref_forget` neutralises the `Ref` so the struct's own `Drop`
@@ -460,7 +436,7 @@ fn call_group<'h>(m: &HeapRead<'h, ReMatch>, args: ArgValues, vm: &mut VM<'h>) -
                 elements.push(resolve_group_arg(m.get(vm.heap), val, vm)?);
             }
             let (elements, vm) = elements_guard.into_parts();
-            Ok(allocate_tuple(elements, vm.heap)?)
+            Ok(allocate_tuple(elements, vm.heap))
         }
     }
 }
