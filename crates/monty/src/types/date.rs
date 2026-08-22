@@ -185,13 +185,7 @@ impl HeapItem for Date {
 impl<'h> HeapObjectRead<'h, Date> {
     /// Compares dates without exposing representation-specific methods to dispatch.
     #[expect(clippy::unnecessary_wraps)]
-    fn rich_compare(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let Some(HeapReadOutput::Date(other)) = other.read_heap(vm) else {
             return Ok(Value::NotImplemented);
         };
@@ -212,7 +206,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Date> {
         None
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
         self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))

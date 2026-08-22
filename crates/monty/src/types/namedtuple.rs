@@ -223,7 +223,7 @@ impl<'h> HeapRead<'h, NamedTuple> {
     }
 
     /// Clones every item for [`rich_compare_item_seqs`].
-    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> Vec<Value> {
+    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> RunResult<Vec<Value>> {
         let len = self.get(vm.heap).len();
         vm.heap.tracker.check_allocation(len.saturating_mul(VALUE_SIZE))?;
         Ok((0..len).map(|i| self.clone_item(i, vm)).collect())
@@ -352,13 +352,7 @@ impl<'h> HeapObjectRead<'h, NamedTuple> {
     }
 
     /// Compares named tuples by their elements, including against plain tuples.
-    fn rich_compare(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         if op.is_equality() {
             return Ok(op.equality_result(self.eq_bool(other, vm)?));
         }
@@ -367,11 +361,11 @@ impl<'h> HeapObjectRead<'h, NamedTuple> {
             Some(HeapReadOutput::Tuple(other)) => other.cloned_items(vm),
             _ => return Ok(Value::NotImplemented),
         };
-        rich_compare_item_seqs(self.cloned_items(vm), other_items, op, vm)
+        rich_compare_item_seqs(self.cloned_items(vm)?, other_items?, op, vm)
     }
 }
 
-/// `PyTrait` implementation for `HeapRead<NamedTuple>`, providing all Python operations
+/// `PyTrait` implementation for `HeapObjectRead<NamedTuple>`, providing all Python operations
 /// on heap-allocated named tuples via short-lived borrow patterns.
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTuple> {
     const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
@@ -850,8 +844,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, NamedTupleClass> {
         None
     }
 
-    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        Ok(Some(identity_hash(self_id)))
+    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        Ok(Some(identity_hash(self.id())))
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {

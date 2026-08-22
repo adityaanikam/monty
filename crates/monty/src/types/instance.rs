@@ -65,7 +65,7 @@ pub(crate) struct BoundMethod {
     pub func: Value,
 }
 
-impl<'h> HeapObjectRead<'h, Instance> {
+impl<'h> HeapRead<'h, Instance> {
     fn attrs_mut(&mut self) -> BorrowedHeapReadMut<'_, 'h, Dict> {
         heap_read_ref_as_field_mut!(self, Instance, attrs)
     }
@@ -99,30 +99,43 @@ impl<'h> HeapObjectRead<'h, Instance> {
     pub fn set_attr_unchecked(&mut self, name: Value, value: Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         self.attrs_mut().set(name, value, vm)
     }
+}
 
-    /// Resolves and invokes the class special method for one rich comparison.
-    ///
-    /// Missing `__ne__` derives from `__eq__`; any other missing method declines
-    /// the operation. Lookup occurs immediately before invocation so mutations
-    /// made by the left comparison are visible to reflected dispatch.
-    fn rich_compare(
-        _receiver: &Self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        instance_rich_compare(self_id.expect("heap values have an id"), other, op, vm)
-    }
+/// Resolves and invokes the class special method for one rich comparison.
+///
+/// Missing `__ne__` derives from `__eq__`; any other missing method declines
+/// the operation. Lookup occurs immediately before invocation so mutations
+/// made by the left comparison are visible to reflected dispatch.
+fn instance_rich_compare_slot(
+    receiver: &HeapObjectRead<'_, Instance>,
+    other: &Value,
+    op: RichCmpOp,
+    vm: &mut VM<'_>,
+) -> RunResult<Value> {
+    instance_rich_compare(receiver.id(), other, op, vm)
 }
 
 impl<'h> PyTrait<'h> for HeapObjectRead<'h, Instance> {
-    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(instance_rich_compare_slot);
 
     /// The class's `__contains__`, or `None` when it defines none — `in` then
     /// falls back to iteration, matching CPython's `sq_contains` before `tp_iter`.
-    fn py_contains_impl(&self, self_id: HeapId, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        instance_contains(self_id, item, vm)
+    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let class_id = self.get(vm.heap).class();
+        if matches!(class_dunder(class_id, "__contains__", vm), Some(Value::None)) {
+            Err(ExcType::type_error_object_not_container(&class_name(
+                class_id, vm.heap, vm.interns,
+            )))
+        } else {
+            let item = item.clone_with_heap(vm.heap);
+            match instance_call_dunder_sync(self.id(), "__contains__", Some(item), vm)? {
+                Some(result) => {
+                    defer_drop!(result, vm);
+                    Ok(Some(result.py_bool(vm)?))
+                }
+                None => Ok(None),
+            }
+        }
     }
 
     fn py_type(&self, vm: &VM<'h>) -> Type {
@@ -372,7 +385,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, BoundMethod> {
         None
     }
 
-    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         // Bound methods hash by identity, consistent with their identity-only
         // equality (CPython hashes by `(instance, func)` — see limitations/classes.md).
         Ok(Some(identity_hash(self.id())))

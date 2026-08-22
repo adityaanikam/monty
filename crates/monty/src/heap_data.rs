@@ -564,10 +564,10 @@ pub(crate) fn heap_subscript(id: HeapId, key: &Value, vm: &mut VM<'_>) -> RunRes
 
 impl<'h> HeapReadOutput<'h> {
     /// Dispatches rich comparison through the concrete heap variant's vtable.
-    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         heap_read_output_py_trait_forward!(
             self,
-            |value| invoke_rich_cmp_slot(value, other, op, vm, self_id),
+            |value| invoke_rich_cmp_slot(value, other, op, vm),
             else {
                 if op.is_equality() {
                     Ok(op.equality_result(self.fallback_eq(other, vm)))

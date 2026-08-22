@@ -149,7 +149,7 @@ impl<'h> HeapRead<'h, Dataclass> {
 
 impl<'h> HeapObjectRead<'h, Dataclass> {
     /// Compares host dataclasses by class and attributes.
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let Some(HeapReadOutput::Dataclass(other)) = other.read_heap(vm) else {
             return Ok(Value::NotImplemented);
         };

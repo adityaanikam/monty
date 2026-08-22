@@ -357,13 +357,7 @@ impl<'h> HeapObjectRead<'h, Deque> {
     }
 
     /// Lexicographically compares two deques while bounding recursive contents.
-    fn rich_compare(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         if op.is_equality() {
             return Ok(op.equality_result(self.eq_bool(other, vm)?));
         }
@@ -648,10 +642,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DequeIterator> {
         None
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        let self_id = self_id.expect("heap values have an id");
-        vm.heap.inc_ref(self_id);
-        Ok(Value::Ref(self_id))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

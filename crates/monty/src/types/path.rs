@@ -438,7 +438,7 @@ impl Path {
 impl<'h> HeapObjectRead<'h, Path> {
     /// Compares normalized virtual paths.
     #[expect(clippy::unnecessary_wraps)]
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let Some(HeapReadOutput::Path(other)) = other.read_heap(vm) else {
             return Ok(Value::NotImplemented);
         };
@@ -458,7 +458,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Path> {
         None
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let p = self.get(vm.heap);
         if let Some(cached) = p.cached_hash.get() {
             return Ok(Some(cached));

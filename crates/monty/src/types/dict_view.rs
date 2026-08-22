@@ -157,7 +157,7 @@ impl DictView for DictKeysView {
 
 impl<'h> HeapObjectRead<'h, DictKeysView> {
     /// Compares key views with other set-like values.
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let equal = match other.read_heap(vm) {
             Some(HeapReadOutput::DictKeysView(other)) => {
                 if self.get(vm.heap).dict_id == other.get(vm.heap).dict_id {
@@ -214,7 +214,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DictKeysView> {
         Some(self.get(vm.heap).dict(vm.heap).len())
     }
 
-    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
+    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         dict_view_binary_op_value(self.to_set(vm)?, other, vm, apply_dict_view_sub)
     }
 
@@ -430,7 +430,7 @@ impl DictView for DictItemsView {
 
 impl<'h> HeapObjectRead<'h, DictItemsView> {
     /// Compares item views with other set-like values.
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let equal = match other.read_heap(vm) {
             Some(HeapReadOutput::DictItemsView(other)) => {
                 if self.get(vm.heap).dict_id == other.get(vm.heap).dict_id {
@@ -497,7 +497,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DictItemsView> {
         Some(self.get(vm.heap).dict(vm.heap).len())
     }
 
-    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
+    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         dict_view_binary_op_value(self.to_set(vm)?, other, vm, apply_dict_view_sub)
     }
 

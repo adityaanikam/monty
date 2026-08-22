@@ -362,7 +362,7 @@ impl RePattern {
 impl<'h> HeapObjectRead<'h, RePattern> {
     /// Compares compiled patterns by source and flags.
     #[expect(clippy::unnecessary_wraps)]
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let Some(HeapReadOutput::RePattern(other)) = other.read_heap(vm) else {
             return Ok(Value::NotImplemented);
         };

@@ -163,7 +163,7 @@ impl RichCmpOp {
 }
 
 /// A native implementation of one rich-comparison slot.
-pub(crate) type RichCmpFn<'h, T> = fn(&T, &Value, RichCmpOp, &mut VM<'h>, Option<HeapId>) -> RunResult<Value>;
+pub(crate) type RichCmpFn<'h, T> = fn(&T, &Value, RichCmpOp, &mut VM<'h>) -> RunResult<Value>;
 
 /// Static rich-comparison slots exposed by a Rust value implementation.
 ///
@@ -237,10 +237,9 @@ pub(crate) fn invoke_rich_cmp_slot<'h>(
     other: &Value,
     op: RichCmpOp,
     vm: &mut VM<'h>,
-    self_id: Option<HeapId>,
 ) -> RunResult<Value> {
     if let Some(compare) = <_ as PyTrait<'h>>::RICH_COMPARE.get(op) {
-        compare(receiver, other, op, vm, self_id)
+        compare(receiver, other, op, vm)
     } else {
         Ok(Value::NotImplemented)
     }
@@ -258,9 +257,9 @@ pub(crate) fn invoke_rich_cmp_slot<'h>(
 /// Methods take the concrete [`VM`]/`Heap` types, which own the resource
 /// tracker enforcing time/memory/recursion limits.
 ///
-/// The lifetime `'h` is the heap borrow lifetime. For concrete types (e.g. `Dict`,
-/// `List`) this is unused and should be `'_`. For `HeapRead<'h, T>` implementers
-/// the lifetime connects the read handle to the VM's heap reference.
+/// The lifetime `'h` connects [`crate::heap::HeapObjectRead`] implementations
+/// to the VM's heap reference; immediate [`Value`] implementations use it only
+/// through the VM argument.
 pub(crate) trait PyTrait<'h>: Sized {
     /// Native rich-comparison methods supplied by this type.
     const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::EMPTY;

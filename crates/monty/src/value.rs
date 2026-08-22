@@ -235,9 +235,9 @@ impl From<bool> for Value {
 
 impl Value {
     /// Compares immediate values and delegates heap values through their slot tables.
-    fn rich_compare(&self, other: &Self, op: RichCmpOp, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Self> {
+    fn rich_compare(&self, other: &Self, op: RichCmpOp, vm: &mut VM<'_>) -> RunResult<Self> {
         if let Self::Ref(id) = self {
-            return invoke_rich_cmp_slot(&vm.heap.read(*id), other, op, vm, Some(*id));
+            return invoke_rich_cmp_slot(&vm.heap.read(*id), other, op, vm);
         }
         if op.is_equality() {
             return Ok(op.equality_result(self.eq_bool(other, vm)));
@@ -283,10 +283,10 @@ impl Value {
                 Some(interns.get_long_int(*lhs).cmp(interns.get_long_int(*rhs)))
             }
             (Self::Bool(lhs), _) => {
-                return Self::Int(i64::from(*lhs)).rich_compare(other, op, vm, None);
+                return Self::Int(i64::from(*lhs)).rich_compare(other, op, vm);
             }
             (_, Self::Bool(rhs)) => {
-                return self.rich_compare(&Self::Int(i64::from(*rhs)), op, vm, None);
+                return self.rich_compare(&Self::Int(i64::from(*rhs)), op, vm);
             }
             (Self::Int(lhs), Self::Ref(id)) if let HeapData::LongInt(rhs) = vm.heap.get(*id) => {
                 Some(bigint_cmp_i64(rhs.inner(), *lhs).reverse())
@@ -567,7 +567,7 @@ impl<'h> PyTrait<'h> for Value {
         }
     }
 
-    fn py_neg_impl(&self, vm: &mut VM<'_>, _self_id: Option<HeapId>) -> RunResult<Option<Self>> {
+    fn py_neg_impl(&self, vm: &mut VM<'_>) -> RunResult<Option<Self>> {
         match self {
             // `checked_neg` catches `i64::MIN`, whose negation only fits a LongInt.
             Self::Int(n) => match n.checked_neg() {
@@ -1504,12 +1504,12 @@ impl Value {
     /// The left operand is tried first, followed by the reflected operation on
     /// the right. Equality falls back to identity; unsupported ordering raises.
     pub(crate) fn py_rich_compare(&self, other: &Self, op: RichCmpOp, vm: &mut VM<'_>) -> RunResult<Self> {
-        let lhs_result = invoke_rich_cmp_slot(self, other, op, vm, self.ref_id())?;
+        let lhs_result = invoke_rich_cmp_slot(self, other, op, vm)?;
         if !lhs_result.is_not_implemented() {
             return Ok(lhs_result);
         }
 
-        let rhs_result = invoke_rich_cmp_slot(other, self, op.reflected(), vm, other.ref_id())?;
+        let rhs_result = invoke_rich_cmp_slot(other, self, op.reflected(), vm)?;
         if !rhs_result.is_not_implemented() {
             return Ok(rhs_result);
         }

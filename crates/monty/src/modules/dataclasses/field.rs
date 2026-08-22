@@ -86,8 +86,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DataclassField> {
         None
     }
 
-    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        Ok(Some(identity_hash(self_id)))
+    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        Ok(Some(identity_hash(self.id())))
     }
 
     /// CPython's `Field.__repr__`, attribute for attribute. The two spellings

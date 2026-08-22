@@ -17,7 +17,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, ExcTypeExt, RunResult},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     types::{LazyHeapSet, PyTrait, RichCmpOp, RichCmpVtable, Type},
     value::Value,
 };
@@ -188,7 +188,7 @@ impl Default for Range {
 impl<'h> HeapObjectRead<'h, Range> {
     /// Compares ranges by the sequence they produce rather than raw parameters.
     #[expect(clippy::unnecessary_wraps)]
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let Some(HeapReadOutput::Range(other)) = other.read_heap(vm) else {
             return Ok(Value::NotImplemented);
         };
@@ -282,7 +282,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
         Ok(Value::Int(offset_i64))
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         // Ranges are equal by the sequence they produce, so the hash must depend
         // only on what equality compares: length, then start (if non-empty), then
         // step (only if length > 1). Hashing the raw `start`/`stop`/`step` fields
@@ -362,10 +362,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, RangeIterator> {
         None
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        let self_id = self_id.expect("heap values have an id");
-        vm.heap.inc_ref(self_id);
-        Ok(Value::Ref(self_id))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

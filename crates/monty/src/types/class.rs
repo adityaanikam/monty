@@ -148,7 +148,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Class> {
         Ok(())
     }
 
-    fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         // Class objects hash by identity (like CPython type objects).
         Ok(Some(identity_hash(self.id())))
     }

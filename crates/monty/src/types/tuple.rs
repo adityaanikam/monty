@@ -167,8 +167,8 @@ impl<'h> HeapRead<'h, Tuple> {
 
     /// Clones every item into a plain `Vec`, for the namedtuple orderings in
     /// [`rich_compare_item_seqs`](crate::types::namedtuple::rich_compare_item_seqs).
-    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> Vec<Value> {
-        self.clone_all_items(vm).into_vec()
+    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> RunResult<Vec<Value>> {
+        Ok(self.clone_all_items(vm)?.into_vec())
     }
 
     /// Clones all items from this tuple with proper refcount management.
@@ -305,20 +305,14 @@ impl<'h> HeapObjectRead<'h, Tuple> {
     /// Equality identifies the shared prefix; the first unequal pair receives
     /// the original operator and may return any Python value. Lengths decide
     /// only when every shared element compares equal.
-    fn rich_compare(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         if op.is_equality() {
             return Ok(op.equality_result(self.eq_bool(other, vm)?));
         }
         let other = match other.read_heap(vm) {
             Some(HeapReadOutput::Tuple(other)) => other,
             Some(HeapReadOutput::NamedTuple(other)) => {
-                let (a, b) = (self.cloned_items(vm), other.cloned_items(vm));
+                let (a, b) = (self.cloned_items(vm)?, other.cloned_items(vm)?);
                 return rich_compare_item_seqs(a, b, op, vm);
             }
             _ => return Ok(Value::NotImplemented),
@@ -427,7 +421,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Tuple> {
         Ok(Some(hash))
     }
 
-    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         let Some(HeapReadOutput::Tuple(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
@@ -657,10 +651,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, TupleIterator> {
         None
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        let self_id = self_id.expect("heap values have an id");
-        vm.heap.inc_ref(self_id);
-        Ok(Value::Ref(self_id))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

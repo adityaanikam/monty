@@ -93,8 +93,9 @@ pub fn sort_values(values: &mut [Value], key_fn: Option<&Value>, reverse: bool, 
 /// The `values` slice is typically either the items themselves (no key function)
 /// or the pre-computed key values.
 pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> Result<(), RunError> {
+    let mut comparisons = 0;
     if indices.len() <= INSERTION_SORT_THRESHOLD {
-        return insertion_sort_indices(indices, values, reverse, vm);
+        return insertion_sort_indices(indices, values, reverse, &mut comparisons, vm);
     }
 
     let mut scratch = indices.to_vec();
@@ -104,7 +105,17 @@ pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: 
         for start in (0..indices.len()).step_by(stride) {
             let mid = start.saturating_add(width).min(indices.len());
             let end = start.saturating_add(stride).min(indices.len());
-            merge_indices(indices, &mut scratch, values, start, mid, end, reverse, vm)?;
+            merge_indices(
+                indices,
+                &mut scratch,
+                values,
+                start,
+                mid,
+                end,
+                reverse,
+                &mut comparisons,
+                vm,
+            )?;
         }
         indices.copy_from_slice(&scratch);
         width = stride;
@@ -113,10 +124,24 @@ pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: 
 }
 
 /// Stably insertion-sorts a small index buffer using Python's `<` predicate.
-fn insertion_sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> RunResult<()> {
+fn insertion_sort_indices(
+    indices: &mut [usize],
+    values: &[Value],
+    reverse: bool,
+    comparisons: &mut usize,
+    vm: &mut VM<'_>,
+) -> RunResult<()> {
     for unsorted in 1..indices.len() {
         let mut current = unsorted;
-        while current > 0 && comes_before(&values[indices[current]], &values[indices[current - 1]], reverse, vm)? {
+        while current > 0
+            && comes_before(
+                &values[indices[current]],
+                &values[indices[current - 1]],
+                reverse,
+                comparisons,
+                vm,
+            )?
+        {
             indices.swap(current, current - 1);
             current -= 1;
         }
@@ -137,6 +162,7 @@ fn merge_indices(
     mid: usize,
     end: usize,
     reverse: bool,
+    comparisons: &mut usize,
     vm: &mut VM<'_>,
 ) -> RunResult<()> {
     let (mut left, mut right) = (start, mid);
@@ -146,7 +172,13 @@ fn merge_indices(
         } else if right == end {
             false
         } else {
-            comes_before(&values[indices[right]], &values[indices[left]], reverse, vm)?
+            comes_before(
+                &values[indices[right]],
+                &values[indices[left]],
+                reverse,
+                comparisons,
+                vm,
+            )?
         };
         *destination = if take_right {
             let index = indices[right];
@@ -162,8 +194,9 @@ fn merge_indices(
 }
 
 /// Tests whether `lhs` precedes `rhs` in the requested sort direction.
-fn comes_before(lhs: &Value, rhs: &Value, reverse: bool, vm: &mut VM<'_>) -> RunResult<bool> {
-    vm.heap.check_time()?;
+fn comes_before(lhs: &Value, rhs: &Value, reverse: bool, comparisons: &mut usize, vm: &mut VM<'_>) -> RunResult<bool> {
+    *comparisons += 1;
+    vm.heap.tracker.check_time_every(*comparisons)?;
     if reverse {
         rhs.py_rich_compare_bool(lhs, RichCmpOp::Lt, vm)
     } else {

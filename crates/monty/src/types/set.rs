@@ -963,7 +963,7 @@ impl<C: ContainsHeap> DropWithContext<C> for SetEntry {
 
 impl<'h> HeapObjectRead<'h, Set> {
     /// Compares sets and frozensets by their members.
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let equal = match other.read_heap(vm) {
             Some(HeapReadOutput::Set(other)) => Some(self.storage().eq(&other.storage(), vm)?),
             Some(HeapReadOutput::FrozenSet(other)) => Some(self.storage().eq(&other.storage(), vm)?),
@@ -1275,7 +1275,7 @@ impl FrozenSet {
 
 impl<'h> HeapObjectRead<'h, FrozenSet> {
     /// Compares frozensets and sets by their members.
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let equal = match other.read_heap(vm) {
             Some(HeapReadOutput::FrozenSet(other)) => Some(self.storage().eq(&other.storage(), vm)?),
             Some(HeapReadOutput::Set(other)) => Some(self.storage().eq(&other.storage(), vm)?),
@@ -1571,10 +1571,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, SetIterator> {
         None
     }
 
-    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        let self_id = self_id.expect("heap values have an id");
-        vm.heap.inc_ref(self_id);
-        Ok(Value::Ref(self_id))
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
     }
 
     fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {

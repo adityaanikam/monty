@@ -160,7 +160,7 @@ fn normalize_index(index: i64, length: i64, lower: i64, upper: i64) -> i64 {
 impl<'h> HeapObjectRead<'h, Slice> {
     /// Compares the three normalized slice components.
     #[expect(clippy::unnecessary_wraps)]
-    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         let Some(HeapReadOutput::Slice(other)) = other.read_heap(vm) else {
             return Ok(Value::NotImplemented);
         };
@@ -182,7 +182,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Slice> {
         None
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
         self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))

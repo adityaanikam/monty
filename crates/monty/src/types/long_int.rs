@@ -377,13 +377,7 @@ fn int_max_str_digits_threshold() -> &'static BigInt {
 impl<'h> HeapObjectRead<'h, LongInt> {
     /// Compares arbitrary-precision integers with every numeric representation.
     #[expect(clippy::unnecessary_wraps)]
-    fn rich_compare(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         if op.is_equality() {
             return Ok(op.equality_result(eq_bigint(self.get(vm.heap).inner(), other, vm)));
         }
@@ -417,7 +411,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, LongInt> {
         Ok(!self.get(vm.heap).is_zero())
     }
 
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
         Ok(Some(self.get(vm.heap).hash()))
     }
 

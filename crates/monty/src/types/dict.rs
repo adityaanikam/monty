@@ -11,13 +11,17 @@ use smallvec::{SmallVec, smallvec};
 
 use super::{
     DictItemsView, DictKeysView, DictValuesView, LazyHeapSet, PyTrait, RichCmpOp, RichCmpVtable, allocate_tuple,
+    list::repr_check_time,
 };
 use crate::{
     args::{ArgValues, FromArgs, KwargsValues},
     bytecode::{CallResult, ContainsVM, RecursionToken, VM},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, ExcTypeExt, RunResult},
-    heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
+    heap::{
+        ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead,
+        HeapReadOutput,
+    },
     intern::{Interns, StaticStrings},
     modules::collections::{
         counter::{
@@ -1149,7 +1153,7 @@ impl<'h> HeapObjectRead<'h, Dict> {
     }
 
     /// Two Counters compare as multisets; ordinary dicts decline ordering.
-    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, self_id: Option<HeapId>) -> RunResult<Value> {
+    fn rich_compare(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>) -> RunResult<Value> {
         if op.is_equality() {
             return Ok(op.equality_result(self.eq_bool(other, vm)?));
         }
@@ -1160,16 +1164,14 @@ impl<'h> HeapObjectRead<'h, Dict> {
             RichCmpOp::Ge => CounterCmp::Ge,
             RichCmpOp::Eq | RichCmpOp::Ne => unreachable!("equality handled above"),
         };
-        match (self_id, other.ref_id()) {
-            (Some(lhs), Some(rhs)) if self.both_counters(rhs, vm) => {
-                Ok(Value::Bool(counter_compare(lhs, rhs, cmp, vm)?))
-            }
+        match other.ref_id() {
+            Some(rhs) if self.both_counters(rhs, vm) => Ok(Value::Bool(counter_compare(self.id(), rhs, cmp, vm)?)),
             _ => Ok(Value::NotImplemented),
         }
     }
 }
 
-/// `PyTrait` implementation for `HeapRead<'h, Dict>`.
+/// `PyTrait` implementation for a heap-backed `Dict` object.
 ///
 /// All methods access the dict data through short-lived borrows from the heap via
 /// `self.get(vm.heap)`, and mutation methods use `self.get_mut(vm.heap)`. This avoids
@@ -1208,8 +1210,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Dict> {
         Ok(!self.get(vm.heap).is_empty())
     }
 
-    fn py_neg_impl(&self, vm: &mut VM<'h>, self_id: Option<HeapId>) -> RunResult<Option<Value>> {
-        self.counter_unary(true, vm, self_id)
+    fn py_neg_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        self.counter_unary(true, vm, self.id())
     }
 
     fn py_pos_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -1919,10 +1921,8 @@ macro_rules! impl_dict_iterator {
                 None
             }
 
-            fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-                let self_id = self_id.expect("heap values have an id");
-                vm.heap.inc_ref(self_id);
-                Ok(Value::Ref(self_id))
+            fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+                Ok(self.clone_value(vm.heap))
             }
 
             fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
