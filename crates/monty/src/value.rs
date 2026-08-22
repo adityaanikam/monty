@@ -1527,9 +1527,38 @@ impl Value {
 
     /// Truth-tests a rich-comparison result without an identity shortcut.
     pub(crate) fn py_rich_compare_bool(&self, other: &Self, op: RichCmpOp, vm: &mut VM<'_>) -> RunResult<bool> {
+        if let Some(result) = self.rich_compare_bool_fast(other, op) {
+            return Ok(result);
+        }
         let result = self.py_rich_compare(other, op, vm)?;
+        // A native slot answers with a plain `bool`; only a user-defined method
+        // can hand back an object that needs the truth-test protocol.
+        if let Self::Bool(result) = result {
+            return Ok(result);
+        }
         defer_drop!(result, vm);
         result.py_bool(vm)
+    }
+
+    /// Answers the comparisons that dominate sorting without slot dispatch.
+    ///
+    /// `sorted()`, `min()`/`max()` and container equality compare plain `int`s
+    /// (and `float`s) far more often than anything else, and each of those
+    /// comparisons otherwise walks the reflected protocol, builds an
+    /// intermediate [`Value`] and truth-tests it. Both arms below produce
+    /// exactly what [`Self::rich_compare`] would, so the slow path stays the
+    /// single source of truth for everything else.
+    #[inline]
+    fn rich_compare_bool_fast(&self, other: &Self, op: RichCmpOp) -> Option<bool> {
+        match (self, other) {
+            (Self::Int(lhs), Self::Int(rhs)) => Some(op.holds(lhs.cmp(rhs))),
+            // A `NaN` is unordered rather than unequal, so `==`/`!=` keep to the
+            // general path where that distinction is made.
+            (Self::Float(lhs), Self::Float(rhs)) if !op.is_equality() => {
+                Some(lhs.partial_cmp(rhs).is_some_and(|ordering| op.holds(ordering)))
+            }
+            _ => None,
+        }
     }
 
     /// Returns an iterator for this value using its type-specific protocol when available.
