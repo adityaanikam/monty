@@ -95,8 +95,7 @@ upload-cpython-image: ## Build the monty-cpython docker image and push to ghcr.i
 dev-py-pgo: ## Install the Python package with a PGO-optimized Monty interpreter
 	rustup component add llvm-tools --toolchain stable
 	rm -rf target/pgo-wheels
-	uvx --from 'maturin==1.14.1' maturin build -m crates/monty-runtime/Cargo.toml --release --pgo -i "$$(uv run python -c 'import sys; print(sys.executable)')" --out target/pgo-wheels
-	uv pip install --python "$$(uv run python -c 'import sys; print(sys.executable)')" --reinstall --no-deps target/pgo-wheels/pydantic_monty_runtime-*.whl
+	uv run maturin develop --uv -m crates/monty-runtime/Cargo.toml --pgo
 	uv run maturin develop --uv -m crates/monty-python/Cargo.toml --release
 
 .PHONY: format-rs

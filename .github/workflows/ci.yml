@@ -554,10 +554,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'manylinux_2_28' }}
-          # FIXME: should not need `-i`
-          # see https://github.com/PyO3/maturin/issues/3256 which causes per-version builds
-          args: --release ${{ matrix.pgo-runtime && '--pgo' || '' }} --out dist -i 3.10 3.11 3.12 3.13 3.14
-          maturin-version: v1.14.1
+          args: --release ${{ matrix.pgo-runtime && '--pgo' || '' }} --out dist
           rust-toolchain: stable
           rustup-components: ${{ matrix.pgo-runtime && 'llvm-tools-preview' || '' }}
           docker-options: -e CI
