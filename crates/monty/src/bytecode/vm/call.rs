@@ -442,7 +442,7 @@ impl VM<'_> {
 
     /// Converts a nested VM suspension into a specific synchronous-context error.
     #[cold]
-    fn unsupported_frame_exit(&mut self, ctx: &'static str, exit: FrameExit) -> RunError {
+    pub(super) fn unsupported_frame_exit(&mut self, ctx: &'static str, exit: FrameExit) -> RunError {
         let error = match &exit {
             FrameExit::Return(_) => unreachable!("return exits are handled above"),
             FrameExit::ExternalCall { function_name, .. } => ExcType::not_implemented(format!(
@@ -813,7 +813,7 @@ impl VM<'_> {
     /// during preparation, outside the contiguous param/cell/free region — so a
     /// positional `push` would place it wrong. Shared by sync calls and
     /// coroutine creation.
-    fn install_closure_cells(&mut self, func: &Function, cells: &[HeapId], namespace: &mut Vec<Value>) {
+    pub(super) fn install_closure_cells(&mut self, func: &Function, cells: &[HeapId], namespace: &mut Vec<Value>) {
         namespace.resize_with(func.namespace_size, || Value::Undefined);
 
         for (i, &slot) in func.cell_var_slots.iter().enumerate() {

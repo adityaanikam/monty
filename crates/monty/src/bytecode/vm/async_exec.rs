@@ -494,14 +494,20 @@ impl<'h> VM<'h> {
         let frames: Vec<SerializedTaskFrame> = self
             .frames
             .drain(..)
-            .map(|f| SerializedTaskFrame {
-                function_id: f.function_id,
-                ip: f.ip,
-                stack_base: f.stack_base,
-                locals_count: f.locals_count,
-                exception_stack_base: f.exception_stack_base,
-                call_offset: f.call_offset,
-                is_initializer: f.is_initializer,
+            .map(|f| {
+                assert!(
+                    f.generator_id.is_none(),
+                    "cannot save an actively executing generator frame as an async task"
+                );
+                SerializedTaskFrame {
+                    function_id: f.function_id,
+                    ip: f.ip,
+                    stack_base: f.stack_base,
+                    locals_count: f.locals_count,
+                    exception_stack_base: f.exception_stack_base,
+                    call_offset: f.call_offset,
+                    is_initializer: f.is_initializer,
+                }
             })
             .collect();
 
@@ -564,6 +570,7 @@ impl<'h> VM<'h> {
                         exception_stack_base: sf.exception_stack_base,
                         function_id: sf.function_id,
                         call_offset: sf.call_offset,
+                        generator_id: None,
                         should_return: false,
                         is_initializer: sf.is_initializer,
                     }

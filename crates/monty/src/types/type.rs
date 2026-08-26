@@ -210,6 +210,8 @@ pub enum Type {
     /// inheritance, so it exists to carry `object.__setattr__`, the write that
     /// bypasses a class's attribute hooks. Constructing it is unsupported.
     Object,
+    /// Iterator produced by a generator expression.
+    Generator,
 }
 
 /// Writes the canonical static name of every non-[`Instance`](Type::Instance)
@@ -353,6 +355,7 @@ impl Type {
                 | Self::ItertoolsDropWhile
                 | Self::ItertoolsFilterFalse
                 | Self::ItertoolsStarMap
+                | Self::Generator
         )
     }
 

@@ -12,6 +12,7 @@ mod compare;
 mod context_manager;
 mod exceptions;
 mod format;
+mod generator;
 mod recursion;
 mod scheduler;
 
@@ -364,8 +365,11 @@ pub struct CallFrame<'code> {
     /// skip the location-table scan unless the call raises. `None` at the root.
     call_offset: Option<u32>,
 
+    /// Generator owning this resumable frame, or `None` for ordinary calls.
+    generator_id: Option<HeapId>,
+
     /// When this frame returns (or exits with an exception) the VM should exit the run loop
-    /// and return to the caller. Supports `evaluate_function`.
+    /// and return to the caller. Supports `evaluate_function` and generator advancement.
     should_return: bool,
 
     /// Whether this frame is a class `__init__` running for `Foo(...)`.
@@ -392,6 +396,7 @@ impl<'code> CallFrame<'code> {
             exception_stack_base,
             function_id: None,
             call_offset: None,
+            generator_id: None,
             should_return: false,
             is_initializer: false,
         }
@@ -421,6 +426,7 @@ impl<'code> CallFrame<'code> {
             exception_stack_base,
             function_id: Some(function_id),
             call_offset,
+            generator_id: None,
             should_return: false,
             is_initializer: false,
         }
@@ -572,6 +578,10 @@ impl CallFrame<'_> {
         assert!(
             !self.should_return,
             "cannot serialize frame marked for return - not yet supported"
+        );
+        assert!(
+            self.generator_id.is_none(),
+            "cannot serialize an actively executing generator frame"
         );
         SerializedFrame {
             function_id: self.function_id,
@@ -823,6 +833,7 @@ impl<'h> VM<'h> {
                     exception_stack_base: sf.exception_stack_base,
                     function_id: sf.function_id,
                     call_offset: sf.call_offset,
+                    generator_id: None,
                     should_return: false,
                     is_initializer: sf.is_initializer,
                 }
@@ -1607,6 +1618,15 @@ impl<'h> VM<'h> {
                         self.push(Value::Ref(heap_id));
                     }
                 }
+                Opcode::MakeGenerator => {
+                    let (func_idx, cell_count) = cached_frame.fetch_u16_u8();
+                    let function_id = FunctionId::from_index(func_idx);
+                    try_catch_sync!(
+                        self,
+                        cached_frame,
+                        self.make_generator(function_id, cell_count as usize)
+                    );
+                }
                 Opcode::MakeClosure => {
                     let (func_idx, defaults_count, cell_count) = cached_frame.fetch_u16_u8_u8();
                     let func_id = FunctionId::from_index(func_idx);
@@ -1721,6 +1741,15 @@ impl<'h> VM<'h> {
                         // exception machinery rather than aborting the run.
                         Err(err) => catch_sync!(self, cached_frame, err),
                     }
+                }
+                Opcode::YieldValue => {
+                    let value = self.pop();
+                    self.current_frame_mut().ip = cached_frame.ip;
+                    if let Err(error) = self.suspend_generator(cached_frame.ip) {
+                        value.drop_with(self);
+                        return Err(error);
+                    }
+                    return Ok(FrameExit::Return(value));
                 }
                 // Return - reload cache after popping frame
                 Opcode::ReturnValue => {

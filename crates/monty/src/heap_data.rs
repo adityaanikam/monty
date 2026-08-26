@@ -23,7 +23,7 @@ use crate::{
     },
     types::{
         BoundMethod, Bytes, BytesIterator, Class, Dataclass, Deque, Dict, DictItemIterator, DictItemsView,
-        DictKeyIterator, DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, Instance,
+        DictKeyIterator, DictKeysView, DictValueIterator, DictValuesView, ExtFunction, FrozenSet, Generator, Instance,
         ItertoolsIter, LazyHeapSet, List, LongInt, Module, NamedTuple, NamedTupleClass, OpenFile, Path, PyTrait, Range,
         RangeIterator, ReMatch, RePattern, Set, SetIterator, Slice, Str, StringIterator, Tuple, TupleIterator, Type,
         callable_iterator::CallableIterator, date, datetime, deque::DequeIterator, list::ListIterator,
@@ -192,6 +192,8 @@ pub(crate) enum HeapData {
     /// The `@dataclass(...)` options of a `@dataclass`, held by the class's
     /// `__dataclass_params__` entry.
     DataclassParams(DataclassParams),
+    /// A lazy generator-expression iterator with a saved synthetic frame.
+    Generator(Generator),
 }
 
 // `HeapData` is memcpy'd on every allocate and free, so its inline size is paid on
@@ -245,7 +247,8 @@ impl HeapData {
             | Self::Module(_)
             | Self::Coroutine(_)
             | Self::GatherFuture(_)
-            | Self::ExternalFuture(_) => true,
+            | Self::ExternalFuture(_)
+            | Self::Generator(_) => true,
             // Leaf types, plus iterators whose heap refs only point at leaves and so
             // cannot close a cycle. Move one up if it gains a container-valued field.
             Self::Str(_)
@@ -337,6 +340,7 @@ impl HeapData {
             Self::SetIterator(_) => Type::SetIterator,
             Self::CallableIterator(_) => Type::CallableIterator,
             Self::Itertools(i) => i.py_type(),
+            Self::Generator(_) => Type::Generator,
         }
     }
 }
@@ -495,6 +499,7 @@ macro_rules! heap_read_output_py_trait_forward {
             Self::SetIterator($value) => $body,
             Self::CallableIterator($value) => $body,
             Self::Itertools($value) => $body,
+            Self::Generator($value) => $body,
             Self::Tuple($value) => $body,
             Self::NamedTuple($value) => $body,
             Self::NamedTupleClass($value) => $body,
@@ -982,6 +987,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::SetIterator(value) => value.py_iter(vm),
             Self::CallableIterator(value) => value.py_iter(vm),
             Self::Itertools(value) => value.py_iter(vm),
+            Self::Generator(value) => value.py_iter(vm),
             Self::Tuple(value) => value.py_iter(vm),
             Self::NamedTuple(value) => value.py_iter(vm),
             Self::Dict(value) => value.py_iter(vm),
@@ -1039,6 +1045,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::SetIterator(value) => value.py_next(vm),
             Self::CallableIterator(value) => value.py_next(vm),
             Self::Itertools(value) => value.py_next(vm),
+            Self::Generator(value) => value.py_next(vm),
             Self::Tuple(value) => value.py_next(vm),
             Self::NamedTuple(value) => value.py_next(vm),
             Self::Dict(value) => value.py_next(vm),
