@@ -1,11 +1,14 @@
 use std::time::Duration;
 
-use monty::{
-    CodeLoc, DictPairs, ExcData, ExcType, ExtFunctionResult, MontyDate, MontyDateTime, MontyException, MontyFileHandle,
-    MontyObject, MontyRun, MontyTimeDelta, MontyTimeZone, MontyType, NameLookupResult, ResourceLimits, StackFrame,
-    UnicodeErrorData,
-};
+use insta::assert_snapshot;
+use monty::MontyRun;
 use monty_proto::{MAX_VALUE_DEPTH, ProtoConvertError, WireObject, exceeds_max_value_depth, pb};
+use monty_types::{
+    CodeLoc, CompileOptions, DictPairs, ExcData, ExcType, ExtFunctionResult, GetenvArgs, JsonErrorData, MkdirCallArgs,
+    MontyDate, MontyDateTime, MontyException, MontyFileHandle, MontyObject, MontyPath, MontyTimeDelta, MontyTimeZone,
+    MontyType, NameLookupResult, OpenCallArgs, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs, RenameCallArgs,
+    ResourceLimits, StackFrame, UnicodeErrorData,
+};
 use num_bigint::BigInt;
 use prost::Message;
 
@@ -146,10 +149,22 @@ fn exception_and_type_values_round_trip() {
     });
     assert_value_round_trip(&MontyObject::Type(MontyType::Int));
     assert_value_round_trip(&MontyObject::Type(MontyType::DateTime));
+    // Qualified name (`collections.deque`) must survive the wire round-trip.
+    assert_value_round_trip(&MontyObject::Type(MontyType::Deque));
     assert_value_round_trip(&MontyObject::Type(MontyType::Exception(ExcType::KeyError)));
     assert_value_round_trip(&MontyObject::Type(MontyType::Instance("Foo".to_owned())));
     let builtin = MontyObject::builtin_function_from_name("len").expect("len is a builtin");
     assert_value_round_trip(&builtin);
+    // A dotted builtin name must survive too: `object.__setattr__` is the one
+    // whose name is not just its lowercased variant, so it is the only variant
+    // that can drift between the strum and serde spellings.
+    let dotted =
+        MontyObject::builtin_function_from_name("object.__setattr__").expect("object.__setattr__ is a builtin");
+    assert_value_round_trip(&dotted);
+    assert_eq!(
+        serde_json::to_string(&dotted).expect("serializes"),
+        r#"{"BuiltinFunction":"object.__setattr__"}"#
+    );
 }
 
 #[test]
@@ -194,7 +209,13 @@ fn repr_and_cycle_round_trip() {
     // Cycles appear in worker outputs (e.g. a returned cyclic list), so the
     // parent must decode them; produce one via execution and round-trip it.
     // Using one as an *execution input* is rejected by `MontyObject::to_value`.
-    let run = MontyRun::new("a = []\na.append(a)\na".to_owned(), "test.py", vec![]).unwrap();
+    let run = MontyRun::new(
+        "a = []\na.append(a)\na".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    )
+    .unwrap();
     let cyclic = run.run_no_limits(vec![]).unwrap();
     assert_value_round_trip(&cyclic);
     assert!(matches!(&cyclic, MontyObject::List(items) if matches!(items[0], MontyObject::Cycle(_, _))));
@@ -256,6 +277,32 @@ fn invalid_stack_frame_coordinates_are_rejected() {
         })
     ));
     StackFrame::try_from(frame(1, 6)).expect("in-range columns must convert");
+}
+
+/// Multi-line spans render their preview as a pre-computed block with no
+/// caret math, and legitimately end on a lower column than they start (a
+/// call closed by a hanging `)`), so the same-line column validation must
+/// not reject them — regression test for issue #631, where such frames were
+/// discarded as "invalid exception payload", replacing the real exception.
+#[test]
+fn multiline_stack_frame_with_lower_end_column_converts() {
+    let frame = pb::StackFrame {
+        filename: "main.py".to_owned(),
+        start: Some(pb::CodeLoc { line: 4, column: 5 }),
+        end: Some(pb::CodeLoc { line: 6, column: 2 }),
+        frame_name: None,
+        preview_line: Some("r = f(\n    a=1,\n)".to_owned()),
+        hide_caret: false,
+        hide_frame_name: false,
+    };
+    let frame = StackFrame::try_from(frame).expect("multi-line span must convert");
+    // rendering takes the caret-free block path, so hostile columns are inert
+    assert_snapshot!(frame, @r#"
+      File "main.py", line 4, in <module>
+        r = f(
+            a=1,
+        )
+    "#);
 }
 
 #[test]
@@ -346,16 +393,95 @@ fn bogus_unicode_payloads_are_dropped_not_trusted() {
 }
 
 #[test]
+fn json_error_payload_round_trips() {
+    let data = JsonErrorData {
+        msg: "Expecting value".to_owned(),
+        doc: Some("[1,\n2,]".to_owned()),
+        pos: 6,
+        lineno: 2,
+        colno: 3,
+    };
+    let exc = MontyException::new(
+        ExcType::JsonDecodeError,
+        Some("Expecting value: line 2 column 3 (char 6)".to_owned()),
+    )
+    .with_data(ExcData::Json(Box::new(data)));
+    let back = MontyException::try_from(pb::RaisedException::from(&exc)).unwrap();
+    assert_eq!(back, exc);
+
+    // A payload without a document (dropped for oversized inputs) also survives.
+    let exc = MontyException::new(ExcType::JsonDecodeError, Some("boom".to_owned())).with_data(ExcData::Json(
+        Box::new(JsonErrorData {
+            msg: "Expecting value".to_owned(),
+            doc: None,
+            pos: 100_000,
+            lineno: 5,
+            colno: 2,
+        }),
+    ));
+    let back = MontyException::try_from(pb::RaisedException::from(&exc)).unwrap();
+    assert_eq!(back, exc);
+}
+
+/// Builds a wire `json.JSONDecodeError` whose payload fields a byzantine
+/// child controls, for probing the receive-side sanitizer.
+fn json_exception(msg: String, doc: Option<String>, pos: u64, lineno: u64, colno: u64) -> pb::RaisedException {
+    pb::RaisedException {
+        exc_type: "json.JSONDecodeError".to_owned(),
+        message: Some("boom".to_owned()),
+        traceback: vec![],
+        data: Some(pb::ExcData {
+            kind: Some(pb::exc_data::Kind::Json(pb::JsonErrorData {
+                msg,
+                doc,
+                pos,
+                lineno,
+                colno,
+            })),
+        }),
+    }
+}
+
+#[test]
+fn bogus_json_payloads_are_dropped_not_trusted() {
+    let oversized = "x".repeat(JsonErrorData::MAX_DOC_LEN + 1);
+    // As with unicode payloads, rejected data must not block conversion.
+    let bogus = [
+        json_exception(oversized.clone(), None, 0, 1, 1),
+        json_exception("msg".to_owned(), Some(oversized), 0, 1, 1),
+        // 0 is not a valid 1-based line/column
+        json_exception("msg".to_owned(), None, 0, 0, 1),
+        json_exception("msg".to_owned(), None, 0, 1, 0),
+        // pos beyond the document
+        json_exception("msg".to_owned(), Some("[]".to_owned()), 3, 1, 1),
+    ];
+    for proto in bogus {
+        let back = MontyException::try_from(proto).expect("malformed payload must not block conversion");
+        assert_eq!(back.data(), &ExcData::None);
+    }
+
+    // An in-bounds payload survives sanitization intact; pos may equal the
+    // document length (errors at end of input).
+    let back = MontyException::try_from(json_exception(
+        "Expecting value".to_owned(),
+        Some("[1,".to_owned()),
+        3,
+        1,
+        4,
+    ))
+    .unwrap();
+    assert!(matches!(back.data(), ExcData::Json(data) if data.pos == 3 && data.colno == 4));
+}
+
+#[test]
 fn resource_limits_round_trip() {
     let limits = ResourceLimits {
-        max_allocations: Some(10_000),
         max_duration: Some(Duration::from_millis(1500)),
         max_memory: Some(64 * 1024 * 1024),
         gc_interval: Some(100),
-        max_recursion_depth: Some(50),
+        max_recursion_depth: 50,
     };
     let back = ResourceLimits::from(pb::ResourceLimits::from(&limits));
-    assert_eq!(back.max_allocations, limits.max_allocations);
     assert_eq!(back.max_duration, limits.max_duration);
     assert_eq!(back.max_memory, limits.max_memory);
     assert_eq!(back.gc_interval, limits.gc_interval);
@@ -364,11 +490,10 @@ fn resource_limits_round_trip() {
 
 #[test]
 fn empty_resource_limits_default_recursion_depth() {
-    // an all-absent wire message must behave like ResourceLimits::new():
+    // an all-absent wire message must behave like ResourceLimits::default():
     // unlimited everything except the standard recursion-depth default
     let back = ResourceLimits::from(pb::ResourceLimits::default());
-    let expected = ResourceLimits::new();
-    assert_eq!(back.max_allocations, expected.max_allocations);
+    let expected = ResourceLimits::default();
     assert_eq!(back.max_duration, expected.max_duration);
     assert_eq!(back.max_memory, expected.max_memory);
     assert_eq!(back.gc_interval, expected.gc_interval);
@@ -459,9 +584,9 @@ fn decodes_in_frame(value: &MontyObject) -> bool {
                 name: "v".to_owned(),
                 value: Some(WireObject::new(value.clone())),
             }],
-            mounts: vec![],
             skip_type_check: false,
         })),
+        trace_parent: None,
     };
     pb::ParentRequest::decode(request.encode_to_vec().as_slice()).is_ok()
 }
@@ -502,4 +627,140 @@ fn depth_check_matches_frame_decodability() {
             max_depth + 1
         );
     }
+}
+
+// =============================================================================
+// OsCall conversions — the typed wire arms and `OsFunctionCall` map 1:1.
+// =============================================================================
+
+/// Asserts `call` survives `OsFunctionCall -> wire bytes -> OsFunctionCall`
+/// through the generated `OsCall` message. Compared via `Debug` since
+/// `OsFunctionCall` has no `PartialEq`.
+#[track_caller]
+fn assert_os_call_round_trip(call: OsFunctionCall) {
+    let expected = format!("{call:?}");
+    let bytes = pb::OsCall {
+        call_id: 3,
+        call: Some(call.into()),
+    }
+    .encode_to_vec();
+    let decoded = pb::OsCall::decode(bytes.as_slice()).expect("wire bytes -> OsCall failed");
+    assert_eq!(decoded.call_id, 3);
+    let back = OsFunctionCall::try_from(decoded.call.expect("decoded OsCall has no call"))
+        .expect("wire call -> OsFunctionCall failed");
+    assert_eq!(format!("{back:?}"), expected);
+}
+
+#[test]
+fn os_calls_round_trip_all_variants() {
+    let p = || MontyPath::new("/mnt/data/f.txt".to_owned());
+    for call in [
+        OsFunctionCall::Exists(p()),
+        OsFunctionCall::IsFile(p()),
+        OsFunctionCall::IsDir(p()),
+        OsFunctionCall::IsSymlink(p()),
+        OsFunctionCall::ReadText(p()),
+        OsFunctionCall::ReadBytes(p()),
+        OsFunctionCall::Stat(p()),
+        OsFunctionCall::Iterdir(p()),
+        OsFunctionCall::Resolve(p()),
+        OsFunctionCall::Absolute(p()),
+        OsFunctionCall::Unlink(p()),
+        OsFunctionCall::Rmdir(p()),
+        OsFunctionCall::WriteText(PathStringDataArgs {
+            path: p(),
+            data: "hello".to_owned(),
+        }),
+        OsFunctionCall::AppendText(PathStringDataArgs {
+            path: p(),
+            data: String::new(),
+        }),
+        OsFunctionCall::WriteBytes(PathBytesDataArgs {
+            path: p(),
+            data: vec![1, 2, 3],
+        }),
+        OsFunctionCall::AppendBytes(PathBytesDataArgs {
+            path: p(),
+            data: vec![],
+        }),
+        OsFunctionCall::Mkdir(MkdirCallArgs {
+            path: p(),
+            parents: true,
+            exist_ok: false,
+        }),
+        OsFunctionCall::Rename(RenameCallArgs {
+            src: p(),
+            dst: MontyPath::new("/mnt/data/g.txt".to_owned()),
+        }),
+        OsFunctionCall::Getenv(GetenvArgs {
+            key: "HOME".to_owned(),
+            default: MontyObject::None,
+        }),
+        OsFunctionCall::Getenv(GetenvArgs {
+            key: "PATH".to_owned(),
+            default: MontyObject::List(vec![MontyObject::Int(1)]),
+        }),
+        OsFunctionCall::GetEnviron,
+        OsFunctionCall::DateToday,
+        OsFunctionCall::DateTimeNow(None),
+        OsFunctionCall::DateTimeNow(Some(MontyTimeZone {
+            offset_seconds: 3600,
+            name: Some("CET".to_owned()),
+        })),
+    ] {
+        assert_os_call_round_trip(call);
+    }
+}
+
+#[test]
+fn os_call_open_round_trips_all_modes() {
+    // Only the modes `FromStr` produces — the `+` update modes are reserved
+    // and unreachable from user input.
+    for mode in ["r", "rb", "w", "wb", "a", "ab"] {
+        assert_os_call_round_trip(OsFunctionCall::Open(OpenCallArgs {
+            path: MontyPath::new("/mnt/data/f.txt".to_owned()),
+            mode: mode.parse().unwrap(),
+        }));
+    }
+}
+
+#[test]
+fn os_call_conversion_rejects_invalid_payloads() {
+    // A bogus open mode the child could never produce.
+    let bad_mode = pb::os_call::Call::Open(pb::os_call::Open {
+        path: "/mnt/data/f.txt".to_owned(),
+        mode: "q".to_owned(),
+    });
+    assert!(matches!(
+        OsFunctionCall::try_from(bad_mode),
+        Err(ProtoConvertError::InvalidFileMode(mode)) if mode == "q"
+    ));
+    // os.getenv always carries a default (None when the sandbox omitted it).
+    let missing_default = pb::os_call::Call::Getenv(pb::os_call::Getenv {
+        key: "HOME".to_owned(),
+        default: None,
+    });
+    assert!(matches!(
+        OsFunctionCall::try_from(missing_default),
+        Err(ProtoConvertError::MissingField("Getenv.default"))
+    ));
+}
+
+#[test]
+fn shutdown_event_round_trips() {
+    let event = pb::ChildEvent {
+        kind: Some(pb::child_event::Kind::Shutdown(pb::ShutdownDump {
+            dump: Some(vec![1, 2, 3]),
+        })),
+        ..Default::default()
+    };
+    let back = pb::ChildEvent::decode(event.encode_to_vec().as_slice()).expect("ShutdownDump event decodes");
+    assert_eq!(back, event);
+    // a shutdown with nothing to dump (no session yet) also round-trips
+    let bare = pb::ChildEvent {
+        kind: Some(pb::child_event::Kind::Shutdown(pb::ShutdownDump { dump: None })),
+        ..Default::default()
+    };
+    let back = pb::ChildEvent::decode(bare.encode_to_vec().as_slice()).expect("bare ShutdownDump decodes");
+    assert_eq!(back, bare);
 }

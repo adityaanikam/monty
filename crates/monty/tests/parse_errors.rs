@@ -1,11 +1,12 @@
 use std::fmt::Write;
 
 use insta::assert_snapshot;
-use monty::{ExcType, MontyException, MontyRun};
+use monty::MontyRun;
+use monty_types::{CompileOptions, ExcType, MontyException};
 
 /// Helper to extract the exception from a parse error.
 fn get_parse_err(code: impl Into<String>) -> MontyException {
-    let result = MontyRun::new(code.into(), "test.py", vec![]);
+    let result = MontyRun::new(code.into(), "test.py", vec![], CompileOptions::default());
     result.expect_err("expected parse error")
 }
 
@@ -30,6 +31,7 @@ fn simple_classes_compile_successfully() {
         "class Foo:\n    def m(self):\n        return 1".to_owned(),
         "test.py",
         vec![],
+        CompileOptions::default(),
     );
     assert!(result.is_ok(), "a simple class should compile");
 }
@@ -42,22 +44,6 @@ fn class_inheritance_returns_not_implemented_error() {
         err.message().unwrap(),
         @"The monty syntax parser does not yet support class inheritance and metaclasses"
     );
-}
-
-#[test]
-fn class_decorators_return_not_implemented_error() {
-    let err = get_parse_err("@deco\nclass Foo: pass");
-    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
-    assert_snapshot!(err.message().unwrap(), @"The monty syntax parser does not yet support class decorators");
-}
-
-#[test]
-fn function_decorators_return_not_implemented_error() {
-    // A top-level `def` decorator is rejected rather than silently ignored:
-    // silently dropping a decorator would change behaviour without warning.
-    let err = get_parse_err("@deco\ndef foo(): pass");
-    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
-    assert_snapshot!(err.message().unwrap(), @"The monty syntax parser does not yet support function decorators");
 }
 
 #[test]
@@ -102,6 +88,7 @@ fn non_literal_class_var_compiles_successfully() {
         "class Foo:\n    a = 1\n    b = a + 1\n    c = [a, b]".to_owned(),
         "test.py",
         vec![],
+        CompileOptions::default(),
     );
     assert!(result.is_ok(), "non-literal class variables should compile");
 }
@@ -126,8 +113,87 @@ fn unknown_imports_compile_successfully_error_deferred_to_runtime() {
     // Unknown modules (not sys, typing, os, etc.) compile successfully.
     // The ModuleNotFoundError is deferred to runtime, allowing TYPE_CHECKING
     // imports to work without causing compile-time errors.
-    let result = MontyRun::new("import foobar".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new("import foobar".to_owned(), "test.py", vec![], CompileOptions::default());
     assert!(result.is_ok(), "unknown import should compile successfully");
+}
+
+#[test]
+fn explicit_class_annotations_assignment_returns_not_implemented_error() {
+    // The synthesized `__annotations__` is the last class-body statement, so an
+    // explicit assignment would be silently clobbered and its entries lost.
+    // CPython merges the two; Monty rejects rather than dropping them quietly.
+    let err = get_parse_err("class C:\n    __annotations__ = {'a': 'b'}\n    x: int");
+    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+    assert_snapshot!(
+        err.message().unwrap(),
+        @"The monty syntax parser does not yet support assigning `__annotations__` in a class body with annotated names"
+    );
+}
+
+#[test]
+fn class_binding_annotations_without_annotated_names_compiles() {
+    // With nothing to store, the body's own binding stands rather than being
+    // overwritten by a synthesized empty dict — CPython accepts both of these,
+    // so rejecting them would fail class bodies that are perfectly valid.
+    for body in [
+        "__annotations__ = {'a': 'b'}",
+        "def __annotations__(self):\n        return 1",
+    ] {
+        let code = format!("class C:\n    {body}\n");
+        let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+        assert!(result.is_ok(), "`{body}` should compile");
+    }
+}
+
+#[test]
+fn supported_future_imports_compile_successfully() {
+    // `__future__` imports are compiler directives, not real imports. All but
+    // `annotations` became mandatory in Python 3.7 or earlier and so are inert
+    // in CPython too; `annotations` is a no-op because Monty already stringizes
+    // annotations. Rejecting any of them would break otherwise-valid code.
+    for feature in ["division", "print_function", "generator_stop", "annotations"] {
+        let code = format!("from __future__ import {feature}\nx = 1");
+        let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+        assert!(result.is_ok(), "`{feature}` should compile as a no-op");
+    }
+}
+
+#[test]
+fn unsupported_future_import_returns_not_implemented_error() {
+    // `barry_as_FLUFL` (PEP 401) is one of only two `__future__` features still
+    // meaningful in Python 3, and Monty does not implement it — it makes `<>`
+    // the inequality operator and `!=` a SyntaxError. Rejected rather than
+    // ignored, so the import cannot quietly fail to do what it says. CPython
+    // accepts it, so this is a deliberate divergence.
+    let err = get_parse_err("from __future__ import barry_as_FLUFL");
+    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+    assert_snapshot!(
+        err.message().unwrap(),
+        @"The monty syntax parser does not yet support the 'barry_as_FLUFL' future feature"
+    );
+}
+
+#[test]
+fn aliased_future_import_returns_not_implemented_error() {
+    // The no-op binds nothing, so accepting an alias would leave the name
+    // undefined and surface as a `NameError` far from the import. CPython binds
+    // a `__future__._Feature` object, so this is a deliberate divergence.
+    let err = get_parse_err("from __future__ import annotations as ann");
+    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+    assert_snapshot!(
+        err.message().unwrap(),
+        @"The monty syntax parser does not yet support aliasing a `__future__` feature"
+    );
+}
+
+#[test]
+fn undefined_future_import_returns_syntax_error() {
+    // A name that is not a `__future__` feature at all, matching CPython's
+    // message. See `test_cases/import__future_unknown_feature.py` for the
+    // dual-run traceback test.
+    let err = get_parse_err("from __future__ import teleportation");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"future feature teleportation is not defined");
 }
 
 #[test]
@@ -138,6 +204,7 @@ fn async_with_statement_returns_not_implemented_error() {
         "async def f():\n    async with open('f') as g: pass\n".to_owned(),
         "test.py",
         vec![],
+        CompileOptions::default(),
     );
     let err = result.expect_err("expected parse error");
     assert_eq!(err.exc_type(), ExcType::NotImplementedError);
@@ -176,7 +243,12 @@ fn invalid_fstring_format_spec_str_returns_syntax_error() {
 fn format_spec_width_overflow_returns_syntax_error() {
     // 22 nines overflows usize; verify the parser surfaces this rather than
     // silently clamping to 0.
-    let result = MontyRun::new("f'{42:9999999999999999999999d}'".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new(
+        "f'{42:9999999999999999999999d}'".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    );
     let exc = result.expect_err("expected parse error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert!(
@@ -218,7 +290,7 @@ fn nested_tuples_within_limit_succeed() {
     for _ in 0..20 {
         code = format!("({code},)");
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     assert!(result.is_ok(), "nesting within limit should succeed");
 }
 
@@ -344,6 +416,22 @@ fn deeply_nested_while_loops_exceed_limit() {
     let err = get_parse_err(code);
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_snapshot!(err.message().unwrap(), @"Source is too deeply nested");
+}
+
+/// A loop's `else` suite is outside that loop for `break` and `continue`.
+#[test]
+fn control_flow_in_loop_else_requires_an_enclosing_loop() {
+    for (code, expected) in [
+        ("for x in []:\n    pass\nelse:\n    break", "'break' outside loop"),
+        (
+            "while False:\n    pass\nelse:\n    continue",
+            "'continue' not properly in loop",
+        ),
+    ] {
+        let err = get_parse_err(code);
+        assert_eq!(err.exc_type(), ExcType::SyntaxError);
+        assert_eq!(err.message().unwrap(), expected);
+    }
 }
 
 #[test]
@@ -494,7 +582,7 @@ fn deeply_nested_boolean_or_exceed_limit() {
 
 /// Helper to run code and get the exception from a runtime error.
 fn run_and_get_err(code: &str) -> MontyException {
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).expect("should parse");
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).expect("should parse");
     runner.run_no_limits(vec![]).expect_err("expected runtime error")
 }
 
@@ -530,7 +618,12 @@ fn duplicate_positional_parameter_returns_syntax_error() {
     // the unique-name count (HashMap::len) while resolving the duplicate to a
     // positional NamespaceId that points past the allocated stack region, panicking
     // `load_local` at call time.
-    let result = MontyRun::new("def f(x, x): return x\nf(1, 2)".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new(
+        "def f(x, x): return x\nf(1, 2)".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    );
     let exc = result.expect_err("expected compile error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_eq!(exc.message(), Some("duplicate argument 'x' in function definition"));
@@ -538,7 +631,12 @@ fn duplicate_positional_parameter_returns_syntax_error() {
 
 #[test]
 fn duplicate_keyword_only_parameter_returns_syntax_error() {
-    let result = MontyRun::new("def f(*, x, x): return x".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new(
+        "def f(*, x, x): return x".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    );
     let exc = result.expect_err("expected compile error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_eq!(exc.message(), Some("duplicate argument 'x' in function definition"));
@@ -546,7 +644,12 @@ fn duplicate_keyword_only_parameter_returns_syntax_error() {
 
 #[test]
 fn duplicate_mixed_positional_and_keyword_only_parameter_returns_syntax_error() {
-    let result = MontyRun::new("def f(x, *, x=1): return x".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new(
+        "def f(x, *, x=1): return x".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    );
     let exc = result.expect_err("expected compile error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_eq!(exc.message(), Some("duplicate argument 'x' in function definition"));
@@ -554,7 +657,12 @@ fn duplicate_mixed_positional_and_keyword_only_parameter_returns_syntax_error() 
 
 #[test]
 fn duplicate_lambda_parameter_returns_syntax_error() {
-    let result = MontyRun::new("f = lambda x, x: x".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new(
+        "f = lambda x, x: x".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    );
     let exc = result.expect_err("expected compile error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_eq!(exc.message(), Some("duplicate argument 'x' in function definition"));
@@ -566,7 +674,8 @@ fn long_source_line_does_not_overflow_column() {
     //
     // (code locations was previously limited to u16 values for line / col)
     let code = format!("x = \"{}\"\nassert len(x) == 65530", "a".repeat(65530));
-    let run = MontyRun::new(code, "test.py", vec![]).expect("long line should parse without panicking");
+    let run = MontyRun::new(code, "test.py", vec![], CompileOptions::default())
+        .expect("long line should parse without panicking");
     let result = run.run_no_limits(vec![]);
     assert!(result.is_ok(), "long line should run: {result:?}");
 }
@@ -582,7 +691,7 @@ fn long_source_line_does_not_overflow_column() {
 fn starred_name_target_has_clean_message() {
     // `*a = [1, 2]`: Ruff parses the LHS as a bare starred target, which
     // Monty rejects at `parse_identifier`.
-    let result = MontyRun::new("*a = [1, 2]".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new("*a = [1, 2]".to_owned(), "test.py", vec![], CompileOptions::default());
     let exc = result.expect_err("expected parse error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_snapshot!(exc.message().expect("has message"), @"Expected name, got starred expression");
@@ -592,7 +701,7 @@ fn starred_name_target_has_clean_message() {
 fn starred_attribute_target_has_clean_message() {
     // `*x.y = 1`: starred target wrapping an attribute. Same rejection
     // path, different inner node shape.
-    let result = MontyRun::new("*x.y = 1".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new("*x.y = 1".to_owned(), "test.py", vec![], CompileOptions::default());
     let exc = result.expect_err("expected parse error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_snapshot!(exc.message().expect("has message"), @"Expected name, got starred expression");
@@ -601,7 +710,7 @@ fn starred_attribute_target_has_clean_message() {
 #[test]
 fn starred_subscript_target_has_clean_message() {
     // `*x[0] = 1`: starred target wrapping a subscript.
-    let result = MontyRun::new("*x[0] = 1".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new("*x[0] = 1".to_owned(), "test.py", vec![], CompileOptions::default());
     let exc = result.expect_err("expected parse error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_snapshot!(exc.message().expect("has message"), @"Expected name, got starred expression");
@@ -613,7 +722,12 @@ fn for_loop_attribute_target_has_clean_message() {
     // accepts this; Monty currently rejects at `parse_unpack_target_impl`.
     // That rejection of valid Python is a separate issue; this test locks
     // only that the error message does not leak `ExprAttribute` Debug.
-    let result = MontyRun::new("for x.y in [1]: pass".to_owned(), "test.py", vec![]);
+    let result = MontyRun::new(
+        "for x.y in [1]: pass".to_owned(),
+        "test.py",
+        vec![],
+        CompileOptions::default(),
+    );
     let exc = result.expect_err("expected parse error");
     assert_eq!(exc.exc_type(), ExcType::SyntaxError);
     assert_snapshot!(exc.message().expect("has message"), @"invalid unpacking target: attribute");
@@ -629,7 +743,7 @@ fn many_elif_clauses_exceed_limit() {
     for _ in 0..400 {
         code.push_str("elif 0:\n    pass\n");
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected parse error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -647,7 +761,7 @@ fn moderate_elif_chain_within_limit() {
         code.push_str("elif 0:\n    pass\n");
     }
     code.push_str("else:\n    pass\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     assert!(result.is_ok(), "moderate elif chain should succeed: {result:?}");
 }
 
@@ -662,7 +776,7 @@ fn many_with_items_exceed_limit() {
         code.push_str(", 0");
     }
     code.push_str(":\n    pass\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected parse error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -680,7 +794,7 @@ fn moderate_with_items_within_limit() {
         code.push_str(", 0");
     }
     code.push_str(":\n    pass\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     assert!(result.is_ok(), "moderate with-item chain should succeed: {result:?}");
 }
 
@@ -693,7 +807,7 @@ fn many_bool_op_operands_exceed_limit() {
     for _ in 0..400 {
         code.push_str(" and 1");
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected parse error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
 }
@@ -704,8 +818,54 @@ fn moderate_bool_op_chain_within_limit() {
     for _ in 0..20 {
         code.push_str(" and 1");
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     assert!(result.is_ok(), "moderate bool-op chain should succeed: {result:?}");
+}
+
+/// A flat-looking expression ruff parses without recursing, so only an explicit
+/// depth check stops a later recursive walk overflowing the host stack.
+fn deep_attribute_chain() -> String {
+    let mut chain = "a".to_owned();
+    for _ in 0..2_000 {
+        chain.push_str(".x");
+    }
+    chain
+}
+
+#[test]
+fn deeply_nested_class_annotation_exceeds_limit() {
+    // Stringized, never parsed, so `parse_expression`'s budget never sees it.
+    let code = format!("class C:\n    y: {}\n", deep_attribute_chain());
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"Source is too deeply nested");
+}
+
+#[test]
+fn deeply_nested_class_var_value_exceeds_limit() {
+    // The class-scope walrus search walks the value before it is parsed.
+    let code = format!("class C:\n    y = {}\n", deep_attribute_chain());
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"Source is too deeply nested");
+}
+
+#[test]
+fn deeply_nested_method_default_exceeds_limit() {
+    // Parameter defaults go through the same pre-parse walrus search.
+    let code = format!("class C:\n    def m(self, x={}): pass\n", deep_attribute_chain());
+    let err = get_parse_err(code);
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"Source is too deeply nested");
+}
+
+#[test]
+fn moderate_class_annotation_within_limit() {
+    // The new checks must not reject annotations of ordinary depth.
+    let code = "class C:\n    y: dict[str, list[int]]\n    z: a.b.c = 1\n\
+                assert C.__annotations__ == {'y': 'dict[str, list[int]]', 'z': 'a.b.c'}\n";
+    let result = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default());
+    assert!(result.is_ok(), "ordinary class annotations should compile: {result:?}");
 }
 
 #[test]
@@ -715,7 +875,7 @@ fn function_with_too_many_locals_and_except_as_returns_syntax_error() {
         writeln!(code, "    l{i} = 0").unwrap();
     }
     code.push_str("    try:\n        1/0\n    except Exception as e:\n        pass\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -731,7 +891,7 @@ fn function_with_oversized_jump_offset_returns_syntax_error() {
         writeln!(code, "        a{i} = 1").unwrap();
     }
     code.push_str("    return 0\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(err.message(), Some("function too large: jump offset exceeds i16 range"));
@@ -745,7 +905,7 @@ fn module_with_too_many_names_returns_syntax_error() {
     for i in 0..70_000 {
         writeln!(code, "a{i} = 1").unwrap();
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -762,7 +922,7 @@ fn module_with_too_many_interned_strings_returns_syntax_error() {
     for i in 0..60_000 {
         writeln!(code, "x.a{i}").unwrap();
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -778,7 +938,7 @@ fn oversized_tuple_literal_returns_syntax_error() {
         code.push_str("1, ");
     }
     code.push_str(")\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -794,7 +954,7 @@ fn oversized_unpacking_call_returns_syntax_error() {
         code.push_str("1, ");
     }
     code.push_str("*xs)\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(
@@ -813,7 +973,7 @@ fn function_with_too_many_defaults_returns_syntax_error() {
         write!(code, "a{i}=0").unwrap();
     }
     code.push_str("): pass\n");
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(err.message(), Some("more than 255 default parameter values (256)"));
@@ -833,7 +993,7 @@ fn function_with_too_many_closure_variables_returns_syntax_error() {
     for i in 0..256 {
         writeln!(code, "        _ = x{i}").unwrap();
     }
-    let result = MontyRun::new(code, "test.py", vec![]);
+    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
     let err = result.expect_err("expected compile error");
     assert_eq!(err.exc_type(), ExcType::SyntaxError);
     assert_eq!(err.message(), Some("more than 255 closure variables (256)"));

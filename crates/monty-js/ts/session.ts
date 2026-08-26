@@ -19,7 +19,8 @@ import {
   ProtocolError,
 } from './errors.js'
 import { PYTHON_EXC_NAMES } from './errors.js'
-import { mountsToNative, type MountDir } from './mount.js'
+import { mountsToNative } from './mount.js'
+import type { MountDir } from './mountDir.js'
 import type {
   FunctionCallTurn,
   LoadedTurn,
@@ -27,9 +28,11 @@ import type {
   NativeFutureResult,
   NativeTurn,
   OkTurn,
+  NotMountedTurn,
   OsCallTurn,
   ResolveFuturesTurn,
 } from './native.js'
+import { CollectString, CollectStreams } from './print.js'
 
 /**
  * Sentinel an `os` callback returns to decline a call: the sandbox then
@@ -50,6 +53,12 @@ export type OsCallback = (name: string, args: unknown[], kwargs: Record<string, 
 /** Receives sandbox `print()` output (line-buffered). */
 export type PrintCallback = (stream: 'stdout' | 'stderr', text: string) => void
 
+/**
+ * Values accepted by `printCallback` options (function or host collectors).
+ * Mirrors pydantic_monty's PrintCallback union.
+ */
+export type PrintTargetInput = PrintCallback | CollectString | CollectStreams
+
 /** Options for [`MontySession.feedRun`]. */
 export interface FeedOptions {
   /** Values bound as globals before the snippet runs. */
@@ -65,7 +74,7 @@ export interface FeedOptions {
    */
   externalLookup?: Record<string, unknown>
   /** Receives `print()` output; defaults to the host process stdout/stderr. */
-  printCallback?: PrintCallback
+  printCallback?: PrintTargetInput
   /** Host directories mounted into the sandbox for this feed. */
   mount?: MountDir | MountDir[]
   /** Handler for OS calls not covered by mounts. */
@@ -91,12 +100,11 @@ export interface FeedStartOptions {
    */
   externalLookup?: Record<string, unknown>
   /** Receives `print()` output; defaults to the host process stdout/stderr. */
-  printCallback?: PrintCallback
+  printCallback?: PrintTargetInput
   /** Host directories mounted into the sandbox for this feed. */
   mount?: MountDir | MountDir[]
-  /** Handler for OS calls not covered by mounts; auto-dispatched between
-   *  snapshots (and used by `resumeAuto()`). Omit to surface OS calls as
-   *  snapshots instead. */
+  /** Handler for OS calls not covered by mounts. Consulted only by
+   *  `resumeAuto()` — `feedStart` always surfaces OS calls as snapshots. */
   os?: OsCallback
   /** Skip type checking for this feed even when the session enables it. */
   skipTypeCheck?: boolean
@@ -105,7 +113,7 @@ export interface FeedStartOptions {
 /** Options for [`MontySession.loadSnapshot`]. */
 export interface LoadSnapshotOptions {
   /** Receives `print()` output from the resumed feed. */
-  printCallback?: PrintCallback
+  printCallback?: PrintTargetInput
   /** The mounts the paused feed used (re-established by value; host paths are
    *  not stored in the dump). Validated against the dump's requirements. */
   mount?: MountDir | MountDir[]
@@ -116,7 +124,7 @@ export interface LoadSnapshotOptions {
    * the previous process; resolve it manually with `resume([...])`.
    */
   externalLookup?: Record<string, unknown>
-  /** Handler for OS calls, auto-dispatched as in `feedStart`. */
+  /** Handler for OS calls, consulted by `resumeAuto()` as in `feedStart`. */
   os?: OsCallback
 }
 
@@ -146,8 +154,8 @@ export class MontySession {
   /** Set once the session is unusable: crashed worker or protocol error. */
   private broken: Error | null = null
   private closed = false
-  /** Set once the session has been fed or restored; `loadSnapshot` is valid
-   *  only while unset (a fresh session). */
+  /** Set once the session has been fed or restored; `loadSession` /
+   *  `loadSnapshot` are valid only while unset (a fresh session). */
   private driven = false
 
   /** @internal — sessions are created by `Monty.checkout`. */
@@ -191,6 +199,14 @@ export class MontySession {
         case 'protocol':
           throw this.poison(new ProtocolError(turn.message))
       }
+      // Print failures take precedence. On a suspension the worker is waiting
+      // for a resume we will never send — poison so the next feed fails cleanly
+      // (matches Python pool: discard checkout when print fails mid-suspend).
+      try {
+        printTarget.throwIfFailed()
+      } catch (err) {
+        throw this.poison(err instanceof Error ? err : new Error(String(err)))
+      }
       try {
         turn = await answerer.answer(turn, onPrint)
       } catch (err) {
@@ -218,11 +234,12 @@ export class MontySession {
    * while (!(snap instanceof MontyComplete)) snap = await snap.resumeAuto()
    * ```
    *
-   * Unlike `feedRun`, `externalLookup` is *not* consulted during this initial
-   * drive — external calls and name lookups are still surfaced as snapshots; it
-   * is only captured for later `resumeAuto()` calls. An `os` handler still
-   * auto-dispatches uncovered OS calls until the next non-OS event. Use
-   * `snapshot.dump()` to checkpoint the worker and `loadSnapshot` to restore it.
+   * Unlike `feedRun`, nothing is answered during this drive: external calls,
+   * name lookups and OS calls are all surfaced as snapshots, so even a
+   * mount-covered file read comes back as one. `externalLookup` / `os` are
+   * captured for later `resumeAuto()` calls, which also consult the feed's
+   * mounts. Use `snapshot.dump()` to checkpoint the worker and `loadSnapshot`
+   * to restore it.
    */
   async feedStart(code: string, options: FeedStartOptions = {}): Promise<Snapshot> {
     this.ensureUsable()
@@ -247,7 +264,7 @@ export class MontySession {
    * whole session); throws otherwise. The dump restores its own resource limits
    * and type-check state. Throws if the dump is actually a suspended snapshot.
    */
-  async load(state: Uint8Array): Promise<void> {
+  async loadSession(state: Uint8Array): Promise<void> {
     this.claimFresh()
     const printTarget = new PrintTarget(undefined)
     const turn = (await this.native.restore(bytesForNative(state), [], printTarget.write.bind(printTarget))) as
@@ -269,13 +286,13 @@ export class MontySession {
 
   /**
    * Restores a dumped **suspended** snapshot — bytes from `feedStart` +
-   * `snapshot.dump()` — and resolves to the snapshot to resume. Use [`load`]
-   * for a dump taken between feeds.
+   * `snapshot.dump()` — and resolves to the snapshot to resume. Use
+   * [`loadSession`] for a dump taken between feeds.
    *
    * Valid only on a fresh session, before any feed or load; throws otherwise.
    * Re-supply the same `mount`s the paused feed used (their host paths are not
-   * in the dump); a missing, extra, or altered mount throws. Throws if the dump
-   * is actually an idle session.
+   * in the dump), or its filesystem calls degrade into unhandled OS calls.
+   * Throws if the dump is actually an idle session.
    */
   async loadSnapshot(state: Uint8Array, options: LoadSnapshotOptions = {}): Promise<Snapshot> {
     this.claimFresh()
@@ -284,7 +301,7 @@ export class MontySession {
       | NativeTurn
       | LoadedTurn
     if (turn.kind === 'loaded') {
-      throw await this.failedLoad(new Error('this dump is an idle session — use load() to restore it'))
+      throw await this.failedLoad(new Error('this dump is an idle session — use loadSession() to restore it'))
     }
     try {
       return await driver.advance(turn)
@@ -300,7 +317,7 @@ export class MontySession {
     this.ensureUsable()
     if (this.driven) {
       throw new Error(
-        'load / loadSnapshot is only valid on a fresh session, before any feedRun / feedStart / load / loadSnapshot',
+        'loadSession / loadSnapshot is only valid on a fresh session, before any feedRun / feedStart / loadSession / loadSnapshot',
       )
     }
     this.driven = true
@@ -344,7 +361,7 @@ export class MontySession {
    * `uv`, making them importable by later `feedRun` calls. Session-scoped and
    * repeatable; an empty list is a no-op.
    *
-   * Only supported by an embedded-CPython worker (e.g. `monty-cpython`).
+   * Only supported by an embedded-CPython worker.
    * Against the pure-Monty sandbox worker, or on a `uv` install failure (the
    * error carries uv's stderr), throws `MontyRuntimeError`; the session stays
    * usable. Dependencies a script declares inline via PEP 723 (`# /// script`)
@@ -352,8 +369,8 @@ export class MontySession {
    */
   async installDependencies(requirements: string[]): Promise<void> {
     this.ensureUsable()
-    // mark the session driven so a later load/loadSnapshot is rejected — it
-    // would discard the freshly installed environment
+    // mark the session driven so a later loadSession/loadSnapshot is rejected —
+    // it would discard the freshly installed environment
     this.driven = true
     const printTarget = new PrintTarget(undefined)
     const turn = (await this.native.installDependencies(requirements, printTarget.write.bind(printTarget))) as
@@ -513,8 +530,15 @@ class TurnAnswerer {
     return this.native.resumeReturn(returned, onPrint)
   }
 
-  /** Dispatches an OS call to the `os` callback (or its default error). */
+  /**
+   * Answers an OS call: the feed's mounts get first refusal, then the `os`
+   * callback, then the sandbox's own no-handler default.
+   */
   async answerOsCall(call: OsCallTurn, onPrint: PrintCallback): Promise<object> {
+    const mounted = (await this.native.resumeFromMounts(onPrint)) as NativeTurn | NotMountedTurn
+    if (mounted.kind !== 'notMounted') {
+      return mounted
+    }
     if (this.os === undefined) {
       return await this.native.resumeNotHandled(onPrint)
     }
@@ -591,8 +615,13 @@ class PrintTarget {
   private readonly callback: PrintCallback | undefined
   private failure: unknown = null
 
-  constructor(callback: PrintCallback | undefined) {
-    this.callback = callback
+  constructor(input: PrintTargetInput | undefined) {
+    // Collectors adapt once to a function so the drive loop / native path stay typed as PrintCallback.
+    if (input instanceof CollectString || input instanceof CollectStreams) {
+      this.callback = (stream, text) => input.write(stream, text)
+    } else {
+      this.callback = input
+    }
   }
 
   write(stream: 'stdout' | 'stderr', text: string): void {
@@ -622,11 +651,10 @@ class PrintTarget {
 }
 
 /**
- * Drives a `feedStart` / `loadSnapshot` chain: runs each protocol turn,
- * auto-dispatches OS calls through the `os` handler (until a non-OS event),
- * and turns the result into the next [`Snapshot`]. One driver is shared across
- * a snapshot and every snapshot its `resume` produces, so they all answer the
- * same worker with the same print sink.
+ * Drives a `feedStart` / `loadSnapshot` chain: runs each protocol turn and
+ * turns the result into the next [`Snapshot`], answering nothing itself.
+ * One driver is shared across a snapshot and every snapshot its `resume`
+ * produces, so they all answer the same worker with the same print sink.
  */
 class SnapshotDriver {
   /** Exposed so the session's first turn can stream prints through it. */
@@ -641,7 +669,7 @@ class SnapshotDriver {
     this.onPrint = printTarget.write.bind(printTarget)
   }
 
-  /** Resolves a turn (after auto-dispatching OS calls) to the next snapshot. */
+  /** Resolves a turn to the next snapshot, answering nothing automatically. */
   async advance(turn: NativeTurn): Promise<Snapshot> {
     for (;;) {
       switch (turn.kind) {
@@ -659,22 +687,35 @@ class SnapshotDriver {
         case 'protocol':
           throw this.poison(new ProtocolError(turn.message))
         case 'osCall':
-          // With no os handler an OS call surfaces as a snapshot; otherwise it
-          // is auto-dispatched through the same path `resumeAuto` uses.
-          if (this.answerer.os === undefined) {
-            return new FunctionSnapshot(this, turn, true)
-          }
-          turn = (await this.answerer.answerOsCall(turn, this.onPrint)) as NativeTurn
-          continue
+          // Every OS call surfaces; mounts and the `os` callback are consulted
+          // only by `resumeAuto`.
+          this.throwIfPrintFailedOnSuspend()
+          return new FunctionSnapshot(this, turn, true)
         case 'functionCall':
+          this.throwIfPrintFailedOnSuspend()
           return new FunctionSnapshot(this, turn, false)
         case 'nameLookup':
+          this.throwIfPrintFailedOnSuspend()
           return new NameLookupSnapshot(this, turn)
         case 'resolveFutures':
+          this.throwIfPrintFailedOnSuspend()
           return new FutureSnapshot(this, turn)
         default:
           throw this.poison(new ProtocolError(`unexpected turn kind: ${(turn as { kind: string }).kind}`))
       }
+    }
+  }
+
+  /**
+   * Surfaces a pending print-callback failure before exposing a suspension
+   * snapshot. The worker is left suspended with no resume coming, so poison
+   * the session (same policy as Python's checkout discard on this path).
+   */
+  private throwIfPrintFailedOnSuspend(): void {
+    try {
+      this.printTarget.throwIfFailed()
+    } catch (err) {
+      throw this.poison(err instanceof Error ? err : new Error(String(err)))
     }
   }
 

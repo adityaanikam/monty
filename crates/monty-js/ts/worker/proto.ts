@@ -13,6 +13,15 @@
 // generated codec (ts-proto / protobuf-es) is the eventual home; this keeps the
 // spike dependency-free.
 
+/**
+ * Wire schema version this codec speaks, sent as `Configure.protocol_version`.
+ *
+ * Must track `PROTOCOL_VERSION` in `monty-proto/src/lib.rs`: the worker rejects
+ * a session whose version falls outside the range it serves. Safe to hardcode
+ * because this file ships in the same package as the `.wasm` it drives.
+ */
+export const PROTOCOL_VERSION = 1
+
 /** Protobuf wire types this codec handles. */
 export const Wire = {
   Varint: 0,
@@ -200,7 +209,9 @@ export function frame(message: Uint8Array): Uint8Array {
 export function* deframe(buf: Uint8Array): Generator<Uint8Array> {
   let i = 0
   while (i + 4 <= buf.length) {
-    const len = buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24)
+    // `>>> 0` keeps the length unsigned: `<< 24` yields a *signed* 32-bit
+    // value, and a negative length would walk `i` backwards forever.
+    const len = (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24)) >>> 0
     i += 4
     yield buf.subarray(i, i + len)
     i += len

@@ -34,11 +34,11 @@
 use std::{mem, ptr};
 
 use crate::{
-    ResourceTracker,
     args::{ArgPosIter, ArgValues, KwargsValues, KwargsValuesIter},
     bytecode::VM,
-    exception_private::{ExcType, RunError, RunResult},
-    heap::{ContainsHeap, DropGuard, DropWithContext},
+    defer_drop_mut,
+    exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
+    heap::{ContainsHeap, DropWithContext},
     intern::{Interns, StringId},
     value::{EitherStr, Value},
 };
@@ -69,7 +69,7 @@ pub(crate) fn bind<const N: usize>(
     spec: &'static ParamSpec,
     bound: &mut Bound<N>,
     args: ArgValues,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_>,
 ) -> RunResult<()> {
     // `spec` is passed explicitly (despite living in `bound` too) so the
     // inlined fast-path conditions constant-fold against the caller's
@@ -99,7 +99,7 @@ fn bind_slow<const N: usize>(
     spec: &'static ParamSpec,
     bound: &mut Bound<N>,
     args: ArgValues,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_>,
 ) -> RunResult<()> {
     let (pos, kwargs) = args.into_parts();
     let state = IterState {
@@ -110,8 +110,7 @@ fn bind_slow<const N: usize>(
     // values already moved into `bound` are covered by the *caller's* guard
     // around the slots struct, so no error arm needs manual drops beyond
     // values it has already pulled out of an iterator.
-    let mut guard = DropGuard::new(state, vm);
-    let (state, vm) = guard.as_parts_mut();
+    defer_drop_mut!(state, vm);
 
     if spec.kwargs_not_supported_yet && state.kwargs.len() > 0 {
         return Err(ExcType::kwargs_not_implemented(spec.func_name));
@@ -120,25 +119,41 @@ fn bind_slow<const N: usize>(
     let n_pos = state.pos.len();
     let n_kw = state.kwargs.len();
 
-    // Family pre-checks. Order matches CPython: `PyArg_UnpackTuple` checks its
-    // positional range first; `at_most_total` reproduces the
-    // `PyArg_ParseTupleAndKeywords` total pre-count; the "at least M
-    // positional" check reproduces `_PyArg_UnpackKeywords` for C methods whose
-    // required positional-only params cannot be filled by keyword.
-    if matches!(spec.family, ErrorFamily::Unpack)
-        && let Some(err) = unpack_arity_error(spec, n_pos)
-    {
-        return Err(err);
+    // Family pre-checks. Order matches CPython: `PyArg_UnpackTuple` callers
+    // reject keywords wholesale (`_PyArg_NoKeywords` / the `METH_FASTCALL`
+    // dispatch) before any arity check, then check the positional range;
+    // `at_most_total` reproduces the `PyArg_ParseTupleAndKeywords` total
+    // pre-count; the "at least M positional" check reproduces
+    // `_PyArg_UnpackKeywords` for C methods whose required positional-only
+    // params cannot be filled by keyword.
+    if matches!(spec.family, ErrorFamily::Unpack) {
+        if n_kw > 0 {
+            let name = spec.kwarg_error_name.unwrap_or(spec.func_name);
+            return Err(ExcType::type_error_no_kwargs(name));
+        }
+        if let Some(err) = unpack_arity_error(spec, n_pos) {
+            return Err(err);
+        }
+    }
+    // `tp_vectorcall` fast paths (`int`, `str`) check positional arity with
+    // `_PyArg_CheckPositional` before reaching the clinic parser, so kwarg-free
+    // overflow gets the un-parenthesised wording; with kwargs present the
+    // `at_most_total` check below fires with the clinic wording instead.
+    if spec.vectorcall && n_kw == 0 && n_pos > spec.n_positional {
+        return Err(ExcType::type_error_at_most(spec.func_name, spec.n_positional, n_pos));
     }
     if spec.at_most_total && n_pos + n_kw > spec.n_positional {
-        return Err(total_overflow_error(spec, n_pos + n_kw));
+        return Err(total_overflow_error(spec, n_pos, n_kw));
     }
     if spec.uses_c_method_arity() && n_pos < spec.n_required_pos_only {
-        return Err(ExcType::type_error_at_least_positional(
-            spec.func_name,
-            spec.n_required_pos_only,
-            n_pos,
-        ));
+        // The exact form outranks "at least" when every positional slot is
+        // required, even though these are positional-only — CPython counts
+        // the slots, not how they may be passed.
+        return Err(if spec.uses_exact_positional_arity() {
+            ExcType::type_error_named_positional(spec.func_name, spec.n_positional, n_pos, true)
+        } else {
+            ExcType::type_error_at_least_positional(spec.func_name, spec.n_required_pos_only, n_pos)
+        });
     }
 
     // Positional overflow: every C parser checks arity before touching kwargs,
@@ -285,6 +300,11 @@ pub(crate) struct ParamSpec {
     /// function from CPython's observed behaviour — not derivable from the
     /// field shapes (identical signatures differ by parser generation).
     pub at_most_total: bool,
+    /// Kwarg-free positional overflow uses `_PyArg_CheckPositional` wording
+    /// (`{name} expected at most N arguments, got M`) — models `tp_vectorcall`
+    /// fast paths (`int`, `str`) that bypass the clinic parser when no
+    /// keywords are passed. Requires `at_most_total` (enforced by the derive).
+    pub vectorcall: bool,
     /// Reject any kwarg up front with `NotImplementedError` — a Monty TODO
     /// marker for functions whose CPython kwargs aren't plumbed through yet.
     pub kwargs_not_supported_yet: bool,
@@ -301,6 +321,15 @@ impl ParamSpec {
     /// own range pre-check.
     fn uses_c_method_arity(&self) -> bool {
         self.n_required_pos_only > 0 && !matches!(self.family, ErrorFamily::Def | ErrorFamily::Unpack)
+    }
+
+    /// True when `_PyArg_UnpackKeywords` words arity as `takes exactly N
+    /// positional argument(s)`: a named C parser whose positional slots are
+    /// every one required and followed by keyword-only params
+    /// (`binascii.b2a_base64`, `os.stat`).
+    fn uses_exact_positional_arity(&self) -> bool {
+        matches!(self.family, ErrorFamily::CNamed { positional_pivot: true })
+            && self.n_required_positional == self.n_positional
     }
 }
 
@@ -357,10 +386,17 @@ pub(crate) enum ErrorFamily {
     /// Like [`ErrorFamily::C`] but the C source embeds the function name
     /// (`:name` in the format string) — errors say `{name}() …`, and the
     /// unknown-kwarg error uses the named Python wording.
-    CNamed,
-    /// `PyArg_UnpackTuple` (`style = unpack`): a fixed positional `min..max`
-    /// range checked before anything else, `{name} expected …` wording with
-    /// no parentheses. When `min == max` CPython collapses to
+    ///
+    /// `positional_pivot` mirrors [`ErrorFamily::C`]'s: computed by the derive
+    /// (any `kw_only` field present) and switches the overflow wording to
+    /// `… exactly/at most N positional argument(s) …`, pivoting back to the
+    /// total count once the overflow exceeds all slots (e.g. `os.stat`).
+    CNamed { positional_pivot: bool },
+    /// `PyArg_UnpackTuple` (`style = unpack`): any keyword argument is
+    /// rejected first with `{name}() takes no keyword arguments` (CPython's
+    /// `_PyArg_NoKeywords` / `METH_FASTCALL` dispatch), then a fixed
+    /// positional `min..max` range is checked, `{name} expected …` wording
+    /// with no parentheses. When `min == max` CPython collapses to
     /// `expected N argument(s)` — [`bind`] does the same.
     Unpack,
 }
@@ -368,13 +404,13 @@ pub(crate) enum ErrorFamily {
 impl ErrorFamily {
     /// C families raise unknown-kwarg after every missing/conversion error.
     fn defers_unknown_kwarg(self) -> bool {
-        matches!(self, Self::C { .. } | Self::CNamed)
+        matches!(self, Self::C { .. } | Self::CNamed { .. })
     }
 
     /// Non-C families aggregate all missing required names into one error at
     /// the end of [`bind`]; C families report per-param via [`Bound::require`].
     fn aggregates_missing(self) -> bool {
-        !matches!(self, Self::C { .. } | Self::CNamed)
+        !matches!(self, Self::C { .. } | Self::CNamed { .. })
     }
 }
 
@@ -489,10 +525,10 @@ impl<const N: usize> Bound<N> {
             ErrorFamily::C { .. } if i < self.spec.n_positional => {
                 ExcType::type_error_c_missing_required(param.name, i + 1)
             }
-            ErrorFamily::CNamed if i < self.spec.n_positional => {
+            ErrorFamily::CNamed { .. } if i < self.spec.n_positional => {
                 ExcType::type_error_c_missing_required_named(self.spec.func_name, param.name, i + 1)
             }
-            ErrorFamily::C { .. } | ErrorFamily::CNamed => {
+            ErrorFamily::C { .. } | ErrorFamily::CNamed { .. } => {
                 ExcType::type_error_missing_kwonly_with_names(self.spec.func_name, &[param.name])
             }
             // Aggregating families: bind() already raised; a required slot the
@@ -568,7 +604,7 @@ fn duplicate_error(spec: &ParamSpec, idx: usize, param: &Param) -> DuplicateOutc
             param.name,
             idx + 1,
         )),
-        ErrorFamily::CNamed => DuplicateOutcome::Defer(named_conflict()),
+        ErrorFamily::CNamed { .. } => DuplicateOutcome::Defer(named_conflict()),
         ErrorFamily::Clinic => DuplicateOutcome::Raise(named_conflict()),
         ErrorFamily::Def | ErrorFamily::Unpack => {
             DuplicateOutcome::Raise(ExcType::type_error_duplicate_arg(spec.func_name, param.name))
@@ -600,15 +636,19 @@ fn unpack_arity_error(spec: &ParamSpec, n_pos: usize) -> Option<RunError> {
 
 /// `at_most_total` pre-count error: `PyArg_ParseTupleAndKeywords`' total-count
 /// wording for the C families, the parenthesised method form otherwise.
+///
+/// The named families pivot to `keyword argument` when the call passed no
+/// positionals — the only overflow site that can see `n_pos == 0`.
 #[cold]
-fn total_overflow_error(spec: &ParamSpec, total: usize) -> RunError {
+fn total_overflow_error(spec: &ParamSpec, n_pos: usize, n_kw: usize) -> RunError {
+    let total = n_pos + n_kw;
     match spec.family {
         ErrorFamily::C {
             positional_pivot: false,
         } => ExcType::type_error_c_at_most(spec.n_positional, total),
         ErrorFamily::C { positional_pivot: true } => ExcType::type_error_c_at_most_positional(spec.n_positional, total),
         // Clinic / CNamed (`def`/`unpack` reject the flag at derive time).
-        _ => ExcType::type_error_method_at_most(spec.func_name, spec.n_positional, total),
+        _ => ExcType::type_error_method_at_most(spec.func_name, spec.n_positional, total, n_pos == 0),
     }
 }
 
@@ -623,7 +663,15 @@ fn positional_overflow_error(spec: &ParamSpec, n_pos: usize, n_kw: usize) -> Run
         // Unreachable: `def` defers, the unpack pre-check already covered both
         // directions. Match unpack's wording anyway rather than panicking.
         ErrorFamily::Def | ErrorFamily::Unpack => ExcType::type_error_at_most(spec.func_name, max, n_pos),
-        _ if spec.uses_c_method_arity() => ExcType::type_error_method_at_most(spec.func_name, max, n_pos + n_kw),
+        // The exact form again outranks the generic C-method wording for
+        // required positional-only slots; the total-count fallback below still
+        // applies once the overflow exceeds every slot.
+        ErrorFamily::CNamed { positional_pivot: true }
+            if spec.uses_exact_positional_arity() && n_pos + n_kw <= spec.params.len() =>
+        {
+            ExcType::type_error_named_positional(spec.func_name, max, n_pos, true)
+        }
+        _ if spec.uses_c_method_arity() => ExcType::type_error_method_at_most(spec.func_name, max, n_pos + n_kw, false),
         ErrorFamily::C {
             positional_pivot: false,
         } => ExcType::type_error_c_at_most(max, n_pos + n_kw),
@@ -632,7 +680,25 @@ fn positional_overflow_error(spec: &ParamSpec, n_pos: usize, n_kw: usize) -> Run
         ErrorFamily::C { positional_pivot: true } => {
             ExcType::type_error_c_at_most_positional_or_total(max, spec.params.len(), n_pos + n_kw)
         }
-        ErrorFamily::CNamed => ExcType::type_error_method_at_most(spec.func_name, max, n_pos + n_kw),
+        ErrorFamily::CNamed {
+            positional_pivot: false,
+        } => ExcType::type_error_method_at_most(spec.func_name, max, n_pos + n_kw, false),
+        // Same pivot as `C`, but named: `_PyArg_UnpackKeywords` says "exactly"
+        // when every positional param is required (`os.stat`), "at most" when
+        // some have defaults (`os.mkdir`), and falls back to the total-count
+        // wording once the overflow exceeds positional + kw-only slots. The
+        // positional wordings count only positionals in "(M given)"
+        // (`stat('.', 1, dir_fd=None)` reports 2, not 3); the total-count
+        // fallback counts everything — both verified against CPython 3.14.
+        ErrorFamily::CNamed { positional_pivot: true } => {
+            let total = n_pos + n_kw;
+            if total > spec.params.len() {
+                ExcType::type_error_method_at_most(spec.func_name, spec.params.len(), total, false)
+            } else {
+                let exact = spec.n_required_positional == spec.n_positional;
+                ExcType::type_error_named_positional(spec.func_name, max, n_pos, exact)
+            }
+        }
         ErrorFamily::Clinic => ExcType::type_error_at_most(spec.func_name, max, n_pos + n_kw),
     }
 }

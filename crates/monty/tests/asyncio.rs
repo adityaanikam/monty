@@ -3,9 +3,12 @@
 //! These tests verify the behavior of the async execution model, specifically around
 //! resolving external futures incrementally via `ResolveFutures::resume()`.
 
-use monty::{
-    ExcType, ExtFunctionResult, MontyException, MontyObject, MontyRun, NameLookupResult, NoLimitTracker, PrintWriter,
-    ResolveFutures, RunProgress,
+use std::thread;
+
+use monty::{MontyRun, ResolveFutures, RunProgress};
+use monty_types::{
+    CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult, PrintWriter,
+    ResourceTracker,
 };
 
 /// Helper to create a MontyRun for async external function tests.
@@ -22,7 +25,7 @@ async def main():
 
 await main()
 ";
-    MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap()
+    MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap()
 }
 
 /// Helper to create a MontyRun for async external function tests with three functions.
@@ -36,13 +39,11 @@ async def main():
 
 await main()
 ";
-    MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap()
+    MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap()
 }
 
 /// Resolves consecutive `NameLookup` yields by providing a `Function` object for each name.
-fn resolve_name_lookups<T: monty::ResourceTracker>(
-    mut progress: RunProgress<T>,
-) -> Result<RunProgress<T>, monty::MontyException> {
+fn resolve_name_lookups(mut progress: RunProgress) -> Result<RunProgress, MontyException> {
     while let RunProgress::NameLookup(lookup) = progress {
         let name = lookup.name.clone();
         progress = lookup.resume(
@@ -57,7 +58,7 @@ fn resolve_name_lookups<T: monty::ResourceTracker>(
 ///
 /// Returns (pending_call_ids, state, collected_call_ids) where collected_call_ids
 /// are the call_ids from all the FunctionCalls we processed with resume_pending().
-fn drive_to_resolve_futures<T: monty::ResourceTracker>(mut progress: RunProgress<T>) -> (ResolveFutures<T>, Vec<u32>) {
+fn drive_to_resolve_futures(mut progress: RunProgress) -> (ResolveFutures, Vec<u32>) {
     let mut collected_call_ids = Vec::new();
 
     loop {
@@ -107,8 +108,10 @@ async def ready():
 
 await asyncio.gather(parked(), ready())
 ";
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
     assert_eq!(
@@ -139,7 +142,9 @@ await asyncio.gather(parked(), ready())
 #[test]
 fn resume_with_all_call_ids() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
     assert_eq!(call_ids.len(), 2, "should have 2 pending calls");
@@ -160,7 +165,9 @@ fn resume_with_all_call_ids() {
 #[test]
 fn resume_with_partial_results() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -184,7 +191,9 @@ fn resume_with_partial_results() {
 #[test]
 fn resume_with_unknown_call_id() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, _call_ids) = drive_to_resolve_futures(progress);
 
@@ -207,7 +216,9 @@ fn resume_with_unknown_call_id() {
 #[test]
 fn resume_with_empty_results() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -233,7 +244,9 @@ fn resume_with_empty_results() {
 #[test]
 fn resume_with_error_result() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -260,7 +273,9 @@ fn resume_with_error_result() {
 #[test]
 fn resume_with_reversed_order() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -280,7 +295,9 @@ fn resume_with_reversed_order() {
 #[test]
 fn three_way_gather_incremental() {
     let runner = create_gather_three_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
     assert_eq!(call_ids.len(), 3, "should have 3 pending calls");
@@ -306,7 +323,9 @@ fn three_way_gather_incremental() {
 #[test]
 fn resume_with_duplicate_call_id() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -327,7 +346,9 @@ fn resume_with_duplicate_call_id() {
 #[test]
 fn gather_error_propagated_as_exception() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -365,13 +386,15 @@ async def main():
 
 await main()
 ";
-    MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap()
+    MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap()
 }
 
 #[test]
 fn sequential_awaits_second_fails() {
     let runner = create_sequential_awaits_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
     let progress = resolve_name_lookups(progress).unwrap();
 
     // First external call (foo)
@@ -420,7 +443,9 @@ fn sequential_awaits_second_fails() {
 #[test]
 fn sequential_awaits_first_fails() {
     let runner = create_sequential_awaits_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
     let progress = resolve_name_lookups(progress).unwrap();
 
     // First external call (foo)
@@ -454,7 +479,9 @@ fn sequential_awaits_first_fails() {
 #[test]
 fn gather_first_external_fails_immediately() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
     assert_eq!(call_ids.len(), 2, "should have 2 calls");
@@ -479,7 +506,9 @@ fn gather_first_external_fails_immediately() {
 #[test]
 fn gather_second_external_fails() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -505,7 +534,9 @@ fn gather_second_external_fails() {
 #[test]
 fn gather_both_fail() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -532,7 +563,9 @@ fn gather_both_fail() {
 #[test]
 fn three_way_gather_partial_error() {
     let runner = create_gather_three_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -560,7 +593,9 @@ fn three_way_gather_partial_error() {
 #[test]
 fn incremental_resolution_error_on_second_round() {
     let runner = create_gather_two_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -602,9 +637,11 @@ async def double(x):
 results = await asyncio.gather(double(5), async_call(100))
 results
 ";
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
 
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     // Use drive_collecting_calls so we know which call_id maps to which invocation.
     // Call order: async_call(100) (gather direct) then async_call(5) (double's inner).
@@ -646,7 +683,9 @@ results
 #[test]
 fn gather_three_all_at_once_mixed() {
     let runner = create_gather_three_runner();
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
 
@@ -679,9 +718,7 @@ fn gather_three_all_at_once_mixed() {
 /// Helper to drive execution, collecting function calls and resolving them async,
 /// until we reach ResolveFutures. Returns the snapshot and a vec of
 /// (call_id, function_name) pairs for all external calls made.
-fn drive_collecting_calls<T: monty::ResourceTracker>(
-    mut progress: RunProgress<T>,
-) -> (ResolveFutures<T>, Vec<(u32, String)>) {
+fn drive_collecting_calls(mut progress: RunProgress) -> (ResolveFutures, Vec<(u32, String)>) {
     let mut collected = Vec::new();
 
     loop {
@@ -730,9 +767,11 @@ async def slow_b():
 results = await asyncio.gather(slow_a(), slow_b(), async_call(999))
 results
 ";
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
 
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     let (state, call_ids) = drive_to_resolve_futures(progress);
     // 3 calls: async_call(999) from gather, async_call(1) from slow_a, async_call(2) from slow_b
@@ -805,9 +844,11 @@ async def main():
 await main()
 ";
 
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
 
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     // Drive until all initial external calls are made and we need to resolve futures
     let (state, calls) = drive_collecting_calls(progress);
@@ -875,9 +916,11 @@ async def main():
 await main()
 ";
 
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
 
-    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
 
     // Drive to get the initial step1 calls
     let (state, calls) = drive_collecting_calls(progress);
@@ -926,4 +969,189 @@ await main()
     // Total: 111 + 222 = 333
     let result = progress.into_complete().expect("should complete");
     assert_eq!(result, MontyObject::Int(333));
+}
+
+// === Test: Deep blocked task chains are torn down without recursing ===
+
+/// A chain of blocked tasks costs no native stack to *build*, so teardown must
+/// not turn that stored depth back into frames.
+///
+/// Runs on a 2 MiB thread — a worker's budget, and where the abort was seen;
+/// libtest's 8 MiB would need a far deeper, slower chain to prove the same.
+#[test]
+fn deep_blocked_task_chain_teardown_does_not_overflow_the_stack() {
+    thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(fail_sibling_of_deep_task_chain)
+        .expect("spawning the bounded-stack thread")
+        .join()
+        .expect("tearing down a deep blocked chain must not overflow the stack");
+}
+
+/// Wraps `leaf()` in 20,000 nested gathers and awaits that chain alongside a
+/// `sibling()`, so both park on external calls: the chain's `parked` (never
+/// resolved) and the sibling's `doomed`. Resolving `doomed` with an error
+/// fails the outer gather, which cancels all 20,000 blocked tasks in one walk,
+/// and asserts that error surfaces as the run's `ValueError`.
+///
+/// Failing the *sibling* is what makes it a single deep walk — failing the
+/// chain's own future would instead unwind it level by level.
+fn fail_sibling_of_deep_task_chain() {
+    let code = r"
+import asyncio
+
+async def leaf():
+    return await parked(1)
+
+async def wrap(g):
+    return await g
+
+async def sibling():
+    return await doomed(2)
+
+g = leaf()
+for _ in range(20000):
+    g = asyncio.gather(wrap(g))
+await asyncio.gather(g, sibling())
+";
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
+
+    let (state, calls) = drive_collecting_calls(progress);
+    let doomed_id = calls
+        .iter()
+        .find_map(|(id, name)| (name == "doomed").then_some(*id))
+        .expect("the sibling should have parked on an external call");
+    assert_eq!(calls.len(), 2, "the chain's leaf and the sibling should both park");
+
+    // Failing the sibling tears down the enclosing gather, cancelling the
+    // chain top-down; the exception itself only walks up to the main task.
+    let error = MontyException::new(ExcType::ValueError, Some("sibling failed".to_string()));
+    let result = state.resume(vec![(doomed_id, ExtFunctionResult::Error(error))], PrintWriter::Stdout);
+
+    let exc = result.expect_err("the failed sibling should surface as an exception");
+    assert_eq!(exc.exc_type(), ExcType::ValueError);
+}
+
+/// Propagating a failure through deeply nested gather waiters must not recurse
+/// on the native Rust stack.
+#[test]
+fn deeply_nested_gather_failure_does_not_overflow_stack() {
+    let code = r"
+import asyncio
+
+async def leaf():
+    raise ValueError('boom')
+
+async def chain(n):
+    if n == 0:
+        return await asyncio.gather(leaf())
+    return await asyncio.gather(chain(n - 1))
+
+caught = False
+try:
+    await asyncio.gather(chain(4000))
+except ValueError:
+    caught = True
+caught
+";
+
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+
+    let result = runner.run_no_limits(vec![]).expect("should complete");
+    assert_eq!(result, MontyObject::Bool(true));
+}
+
+// === Test: orphaned external whose awaiting task was already cancelled ===
+
+/// Leaves a pending external with no live awaiter: `boom()` raises
+/// synchronously, failing the gather and cancelling `slow()` while its external
+/// call is outstanding, so the host's answer has nobody to deliver to.
+fn create_orphaned_external_runner() -> MontyRun {
+    let code = r"
+import asyncio
+
+async def slow():
+    return await foo()
+
+async def boom():
+    raise ValueError('cancels slow')
+
+async def main():
+    try:
+        await asyncio.gather(slow(), boom())
+    except ValueError:
+        pass
+    return await bar()
+
+await main()
+";
+    MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap()
+}
+
+/// Drives the runner above to the suspension where both externals are pending,
+/// returning their call ids keyed by name: the order the scheduler hands them
+/// over is not part of the contract under test, so positions must not be relied on.
+fn orphan_and_live_ids(progress: RunProgress) -> (ResolveFutures, u32, u32) {
+    let (state, calls) = drive_collecting_calls(progress);
+    assert_eq!(calls.len(), 2, "orphaned foo() and live bar() should both be pending");
+
+    let id_of = |name: &str| {
+        calls
+            .iter()
+            .find_map(|(id, called)| (called == name).then_some(*id))
+            .unwrap_or_else(|| panic!("{name}() should be pending"))
+    };
+    (state, id_of("foo"), id_of("bar"))
+}
+
+#[test]
+fn orphaned_external_resolved_alongside_live_one() {
+    let runner = create_orphaned_external_runner();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
+
+    let (state, orphan, live) = orphan_and_live_ids(progress);
+
+    // Resolving `bar()` readies `main`, `foo()`'s result is discarded; the
+    // scheduler must still find `main` to run.
+    let results = vec![
+        (orphan, ExtFunctionResult::Return(MontyObject::Int(1))),
+        (live, ExtFunctionResult::Return(MontyObject::Int(7))),
+    ];
+
+    let progress = state.resume(results, PrintWriter::Stdout).unwrap();
+    let result = progress.into_complete().expect("should complete");
+    assert_eq!(result, MontyObject::Int(7));
+}
+
+#[test]
+fn orphaned_external_failed_alongside_live_one() {
+    let runner = create_orphaned_external_runner();
+    let progress = runner
+        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
+        .unwrap();
+
+    let (state, orphan, live) = orphan_and_live_ids(progress);
+
+    // The orphan's awaiter chain terminates at a cancelled task, so it fails
+    // nothing; only `bar()`'s failure reaches a task.
+    let results = vec![
+        (
+            orphan,
+            ExtFunctionResult::Error(MontyException::new(ExcType::RuntimeError, Some("orphan".to_string()))),
+        ),
+        (
+            live,
+            ExtFunctionResult::Error(MontyException::new(ExcType::RuntimeError, Some("live".to_string()))),
+        ),
+    ];
+
+    let err = state
+        .resume(results, PrintWriter::Stdout)
+        .expect_err("the live failure should surface");
+    assert_eq!(err.message(), Some("live"));
 }

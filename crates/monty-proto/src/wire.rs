@@ -31,7 +31,7 @@
 
 use std::{cell::Cell, fmt::Display, ops::RangeInclusive};
 
-use monty::{
+use monty_types::{
     DictPairs, MontyDate, MontyDateTime, MontyFileHandle, MontyObject, MontyTimeDelta, MontyTimeZone, MontyType,
 };
 use num_bigint::{BigInt, Sign};
@@ -172,78 +172,6 @@ impl Message for WireFunctionCall {
     }
 }
 
-/// Wire form of `monty.v1.OsCall` with direct argument decoding.
-///
-/// Like [`WireFunctionCall`], this is an `extern_path` replacement for the
-/// generated payload type. `not_handled_error` remains generated because it is
-/// not a repeated value payload and does not create the amplification pattern.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct WireOsCall {
-    /// Name of the OS operation the sandbox is asking the parent to handle.
-    pub function_name: String,
-    /// Positional arguments, decoded straight from repeated `MontyObject`.
-    pub args: Vec<MontyObject>,
-    /// Keyword arguments, preserving wire order.
-    pub kwargs: Vec<(MontyObject, MontyObject)>,
-    /// Child-assigned call id used by the matching resume request.
-    pub call_id: u32,
-    /// Child-provided fallback exception for parents that do not handle this call.
-    pub not_handled_error: Option<pb::RaisedException>,
-}
-
-impl Message for WireOsCall {
-    fn encode_raw(&self, buf: &mut impl BufMut) {
-        encode_str(1, &self.function_name, buf);
-        encode_repeated_object(2, &self.args, buf);
-        encode_repeated_pair(3, &self.kwargs, buf);
-        encode_uint32(4, self.call_id, buf);
-        if let Some(error) = &self.not_handled_error {
-            encoding::message::encode(5, error, buf);
-        }
-    }
-
-    fn encoded_len(&self) -> usize {
-        str_len(1, &self.function_name)
-            + repeated_object_len(2, &self.args)
-            + repeated_pair_len(3, &self.kwargs)
-            + uint32_len(4, self.call_id)
-            + self
-                .not_handled_error
-                .as_ref()
-                .map_or(0, |error| encoding::message::encoded_len(5, error))
-    }
-
-    fn merge_field(
-        &mut self,
-        tag: u32,
-        wire_type: WireType,
-        buf: &mut impl Buf,
-        ctx: DecodeContext,
-    ) -> Result<(), DecodeError> {
-        match tag {
-            1 => encoding::string::merge(wire_type, &mut self.function_name, buf, ctx),
-            2 => merge_object_item(wire_type, buf, ctx, &mut self.args),
-            3 => merge_pair_item(wire_type, buf, ctx, &mut self.kwargs),
-            4 => encoding::uint32::merge(wire_type, &mut self.call_id, buf, ctx),
-            5 => encoding::message::merge(
-                wire_type,
-                self.not_handled_error.get_or_insert_with(pb::RaisedException::default),
-                buf,
-                ctx,
-            ),
-            _ => skip_field(wire_type, tag, buf, ctx),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.function_name.clear();
-        self.args.clear();
-        self.kwargs.clear();
-        self.call_id = 0;
-        self.not_handled_error = None;
-    }
-}
-
 /// Field numbers of the `MontyObject.kind` oneof — must match
 /// `proto/monty/v1/monty.proto` exactly (the differential oracle test catches drift).
 mod tag {
@@ -275,6 +203,7 @@ mod tag {
     pub const REPR: u32 = 26;
     pub const CYCLE: u32 = 27;
     pub const INSTANCE_TYPE: u32 = 28;
+    pub const NOT_IMPLEMENTED: u32 = 29;
 }
 
 // ============================================================================
@@ -290,6 +219,7 @@ mod tag {
 fn encode_object(obj: &MontyObject, buf: &mut impl BufMut) {
     match obj {
         MontyObject::Ellipsis => encoding::message::encode(tag::ELLIPSIS, &pb::Unit {}, buf),
+        MontyObject::NotImplemented => encoding::message::encode(tag::NOT_IMPLEMENTED, &pb::Unit {}, buf),
         MontyObject::None => encoding::message::encode(tag::NONE, &pb::Unit {}, buf),
         MontyObject::Bool(b) => encoding::bool::encode(tag::BOOLEAN, b, buf),
         MontyObject::Int(i) => encoding::sint64::encode(tag::INT, i, buf),
@@ -405,6 +335,7 @@ fn encode_object(obj: &MontyObject, buf: &mut impl BufMut) {
 fn object_len(obj: &MontyObject) -> usize {
     match obj {
         MontyObject::Ellipsis => encoding::message::encoded_len(tag::ELLIPSIS, &pb::Unit {}),
+        MontyObject::NotImplemented => encoding::message::encoded_len(tag::NOT_IMPLEMENTED, &pb::Unit {}),
         MontyObject::None => encoding::message::encoded_len(tag::NONE, &pb::Unit {}),
         MontyObject::Bool(b) => encoding::bool::encoded_len(tag::BOOLEAN, b),
         MontyObject::Int(i) => encoding::sint64::encoded_len(tag::INT, i),
@@ -684,6 +615,10 @@ fn decode_field(
         tag::ELLIPSIS => {
             merge_message::<pb::Unit>(wire_type, buf, ctx)?;
             MontyObject::Ellipsis
+        }
+        tag::NOT_IMPLEMENTED => {
+            merge_message::<pb::Unit>(wire_type, buf, ctx)?;
+            MontyObject::NotImplemented
         }
         tag::NONE => {
             merge_message::<pb::Unit>(wire_type, buf, ctx)?;

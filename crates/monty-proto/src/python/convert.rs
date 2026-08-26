@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use monty::{
+use monty_types::{
     FileMode, MontyDate, MontyDateTime, MontyException, MontyFileHandle, MontyObject, MontyTimeDelta, MontyTimeZone,
     MontyType, StringRepr,
 };
@@ -140,6 +140,8 @@ pub fn py_to_monty(obj: &Bound<'_, PyAny>, dc_registry: &DcRegistry, mut depth: 
         Ok(MontyObject::FrozenSet(items?))
     } else if obj.is(obj.py().Ellipsis()) {
         Ok(MontyObject::Ellipsis)
+    } else if obj.is(PyModule::import(obj.py(), "builtins")?.getattr("NotImplemented")?) {
+        Ok(MontyObject::NotImplemented)
     } else if let Ok(datetime) = obj.cast::<PyDateTime>() {
         py_datetime_to_monty(datetime)
     } else if let Ok(date) = obj.cast::<PyDate>() {
@@ -225,6 +227,20 @@ fn round_trip_type_table(py: Python<'_>) -> PyResult<&'static Vec<(Py<PyAny>, Mo
             MontyType::Str,
             MontyType::Bytes,
             MontyType::List,
+            MontyType::Deque,
+            MontyType::ListIterator,
+            MontyType::CallableIterator,
+            MontyType::ItertoolsCount,
+            MontyType::ItertoolsRepeat,
+            MontyType::ItertoolsPairwise,
+            MontyType::ItertoolsCompress,
+            MontyType::ItertoolsIslice,
+            MontyType::ItertoolsChain,
+            MontyType::ItertoolsCycle,
+            MontyType::ItertoolsTakeWhile,
+            MontyType::ItertoolsDropWhile,
+            MontyType::ItertoolsFilterFalse,
+            MontyType::ItertoolsStarMap,
             MontyType::Tuple,
             MontyType::Dict,
             MontyType::Set,
@@ -288,6 +304,7 @@ pub(crate) fn monty_to_py_inner(
     match obj {
         MontyObject::None => Ok(py.None()),
         MontyObject::Ellipsis => Ok(py.Ellipsis()),
+        MontyObject::NotImplemented => Ok(PyModule::import(py, "builtins")?.getattr("NotImplemented")?.unbind()),
         MontyObject::Bool(b) => Ok(PyBool::new(py, *b).to_owned().into_any().unbind()),
         MontyObject::Int(i) => Ok(i.into_pyobject(py)?.clone().into_any().unbind()),
         MontyObject::BigInt(bi) => Ok(bi.into_pyobject(py)?.clone().into_any().unbind()),
@@ -379,7 +396,7 @@ pub(crate) fn monty_to_py_inner(
         MontyObject::TimeZone(timezone) => monty_timezone_to_py(py, timezone),
         // Return the host Python type object the sandbox type maps to.
         MontyObject::Type(t) => type_object_to_py(py, t.clone()),
-        MontyObject::BuiltinFunction(f) => import_builtins(py)?.getattr(py, f.to_string()),
+        MontyObject::BuiltinFunction(f) => builtin_function_to_py(py, &f.to_string()),
         // Dataclass - use registry to reconstruct original type if available
         MontyObject::Dataclass {
             name,
@@ -408,6 +425,19 @@ pub(crate) fn monty_to_py_inner(
     }
 }
 
+/// Resolves a builtin function's host object from the name Monty renders it as.
+///
+/// Nearly every name is a plain `builtins` attribute, but `object.__setattr__`
+/// is dotted — it lives on `object`, not on the module — so the name is walked
+/// segment by segment rather than looked up whole.
+fn builtin_function_to_py(py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+    let mut obj: Py<PyAny> = import_builtins(py)?.clone_ref(py).into_any();
+    for segment in name.split('.') {
+        obj = obj.getattr(py, segment)?;
+    }
+    Ok(obj)
+}
+
 pub fn import_builtins(py: Python<'_>) -> PyResult<&Py<PyModule>> {
     static BUILTINS: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
 
@@ -434,8 +464,22 @@ fn type_object_to_py(py: Python<'_>, t: MontyType) -> PyResult<Py<PyAny>> {
     match t {
         MontyType::Date => cached!("datetime", "date"),
         MontyType::DateTime => cached!("datetime", "datetime"),
+        MontyType::Deque => cached!("collections", "deque"),
         MontyType::TimeDelta => cached!("datetime", "timedelta"),
         MontyType::TimeZone => cached!("datetime", "timezone"),
+        MontyType::ListIterator => get_list_iterator_type(py).map(|b| b.clone().unbind()),
+        MontyType::CallableIterator => get_callable_iterator_type(py).map(|b| b.clone().unbind()),
+        MontyType::ItertoolsCount => cached!("itertools", "count"),
+        MontyType::ItertoolsRepeat => cached!("itertools", "repeat"),
+        MontyType::ItertoolsPairwise => cached!("itertools", "pairwise"),
+        MontyType::ItertoolsCompress => cached!("itertools", "compress"),
+        MontyType::ItertoolsIslice => cached!("itertools", "islice"),
+        MontyType::ItertoolsChain => cached!("itertools", "chain"),
+        MontyType::ItertoolsCycle => cached!("itertools", "cycle"),
+        MontyType::ItertoolsTakeWhile => cached!("itertools", "takewhile"),
+        MontyType::ItertoolsDropWhile => cached!("itertools", "dropwhile"),
+        MontyType::ItertoolsFilterFalse => cached!("itertools", "filterfalse"),
+        MontyType::ItertoolsStarMap => cached!("itertools", "starmap"),
         // Consistent with the Path *instance* arm, which marshals as PurePosixPath
         // and is instantiable on every host OS (unlike PosixPath on Windows).
         MontyType::Path => get_pure_posix_path(py).map(|b| b.clone().unbind()),
@@ -446,6 +490,7 @@ fn type_object_to_py(py: Python<'_>, t: MontyType) -> PyResult<Py<PyAny>> {
         MontyType::BufferedWriter => cached!("io", "BufferedWriter"),
         MontyType::BufferedRandom => cached!("io", "BufferedRandom"),
         MontyType::SpecialForm => cached!("typing", "_SpecialForm"),
+        MontyType::Field => cached!("dataclasses", "Field"),
         // `NoneType` and `ellipsis` aren't `builtins` attributes; take them from
         // the singletons (`type(None)` / `type(...)`).
         MontyType::NoneType => Ok(py.None().bind(py).get_type().into_any().unbind()),
@@ -456,6 +501,29 @@ fn type_object_to_py(py: Python<'_>, t: MontyType) -> PyResult<Py<PyAny>> {
         ))),
         _ => import_builtins(py)?.getattr(py, t.to_string()),
     }
+}
+
+/// Returns CPython's private `list_iterator` type without relying on a module attribute.
+fn get_list_iterator_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    TYPE.get_or_try_init(py, || Ok(PyList::empty(py).try_iter()?.get_type().into_any().unbind()))
+        .map(|ty| ty.bind(py))
+}
+
+/// Returns CPython's private `callable_iterator` type, which — like
+/// `list_iterator` — is not reachable as a `builtins` attribute, so it is taken
+/// from the type of a throwaway two-argument `iter()`.
+fn get_callable_iterator_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    TYPE.get_or_try_init(py, || {
+        // `iter(callable, sentinel)` does not call `callable` until advanced, and
+        // this iterator never is — so any callable serves, and a builtin avoids
+        // compiling a throwaway lambda.
+        let callable = import_builtins(py)?.getattr(py, "id")?;
+        let iterator = import_builtins(py)?.getattr(py, "iter")?.call1(py, (callable, 0))?;
+        Ok(iterator.bind(py).get_type().into_any().unbind())
+    })
+    .map(|ty| ty.bind(py))
 }
 
 /// Converts a native Python `datetime.timedelta` to Monty's carrier representation.

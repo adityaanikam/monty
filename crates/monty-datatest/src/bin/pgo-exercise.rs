@@ -7,14 +7,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use monty_pool::{Pool, PoolConfig, PoolError, ReplConfig, TurnEvent};
+use monty_pool::{Pool, PoolConfig, PoolError, ReplConfig, TurnEvent, on_print_sync};
 
 /// Runs Monty's test-case corpus through subprocess pool sessions.
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let binary = find_monty_binary()?;
     println!("Training monty runtime at {}", binary.display());
 
-    let pool = Pool::new(PoolConfig::subprocess(binary))?;
+    let pool = Pool::new(PoolConfig::subprocess(binary)).await?;
     let mut test_cases = test_cases()?;
     test_cases.sort();
 
@@ -22,34 +23,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut typing_errors = 0;
     for test_case in &test_cases {
         let code = fs::read_to_string(test_case)?;
-        let mut session = pool.checkout(&ReplConfig {
-            script_name: test_case
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("main.py")
-                .to_owned(),
-            type_check: true,
-            ..ReplConfig::default()
-        })?;
+        let mut session = pool
+            .checkout(&ReplConfig {
+                script_name: test_case
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("main.py")
+                    .to_owned(),
+                type_check: true,
+                ..ReplConfig::default()
+            })
+            .await?;
+        let mut on_print = on_print_sync(|_, _| {});
 
-        match session.feed(&code, vec![], vec![], false, &mut |_, _| {}) {
+        match session.feed(&code, vec![], vec![], false, &mut on_print).await {
             Ok(TurnEvent::Complete(_)) => {
                 completed += 1;
-                session.finish()?;
+                session.finish().await?;
             }
             Err(PoolError::Typing(_)) => {
                 typing_errors += 1;
-                match session.feed(&code, vec![], vec![], true, &mut |_, _| {}) {
+                match session.feed(&code, vec![], vec![], true, &mut on_print).await {
                     Ok(TurnEvent::Complete(_)) => {
                         completed += 1;
-                        session.finish()?;
+                        session.finish().await?;
                     }
-                    Err(PoolError::Runtime(_)) => session.finish()?,
+                    Err(PoolError::Runtime(_)) => session.finish().await?,
                     Ok(_) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
-            Err(PoolError::Runtime(_)) => session.finish()?,
+            Err(PoolError::Runtime(_)) => session.finish().await?,
             Ok(_) => {}
             Err(error) => return Err(error.into()),
         }

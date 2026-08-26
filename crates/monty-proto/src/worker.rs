@@ -18,44 +18,17 @@
 
 use std::{borrow::Cow, mem};
 
-use monty::{
-    ExcType, ExtFunctionResult, LimitedTracker, MontyException, MontyObject, MontyRepl, PrintWriter,
-    PrintWriterCallback, ReplProgress, ReplStartError, fs::MountTable,
+use monty::{Dump, MontyRepl, ReplProgress, ReplStartError, Session, SessionRef, dump};
+use monty_type_checking::{SourceFile, TypeChecker};
+use monty_types::{
+    AssertMessageAnnotations, CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, OsFunctionCall,
+    PrintWriter, PrintWriterCallback, ResourceTracker, TypeCheckState, TypeCheckingConfig,
 };
-use monty_type_checking::{SourceFile, type_check};
-use prost::Message;
 
 use super::{
-    FrameError, FrameReader, MAX_FRAME_LEN, MONTY_VERSION, WireFunctionCall, WireOsCall, build_mount_table,
+    FrameError, FrameReader, MAX_FRAME_LEN, WireFunctionCall, check_protocol_version, exceeds_max_frame_len,
     exceeds_max_value_depth, future_results_from_proto, pb, write_frame,
 };
-
-/// The child always runs with `LimitedTracker`: an absent/empty limits message
-/// behaves like `ResourceLimits::new()`, and a single tracker type keeps the
-/// session state enum free of generics.
-type Tracker = LimitedTracker;
-
-/// Version tag of the opaque dump envelope produced by `Dump`.
-///
-/// Wire layout: `[DUMP_VERSION u16 LE][tag u8][session meta][postcard
-/// payload]` where tag 0 is a `MontyRepl` (idle session) and tag 1 a
-/// `ReplProgress` (suspended). The session meta carries the child-side state
-/// that lives *outside* the repl — script name, accumulated type-check stubs,
-/// and the in-flight feed's mount requirements — so a `Load`ed session keeps
-/// type-check enforcement and can validate its mounts instead of silently
-/// dropping them:
-///
-/// - `[script_name str][type_check u8]` and, when `type_check` is 1,
-///   `[committed_stubs str][has_pending u8][pending_snippet str?]`, where each
-///   `str` is a `u32 LE` byte length followed by UTF-8 bytes.
-/// - mount requirements: `[count u32 LE]` then per entry `[virtual_path
-///   str][mode i32 LE][has_limit u8][write_bytes_limit u64 LE?]`, recording the
-///   feed's mounts *without* host paths so `Load` can verify the re-supply. The
-///   count is 0 for an idle dump.
-///
-/// The payload is monty's postcard format — only a monty child of the same
-/// version can restore it.
-const DUMP_VERSION: u16 = 2;
 
 /// A sink for framed [`pb::ChildEvent`]s, decoupling the child from its
 /// transport.
@@ -177,6 +150,17 @@ fn dispatch_into(child: &mut Child, request_frame: &[u8], sink: &mut VecEventSin
     }
 }
 
+/// The sandbox budget of the child's current session, as a host outside the
+/// interpreter sees it. Both fields describe how much memory the session may
+/// need: the tracked budget, and whether type checking's untracked caches load.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SessionBudget {
+    /// `max_memory` in bytes; `None` when unlimited, or when no session exists.
+    pub max_memory: Option<usize>,
+    /// Whether the session type checks each fed snippet.
+    pub type_check: bool,
+}
+
 /// REPL session state of the child.
 enum SessionState {
     /// No repl materialized yet. `Some` once `Configure` has stored the config
@@ -185,58 +169,19 @@ enum SessionState {
     /// valid only from here — it cannot clobber a started session.
     Configured(Option<Box<pb::Configure>>),
     /// Session ready for the next `Feed`.
-    Ready(Box<MontyRepl<Tracker>>),
+    Ready(Box<MontyRepl>),
     /// Mid-feed, waiting for a resume request. Never holds
     /// `ReplProgress::Complete` — completion ends the turn immediately.
-    Suspended(Box<ReplProgress<Tracker>>),
-}
-
-/// Per-session type-check state, mirroring `pydantic_monty.MontyRepl`:
-/// successfully committed snippets accumulate as stubs so later snippets can
-/// reference names defined by earlier ones.
-struct TypeCheckState {
-    /// User-provided stubs plus every snippet that has completed successfully.
-    committed_stubs: String,
-    /// The in-flight snippet; committed on `Complete`, discarded on error.
-    pending_snippet: Option<String>,
-}
-
-/// The child-side session state that lives *outside* the repl/progress payload
-/// and so must travel in the dump envelope explicitly: the script name, the
-/// type-check state, and the in-flight feed's mount requirements. Serialized by
-/// [`push_session_meta`] and parsed by [`take_session_meta`].
-struct SessionMeta {
-    script_name: String,
-    type_check: Option<TypeCheckState>,
-    mount_requirements: Vec<MountRequirement>,
-}
-
-/// The host-independent shape of one mount: everything in a `pb::Mount`
-/// except the machine-specific `host_path`. Recorded in a suspended feed's
-/// dump so `Load` can verify the parent re-supplied the *same* mounts (by
-/// virtual path, mode, and write cap) before resuming — host paths are never
-/// dumped, so a malicious dump cannot inject a mount of an arbitrary host
-/// directory.
-#[derive(Clone, PartialEq)]
-struct MountRequirement {
-    virtual_path: String,
-    mode: i32,
-    write_bytes_limit: Option<u64>,
-}
-
-impl MountRequirement {
-    fn of(mount: &pb::Mount) -> Self {
-        Self {
-            virtual_path: mount.virtual_path.clone(),
-            mode: mount.mode,
-            write_bytes_limit: mount.write_bytes_limit,
-        }
-    }
+    Suspended(Box<ReplProgress>),
 }
 
 /// All state of one protocol child: the current REPL session plus the
-/// per-session metadata (script name, mounts, type-check context) that lives
-/// outside the repl.
+/// per-session metadata (script name, type-check context) that lives outside
+/// the repl.
+///
+/// The child performs no filesystem I/O: mounts are host configuration the
+/// parent handles entirely by servicing filesystem `OsCall` events itself, so
+/// no mount state (or host path) ever reaches the child.
 ///
 /// Drive it by reading framed [`pb::ParentRequest`]s from the host transport
 /// and passing each to [`Self::handle`] along with an [`EventSink`]; the child
@@ -246,46 +191,23 @@ pub struct Child {
     /// Script name of the current session (used for error and type-check
     /// diagnostics).
     script_name: String,
-    /// Mount table for the in-flight feed; rebuilt per feed, dropped when the
-    /// feed completes. Not part of dumps (mounts are host configuration, not
-    /// sandbox state) — instead a `Load` resuming a suspended feed carries the
-    /// mounts the parent re-supplies, and `handle_load` rebuilds the table from
-    /// them after checking they match `mount_requirements`.
-    mounts: Option<MountTable>,
-    /// Host-independent shape of the in-flight feed's mounts, dumped alongside
-    /// a suspended session so `Load` can validate the re-supplied mounts.
-    /// Empty between feeds and for idle sessions.
-    mount_requirements: Vec<MountRequirement>,
+    type_checker: TypeChecker,
     /// `Some` when the session was created with `type_check: true`.
     type_check: Option<TypeCheckState>,
 }
 
 impl Default for Child {
     fn default() -> Self {
-        Self::new()
+        Self {
+            state: SessionState::Configured(None),
+            script_name: String::new(),
+            type_checker: TypeChecker::default(),
+            type_check: None,
+        }
     }
 }
 
 impl Child {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            state: SessionState::Configured(None),
-            script_name: String::new(),
-            mounts: None,
-            mount_requirements: Vec::new(),
-            type_check: None,
-        }
-    }
-
-    /// Drops the in-flight feed's mount table and its recorded requirements.
-    /// Called when a feed ends (completion, error, reset) so a later idle dump
-    /// records no mount requirements.
-    fn clear_feed_mounts(&mut self) {
-        self.mounts = None;
-        self.mount_requirements.clear();
-    }
-
     /// Handles one request: streams any `Print` events and emits exactly one
     /// turn-ending event through `sink`, then reports what the host loop should
     /// do next. `Err` means the sink is broken (for stdout, the parent is
@@ -302,24 +224,11 @@ impl Child {
 
         let mut event = match kind {
             pb::parent_request::Kind::Configure(configure) => {
-                // Version skew is fatal. The protocol has no in-band
-                // negotiation and assumes parent and child are deployed in
-                // lockstep; a mismatched build can have a different frame
-                // layout, so we fail fast with a `FatalError` rather than risk
-                // a silent desync. Emit the fatal last gasp and stop the child.
-                //
-                // An *empty* version opts out of skew detection: it marks a
-                // parent that ships in lockstep with the worker and so has no
-                // independent build version to compare — the bundled wasm
-                // worker, whose TypeScript driver is published together with the
-                // `.wasm` in one package. A separately-deployed parent (the
-                // subprocess pool) always sends its real version, so its skew
-                // check is unaffected.
-                if !configure.monty_version.is_empty() && configure.monty_version != MONTY_VERSION {
-                    sink.send(&self.fatal_event(&format!(
-                        "version skew: parent={:?} child={MONTY_VERSION:?}",
-                        configure.monty_version
-                    )))?;
+                // An unsupported protocol version is fatal: the parent may frame
+                // or interpret later messages differently, so serving it risks a
+                // silent desync. Emit the fatal last gasp and stop the child.
+                if let Err(refusal) = check_protocol_version(configure.protocol_version) {
+                    sink.send(&self.fatal_event(&refusal))?;
                     return Ok(HandleOutcome::Fatal);
                 }
                 self.handle_configure(configure)
@@ -336,11 +245,19 @@ impl Child {
             pb::parent_request::Kind::ResumeNameLookup(resume) => self.handle_resume_name_lookup(resume, sink),
             pb::parent_request::Kind::ResumeFutures(resume) => self.handle_resume_futures(resume, sink),
             pb::parent_request::Kind::Dump(_) => self.handle_dump(),
-            pb::parent_request::Kind::Load(load) => self.handle_load(load),
-            pb::parent_request::Kind::Reset(_) => {
-                self.reset();
-                ok_event()
-            }
+            pb::parent_request::Kind::Load(load) => self.handle_load(&load),
+            pb::parent_request::Kind::Reset(_) => match self.reset() {
+                Ok(()) => ok_event(),
+                // A failed scrub leaves the finished session's files in the
+                // type checker, so this worker must never serve another one:
+                // the next session could resolve the previous session's
+                // modules. Die with an explanation the parent can log rather
+                // than carry on — or panic, which it would only see as a crash.
+                Err(err) => {
+                    sink.send(&self.fatal_event(&format!("type-check cleanup failed: {err}")))?;
+                    return Ok(HandleOutcome::Fatal);
+                }
+            },
             pb::parent_request::Kind::Shutdown(_) => {
                 sink.send(&ok_event())?;
                 return Ok(HandleOutcome::Shutdown);
@@ -348,9 +265,41 @@ impl Child {
         };
         self.stamp_execution_time(&mut event);
         if let Err(err) = sink.send(&event) {
-            self.recover_send_error(err, sink)?;
+            self.recover_send_error(&event, err, sink)?;
         }
         Ok(HandleOutcome::Continue)
+    }
+
+    /// What the session the child is *currently* holding would run under.
+    ///
+    /// A host that bounds the worker process from outside the interpreter (the
+    /// subprocess shell caps its own allocator) sizes that bound from this,
+    /// after every request: the budget changes when a session is configured,
+    /// restored from a dump — which brings its own limits, not the
+    /// `Configure`'s — or ended by `Reset`.
+    #[must_use]
+    pub fn session_budget(&self) -> SessionBudget {
+        match &self.state {
+            SessionState::Configured(Some(config)) => SessionBudget {
+                max_memory: config
+                    .limits
+                    .as_ref()
+                    .and_then(|limits| limits.max_memory_bytes)
+                    .map(|v| usize::try_from(v).unwrap_or(usize::MAX)),
+                type_check: config.type_check,
+            },
+            SessionState::Configured(None) => SessionBudget::default(),
+            SessionState::Ready(repl) => self.tracker_budget(repl.tracker()),
+            SessionState::Suspended(progress) => self.tracker_budget(progress.tracker()),
+        }
+    }
+
+    /// The budget of a materialized session, whose limits live in its tracker.
+    fn tracker_budget(&self, tracker: &ResourceTracker) -> SessionBudget {
+        SessionBudget {
+            max_memory: tracker.max_memory(),
+            type_check: self.type_check.is_some(),
+        }
     }
 
     /// Builds a timing-stamped `FatalError` event for an unrecoverable
@@ -368,16 +317,29 @@ impl Child {
     /// Recovers from a failure to write a turn-ending event.
     ///
     /// [`write_frame`] rejects an oversize frame *before* writing any bytes, so
-    /// the stream stays synced. When the session is not mid-suspension — e.g.
-    /// a `Complete` result that is merely larger than the frame limit — we can
-    /// answer with a clean, session-preserving error and keep serving instead
-    /// of crashing the worker. An oversize *suspension* announcement is
-    /// unrecoverable (the worker is already suspended but the parent never
-    /// learned the resume point), so it propagates to the host loop's fatal
-    /// handling, as does any genuine I/O break.
-    fn recover_send_error(&mut self, err: FrameError, sink: &mut dyn EventSink) -> Result<(), FrameError> {
+    /// the stream stays synced and an oversize event (a large `Complete`, or a
+    /// `DumpResult` while suspended) can be answered with a clean,
+    /// session-preserving error. An oversize *suspension announcement* is
+    /// unrecoverable — the worker is suspended but the parent never learned the
+    /// resume point — so it propagates to the host loop's fatal handling, as
+    /// does any genuine I/O break.
+    fn recover_send_error(
+        &mut self,
+        failed: &pb::ChildEvent,
+        err: FrameError,
+        sink: &mut dyn EventSink,
+    ) -> Result<(), FrameError> {
+        let announces_suspension = matches!(
+            failed.kind,
+            Some(
+                pb::child_event::Kind::FunctionCall(_)
+                    | pb::child_event::Kind::OsCall(_)
+                    | pb::child_event::Kind::NameLookup(_)
+                    | pb::child_event::Kind::ResolveFutures(_)
+            )
+        );
         match err {
-            FrameError::FrameTooLarge { len, max } if !matches!(self.state, SessionState::Suspended(_)) => {
+            FrameError::FrameTooLarge { len, max } if !announces_suspension => {
                 let mut event = error_event(
                     ExcType::RuntimeError,
                     &format!("result frame of {len} bytes exceeds the maximum of {max} bytes"),
@@ -410,11 +372,12 @@ impl Child {
     /// on the first feed/dump (or restored by `Load` instead). Valid only on a
     /// not-yet-configured worker.
     fn handle_configure(&mut self, configure: pb::Configure) -> pb::ChildEvent {
-        if !matches!(self.state, SessionState::Configured(None)) {
-            return protocol_violation("Configure while a session already exists");
+        if matches!(self.state, SessionState::Configured(None)) {
+            self.state = SessionState::Configured(Some(Box::new(configure)));
+            ok_event()
+        } else {
+            protocol_violation("Configure while a session already exists")
         }
-        self.state = SessionState::Configured(Some(Box::new(configure)));
-        ok_event()
     }
 
     /// Materializes the repl from the stored config the first time the session
@@ -431,12 +394,21 @@ impl Child {
         let Some(config) = config else {
             return Err(Box::new(protocol_violation("session has not been configured")));
         };
+        let type_check_config = TypeCheckingConfig::from(config.as_ref());
+        // Destructured exhaustively on purpose: a new `Configure` field must
+        // fail to compile here until the child decides what to do with it.
         let pb::Configure {
             script_name,
             limits,
             type_check,
             type_check_stubs,
-            // already validated against our own version when `Configure` arrived
+            assert_message_annotations,
+            // read above, through the accessor that validates the enum number
+            type_check_format: _,
+            type_check_color: _,
+            // range-checked when `Configure` arrived
+            protocol_version: _,
+            // informational only — never checked
             monty_version: _,
         } = *config;
         let limits = limits.unwrap_or_default().into();
@@ -444,11 +416,25 @@ impl Child {
         self.type_check = type_check.then(|| TypeCheckState {
             committed_stubs: type_check_stubs.unwrap_or_default(),
             pending_snippet: None,
+            config: type_check_config,
         });
-        self.state = SessionState::Ready(Box::new(MontyRepl::new(&self.script_name, LimitedTracker::new(limits))));
+        // Missing field means an older parent; the feature defaults to on.
+        let options = CompileOptions {
+            assert_message_annotations: assert_message_annotations.map_or_else(
+                AssertMessageAnnotations::default,
+                AssertMessageAnnotations::from_max_bytes,
+            ),
+        };
+        self.state = SessionState::Ready(Box::new(MontyRepl::new(
+            &self.script_name,
+            ResourceTracker::new(limits),
+            options,
+        )));
         Ok(())
     }
 
+    /// Runs a `Feed` on the ready session: type-checks the snippet (unless
+    /// skipped), injects inputs, and drives execution to the turn-ending event.
     fn handle_repl_feed(&mut self, feed: pb::Feed, sink: &mut dyn EventSink) -> pb::ChildEvent {
         if let Err(event) = self.ensure_repl() {
             return *event;
@@ -466,14 +452,6 @@ impl Child {
             Ok(inputs) => inputs,
             Err(event) => return *event,
         };
-        // record the host-independent mount shape before consuming the specs,
-        // so a dump taken mid-feed can make `Load` validate the re-supply
-        let requirements = feed.mounts.iter().map(MountRequirement::of).collect();
-        self.mounts = match build_mount_table(feed.mounts) {
-            Ok(mounts) => mounts,
-            Err(err) => return protocol_violation(&format!("invalid mounts: {err}")),
-        };
-        self.mount_requirements = requirements;
         let SessionState::Ready(repl) = mem::replace(&mut self.state, SessionState::Configured(None)) else {
             unreachable!("checked Ready above");
         };
@@ -492,6 +470,8 @@ impl Child {
         event
     }
 
+    /// Answers a suspended external function or OS call with the parent's
+    /// result, checking the `call_id` matches, then resumes execution.
     fn handle_resume_call(&mut self, resume: pb::ResumeCall, sink: &mut dyn EventSink) -> pb::ChildEvent {
         let expected_call_id = match &self.state {
             SessionState::Suspended(progress) => match progress.as_ref() {
@@ -510,13 +490,27 @@ impl Child {
                 resume.call_id
             ));
         }
-        let result: ExtFunctionResult = match resume.result {
-            Some(result) => match result.try_into() {
-                Ok(result) => result,
-                Err(err) => return protocol_violation(&format!("invalid result: {err}")),
-            },
-            None => return protocol_violation("ResumeCall has no result"),
+        let Some(wire_result) = resume.result else {
+            return protocol_violation("ResumeCall has no result");
         };
+        // NotHandled resolves against the suspended call itself — the child
+        // owns the no-handler semantics (`OsFunctionCall::on_no_handler`), so
+        // the parent never has to compute or echo the default exception.
+        let result: ExtFunctionResult =
+            if matches!(wire_result.kind, Some(pb::ext_function_result::Kind::NotHandled(_))) {
+                let SessionState::Suspended(progress) = &self.state else {
+                    unreachable!("checked above");
+                };
+                let ReplProgress::OsCall(call) = progress.as_ref() else {
+                    return protocol_violation("NotHandled is only valid answering a suspended OS call");
+                };
+                ExtFunctionResult::Error(call.function_call.on_no_handler())
+            } else {
+                match wire_result.try_into() {
+                    Ok(result) => result,
+                    Err(err) => return protocol_violation(&format!("invalid result: {err}")),
+                }
+            };
         let SessionState::Suspended(progress) = mem::replace(&mut self.state, SessionState::Configured(None)) else {
             unreachable!("checked above");
         };
@@ -531,6 +525,8 @@ impl Child {
         event
     }
 
+    /// Answers a suspended name lookup with the value (or absence) the parent
+    /// resolved, then resumes execution.
     fn handle_resume_name_lookup(&mut self, resume: pb::ResumeNameLookup, sink: &mut dyn EventSink) -> pb::ChildEvent {
         let SessionState::Suspended(progress) = &self.state else {
             return protocol_violation("ResumeNameLookup without a suspended name lookup");
@@ -555,6 +551,8 @@ impl Child {
         event
     }
 
+    /// Delivers the parent's resolved future results to a suspended
+    /// `ResolveFutures` state, then resumes execution.
     fn handle_resume_futures(&mut self, resume: pb::ResumeFutures, sink: &mut dyn EventSink) -> pb::ChildEvent {
         let SessionState::Suspended(progress) = &self.state else {
             return protocol_violation("ResumeFutures without suspended futures");
@@ -579,33 +577,21 @@ impl Child {
         event
     }
 
-    /// Serializes the current session into the opaque dump envelope. The
-    /// session stays live — dumping is read-only.
+    /// Serializes the current session, and the metadata that lives outside it,
+    /// into monty's dump format. The session stays live — dumping is read-only.
     fn handle_dump(&mut self) -> pb::ChildEvent {
         // a never-fed session is materialized into an empty repl so it can be
         // dumped; a never-configured worker has nothing to dump
         if let Err(event) = self.ensure_repl() {
             return *event;
         }
-        let dumped = match &self.state {
-            SessionState::Ready(repl) => repl.dump().map(|bytes| (0u8, bytes)),
-            SessionState::Suspended(progress) => progress.dump().map(|bytes| (1u8, bytes)),
+        let session = match &self.state {
+            SessionState::Ready(repl) => SessionRef::Idle(repl),
+            SessionState::Suspended(progress) => SessionRef::Suspended(progress),
             SessionState::Configured(_) => unreachable!("ensure_repl materialized the repl or errored"),
         };
-        match dumped {
-            Ok((tag, payload)) => {
-                let mut state = Vec::with_capacity(payload.len() + 64);
-                state.extend_from_slice(&DUMP_VERSION.to_le_bytes());
-                state.push(tag);
-                push_session_meta(
-                    &mut state,
-                    &self.script_name,
-                    self.type_check.as_ref(),
-                    &self.mount_requirements,
-                );
-                state.extend_from_slice(&payload);
-                event(pb::child_event::Kind::DumpResult(pb::DumpResult { state }))
-            }
+        match dump(&self.script_name, self.type_check.as_ref(), session) {
+            Ok(state) => event(pb::child_event::Kind::DumpResult(pb::DumpResult { state })),
             Err(err) => protocol_violation(&format!("dump failed: {err}")),
         }
     }
@@ -619,66 +605,56 @@ impl Child {
     /// instead of feeding. Once a feed has run (or a prior `Load` restored a
     /// session), the repl exists and `Load` is rejected rather than silently
     /// discarding it.
-    fn handle_load(&mut self, load: pb::Load) -> pb::ChildEvent {
+    fn handle_load(&mut self, load: &pb::Load) -> pb::ChildEvent {
         if !matches!(self.state, SessionState::Configured(_)) {
             return protocol_violation("Load requires a session that has not started (a feed has already run)");
         }
-        let pb::Load { state, mounts } = load;
-        let Some((version_bytes, rest)) = state.split_at_checked(2) else {
-            return protocol_violation("dump state too short");
+        let restored = match Dump::load(&load.state) {
+            Ok(restored) => restored,
+            Err(err) => return protocol_violation(&format!("failed to load session: {err}")),
         };
-        let version = u16::from_le_bytes([version_bytes[0], version_bytes[1]]);
-        if version != DUMP_VERSION {
-            return protocol_violation(&format!("unsupported dump version {version} (expected {DUMP_VERSION})"));
-        }
-        let Some((&tag, rest)) = rest.split_first() else {
-            return protocol_violation("dump state too short");
-        };
-        let Some((meta, payload)) = take_session_meta(rest) else {
-            return protocol_violation("malformed dump session metadata");
-        };
-        let SessionMeta {
+        let Dump {
             script_name,
             type_check,
-            mount_requirements: requirements,
-        } = meta;
-        if let Err(message) = validate_supplied_mounts(&requirements, &mounts) {
-            return error_event(ExcType::RuntimeError, &message);
-        }
-        let mount_table = match build_mount_table(mounts) {
-            Ok(table) => table,
-            Err(err) => return protocol_violation(&format!("invalid mounts: {err}")),
-        };
-        let mut event = match tag {
-            0 => match MontyRepl::load(payload) {
-                Ok(repl) => {
-                    self.state = SessionState::Ready(Box::new(repl));
-                    ok_event()
+            state,
+        } = restored;
+        // the depth/oversize checks below can only fail on a forged or corrupted
+        // dump — `drive` enforces them on every fresh suspension before it is
+        // stored
+        let mut event = match state {
+            Session::Idle(repl) => {
+                self.state = SessionState::Ready(repl);
+                ok_event()
+            }
+            // the protocol only ever serves repl sessions; a `MontyRun`
+            // execution has no way to accept further feeds
+            Session::Running(_) => protocol_violation("dump holds a one-shot run, not a repl session"),
+            Session::Suspended(progress) => match *progress {
+                // a dump is never taken at Complete, but a forged one could
+                // contain it; surface the value rather than fail
+                ReplProgress::Complete { repl, value } => {
+                    if exceeds_max_value_depth(&value) {
+                        protocol_violation("dump value exceeds the maximum wire depth")
+                    } else {
+                        self.state = SessionState::Ready(Box::new(repl));
+                        complete_event(value)
+                    }
                 }
-                Err(err) => protocol_violation(&format!("failed to load session: {err}")),
+                progress => {
+                    if suspension_args_too_deep(&progress) {
+                        protocol_violation("dump suspension arguments exceed the maximum wire depth")
+                    } else {
+                        let event = suspension_event(&progress);
+                        if let Some(message) = oversize_suspension_error_message(&event) {
+                            protocol_violation(&message)
+                        } else {
+                            self.state = SessionState::Suspended(Box::new(progress));
+                            event
+                        }
+                    }
+                }
             },
-            1 => match ReplProgress::load(payload) {
-                Ok(ReplProgress::Complete { repl, value }) => {
-                    // a dump is never taken at Complete, but a forged/legacy
-                    // one could contain it; surface the value rather than fail
-                    self.state = SessionState::Ready(Box::new(repl));
-                    complete_event(value)
-                }
-                Ok(progress) => {
-                    let event = suspension_event(&progress);
-                    self.state = SessionState::Suspended(Box::new(progress));
-                    event
-                }
-                Err(err) => protocol_violation(&format!("failed to load suspended session: {err}")),
-            },
-            other => protocol_violation(&format!("unknown dump tag {other}")),
         };
-        // a resumed feed re-establishes the mounts the parent re-supplied; an
-        // idle restore leaves `self.mounts` untouched (the next feed sets it)
-        if matches!(self.state, SessionState::Suspended(_)) {
-            self.mounts = mount_table;
-            self.mount_requirements = requirements;
-        }
         // adopt the restored metadata only once the payload actually loaded
         // (state is now Ready/Suspended) — a failed load leaves the child in
         // its prior un-started state, re-loadable. Surface the adopted script
@@ -691,18 +667,18 @@ impl Child {
         event
     }
 
-    /// Drives execution until it needs the parent: handles mount-covered OS
-    /// calls locally and returns the turn-ending event for everything else.
+    /// Drives execution until it needs the parent, returning the turn-ending
+    /// event. Every OS call surfaces to the parent — the child performs no
+    /// filesystem I/O (mounts are serviced parent-side).
     fn drive(
         &mut self,
-        mut result: Result<ReplProgress<Tracker>, Box<ReplStartError<Tracker>>>,
+        mut result: Result<ReplProgress, Box<ReplStartError>>,
         print: &mut ProtoPrint,
     ) -> pb::ChildEvent {
         loop {
             match result {
                 Ok(ReplProgress::Complete { repl, value }) => {
                     self.state = SessionState::Ready(Box::new(repl));
-                    self.clear_feed_mounts();
                     if let Some(state) = &mut self.type_check
                         && let Some(snippet) = state.pending_snippet.take()
                     {
@@ -717,46 +693,14 @@ impl Child {
                     }
                     return complete_event(value);
                 }
-                Ok(ReplProgress::OsCall(mut call)) => {
-                    // mount-covered OS calls are handled locally; the parent
-                    // never sees them
-                    let handled = self
-                        .mounts
-                        .as_mut()
-                        .and_then(|mounts| mounts.handle_os_call(&call.function_call));
-                    if let Some(outcome) = handled {
-                        let ext: ExtFunctionResult = match outcome {
-                            Ok(obj) => obj.into(),
-                            Err(err) => err.into_exception().into(),
-                        };
-                        result = call.resume(ext, PrintWriter::Callback(print));
-                        continue;
-                    }
-                    let function_call = call.take_function_call();
-                    let name = function_call.name();
-                    // only the child knows per-call no-handler semantics, so
-                    // the event carries the error a handler-less parent
-                    // should answer with
-                    let not_handled_error = function_call.on_no_handler();
-                    let call_id = call.call_id;
-                    let (args, kwargs) = function_call.to_args();
-                    if args.iter().any(exceeds_max_value_depth)
-                        || kwargs
-                            .iter()
-                            .any(|(k, v)| exceeds_max_value_depth(k) || exceeds_max_value_depth(v))
-                    {
+                Ok(ReplProgress::OsCall(call)) => {
+                    if os_call_args_too_deep(&call) {
                         let err =
                             MontyException::new(ExcType::RuntimeError, Some("Max argument depth exceeded".to_owned()));
                         result = call.resume(ExtFunctionResult::Error(err), PrintWriter::Callback(print));
                         continue;
                     }
-                    let event = event(pb::child_event::Kind::OsCall(WireOsCall {
-                        function_name: name.to_owned(),
-                        args,
-                        kwargs,
-                        call_id,
-                        not_handled_error: Some((&not_handled_error).into()),
-                    }));
+                    let event = suspension_event_os_call(&call);
                     if let Some(message) = oversize_suspension_error_message(&event) {
                         return self.abort_feed_with_runtime_error(call.into_repl(), &message);
                     }
@@ -766,12 +710,7 @@ impl Child {
                 Ok(ReplProgress::FunctionCall(call)) => {
                     // arguments too deep for the wire resume the call with a
                     // catchable error instead of corrupting the protocol
-                    if call.args.iter().any(exceeds_max_value_depth)
-                        || call
-                            .kwargs
-                            .iter()
-                            .any(|(k, v)| exceeds_max_value_depth(k) || exceeds_max_value_depth(v))
-                    {
+                    if function_call_args_too_deep(&call) {
                         let err =
                             MontyException::new(ExcType::RuntimeError, Some("Max argument depth exceeded".to_owned()));
                         result = call.resume(ExtFunctionResult::Error(err), PrintWriter::Callback(print));
@@ -792,7 +731,6 @@ impl Child {
                 Err(err) => {
                     // Python-level failure: the session always survives
                     self.state = SessionState::Ready(Box::new(err.repl));
-                    self.clear_feed_mounts();
                     if let Some(state) = &mut self.type_check {
                         state.pending_snippet = None;
                     }
@@ -805,9 +743,8 @@ impl Child {
     }
 
     /// Ends the current feed with a runtime error while keeping the REPL usable.
-    fn abort_feed_with_runtime_error(&mut self, repl: MontyRepl<Tracker>, message: &str) -> pb::ChildEvent {
+    fn abort_feed_with_runtime_error(&mut self, repl: MontyRepl, message: &str) -> pb::ChildEvent {
         self.state = SessionState::Ready(Box::new(repl));
-        self.clear_feed_mounts();
         if let Some(state) = &mut self.type_check {
             state.pending_snippet = None;
         }
@@ -821,7 +758,10 @@ impl Child {
         let state = self.type_check.as_ref()?;
         let stubs =
             (!state.committed_stubs.is_empty()).then(|| SourceFile::new(&state.committed_stubs, "repl_type_stubs.pyi"));
-        match type_check(&SourceFile::new(code, &self.script_name), stubs.as_ref()) {
+        match self
+            .type_checker
+            .run(&SourceFile::new(code, &self.script_name), stubs.as_ref(), state.config)
+        {
             Ok(None) => None,
             Ok(Some(diagnostics)) => Some(event(pb::child_event::Kind::TypingError(pb::TypingError {
                 diagnostics: diagnostics.to_string(),
@@ -832,11 +772,14 @@ impl Child {
 
     /// Drops all session state, returning to the unconfigured state ready for
     /// the next `Configure` (or `Load`).
-    fn reset(&mut self) {
+    ///
+    /// `Err` means the type checker still holds this session's files, which is
+    /// terminal for the worker — see the `Reset` arm in [`Self::handle`].
+    fn reset(&mut self) -> Result<(), String> {
         self.state = SessionState::Configured(None);
-        self.clear_feed_mounts();
         self.type_check = None;
         self.script_name = String::new();
+        self.type_checker.reset()
     }
 }
 
@@ -901,16 +844,16 @@ fn error_event(exc_type: ExcType, message: &str) -> pb::ChildEvent {
 /// The child turns this into a host-visible error before entering the
 /// suspension, because the parent cannot resume a call it never received.
 fn oversize_suspension_error_message(event: &pb::ChildEvent) -> Option<String> {
-    let len = u32::try_from(event.encoded_len()).unwrap_or(u32::MAX);
-    (len > MAX_FRAME_LEN).then(|| format!("argument frame of {len} bytes exceeds the maximum of {MAX_FRAME_LEN} bytes"))
+    exceeds_max_frame_len(event)
+        .map(|len| format!("argument frame of {len} bytes exceeds the maximum of {MAX_FRAME_LEN} bytes"))
 }
 
-/// Builds the suspension event for a fresh `FunctionCall` (depth-checked by
-/// the caller).
+/// Builds the suspension event for a `FunctionCall` (depth-checked by the
+/// caller).
 ///
 /// Clones the argument payload: the suspension keeps its args so a `Dump` of
 /// the suspended state (and its replay on `Load`) stays complete.
-fn suspension_event_function_call(call: &monty::ReplFunctionCall<Tracker>) -> pb::ChildEvent {
+fn suspension_event_function_call(call: &monty::ReplFunctionCall) -> pb::ChildEvent {
     event(pb::child_event::Kind::FunctionCall(WireFunctionCall {
         function_name: call.function_name.clone(),
         args: call.args.clone(),
@@ -920,217 +863,70 @@ fn suspension_event_function_call(call: &monty::ReplFunctionCall<Tracker>) -> pb
     }))
 }
 
+/// Builds the suspension event for an `OsCall` (depth-checked by the caller).
+///
+/// Clones the call payload: the suspension keeps its args so a `Dump` of the
+/// suspended state (and its re-announcement on `Load`) stays complete — a
+/// restored session's parent can service the call from mounts or its `os`
+/// callback exactly like a fresh one.
+fn suspension_event_os_call(call: &monty::ReplOsCall) -> pb::ChildEvent {
+    event(pb::child_event::Kind::OsCall(pb::OsCall {
+        call_id: call.call_id,
+        call: Some(call.function_call.clone().into()),
+    }))
+}
+
 fn complete_event(value: MontyObject) -> pb::ChildEvent {
     event(pb::child_event::Kind::Complete(pb::Complete {
         value: Some(value.into()),
     }))
 }
 
-/// Builds the suspension event for a non-`Complete`, non-`OsCall` progress
-/// state (OS calls are special-cased in `drive` because emitting them consumes
-/// the call's argument payload).
-fn suspension_event(progress: &ReplProgress<Tracker>) -> pb::ChildEvent {
-    let kind = match progress {
-        ReplProgress::FunctionCall(call) => pb::child_event::Kind::FunctionCall(WireFunctionCall {
-            function_name: call.function_name.clone(),
-            args: call.args.clone(),
-            kwargs: call.kwargs.clone(),
-            call_id: call.call_id,
-            method_call: call.method_call,
-        }),
-        ReplProgress::OsCall(call) => {
-            // reached only on `Load` of a dumped OsCall suspension, where the
-            // payload was already consumed by `take_function_call` (leaving
-            // `Used`, whose `name()` would panic) — the parent re-learns the
-            // name/args from its own records; a fresh suspension goes through
-            // `drive` instead
-            let has_payload = !matches!(call.function_call, monty::OsFunctionCall::Used);
-            pb::child_event::Kind::OsCall(WireOsCall {
-                function_name: if has_payload {
-                    call.function_call.name().to_owned()
-                } else {
-                    String::new()
-                },
-                args: vec![],
-                kwargs: vec![],
-                call_id: call.call_id,
-                not_handled_error: has_payload.then(|| (&call.function_call.on_no_handler()).into()),
-            })
-        }
-        ReplProgress::NameLookup(lookup) => pb::child_event::Kind::NameLookup(pb::NameLookup {
+/// Whether a suspension's argument payload nests too deeply for the wire —
+/// used by `drive` (fresh) and `handle_load` (restored, i.e. forged dumps).
+fn suspension_args_too_deep(progress: &ReplProgress) -> bool {
+    match progress {
+        ReplProgress::FunctionCall(call) => function_call_args_too_deep(call),
+        ReplProgress::OsCall(call) => os_call_args_too_deep(call),
+        // name lookups / future resolutions carry no sandbox values
+        _ => false,
+    }
+}
+
+/// Whether an external call's args/kwargs nest too deeply for the wire.
+fn function_call_args_too_deep(call: &monty::ReplFunctionCall) -> bool {
+    call.args.iter().any(exceeds_max_value_depth)
+        || call
+            .kwargs
+            .iter()
+            .any(|(k, v)| exceeds_max_value_depth(k) || exceeds_max_value_depth(v))
+}
+
+/// Whether an OS call's payload nests too deeply for the wire — only
+/// `os.getenv`'s default carries an arbitrary (nestable) sandbox value.
+fn os_call_args_too_deep(call: &monty::ReplOsCall) -> bool {
+    match &call.function_call {
+        OsFunctionCall::Getenv(args) => exceeds_max_value_depth(&args.default),
+        _ => false,
+    }
+}
+
+/// Builds the suspension event for a non-`Complete` progress state. Used on
+/// `Load` to re-announce a restored suspension; fresh suspensions go through
+/// `drive`, which adds depth/oversize checks before delegating to the same
+/// per-variant builders.
+fn suspension_event(progress: &ReplProgress) -> pb::ChildEvent {
+    match progress {
+        ReplProgress::FunctionCall(call) => suspension_event_function_call(call),
+        ReplProgress::OsCall(call) => suspension_event_os_call(call),
+        ReplProgress::NameLookup(lookup) => event(pb::child_event::Kind::NameLookup(pb::NameLookup {
             name: lookup.name.clone(),
-        }),
-        ReplProgress::ResolveFutures(state) => pb::child_event::Kind::ResolveFutures(pb::ResolveFutures {
+        })),
+        ReplProgress::ResolveFutures(state) => event(pb::child_event::Kind::ResolveFutures(pb::ResolveFutures {
             pending_call_ids: state.pending_call_ids().to_vec(),
-        }),
+        })),
         ReplProgress::Complete { .. } => unreachable!("Complete is handled before suspension_event"),
-    };
-    event(kind)
-}
-
-/// Appends a `u32 LE`-length-prefixed string field to a dump envelope.
-fn push_str_field(buf: &mut Vec<u8>, s: &str) {
-    // dump fields originate from ≤256 MiB protocol frames, so the length
-    // always fits in u32
-    let len = u32::try_from(s.len()).expect("dump field exceeds u32::MAX bytes");
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(s.as_bytes());
-}
-
-/// Appends the session metadata (script name + type-check state + mount
-/// requirements, see [`DUMP_VERSION`]) to a dump envelope.
-fn push_session_meta(
-    buf: &mut Vec<u8>,
-    script_name: &str,
-    type_check: Option<&TypeCheckState>,
-    mount_requirements: &[MountRequirement],
-) {
-    push_str_field(buf, script_name);
-    match type_check {
-        Some(tc) => {
-            buf.push(1);
-            push_str_field(buf, &tc.committed_stubs);
-            match &tc.pending_snippet {
-                Some(snippet) => {
-                    buf.push(1);
-                    push_str_field(buf, snippet);
-                }
-                None => buf.push(0),
-            }
-        }
-        None => buf.push(0),
     }
-    push_mount_requirements(buf, mount_requirements);
-}
-
-/// Splits the [`SessionMeta`] off the front of a dump envelope, returning it
-/// together with the remaining postcard payload. `None` means the envelope is
-/// malformed.
-fn take_session_meta(bytes: &[u8]) -> Option<(SessionMeta, &[u8])> {
-    let (script_name, rest) = take_str_field(bytes)?;
-    let (&type_check_flag, rest) = rest.split_first()?;
-    let (type_check, rest) = match type_check_flag {
-        0 => (None, rest),
-        1 => {
-            let (committed_stubs, rest) = take_str_field(rest)?;
-            let (&pending_flag, rest) = rest.split_first()?;
-            let (pending_snippet, rest) = match pending_flag {
-                0 => (None, rest),
-                1 => take_str_field(rest).map(|(snippet, rest)| (Some(snippet), rest))?,
-                _ => return None,
-            };
-            (
-                Some(TypeCheckState {
-                    committed_stubs,
-                    pending_snippet,
-                }),
-                rest,
-            )
-        }
-        _ => return None,
-    };
-    let (mount_requirements, rest) = take_mount_requirements(rest)?;
-    Some((
-        SessionMeta {
-            script_name,
-            type_check,
-            mount_requirements,
-        },
-        rest,
-    ))
-}
-
-/// Splits a `u32 LE`-length-prefixed string field off the front of a dump
-/// envelope.
-fn take_str_field(bytes: &[u8]) -> Option<(String, &[u8])> {
-    let (len_bytes, rest) = bytes.split_at_checked(4)?;
-    let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-    let (field, rest) = rest.split_at_checked(len)?;
-    Some((String::from_utf8(field.to_vec()).ok()?, rest))
-}
-
-/// Appends the in-flight feed's mount requirements to a dump envelope (see
-/// [`DUMP_VERSION`]). Host paths are deliberately excluded.
-fn push_mount_requirements(buf: &mut Vec<u8>, requirements: &[MountRequirement]) {
-    let count = u32::try_from(requirements.len()).expect("mount count exceeds u32::MAX");
-    buf.extend_from_slice(&count.to_le_bytes());
-    for req in requirements {
-        push_str_field(buf, &req.virtual_path);
-        buf.extend_from_slice(&req.mode.to_le_bytes());
-        match req.write_bytes_limit {
-            Some(limit) => {
-                buf.push(1);
-                buf.extend_from_slice(&limit.to_le_bytes());
-            }
-            None => buf.push(0),
-        }
-    }
-}
-
-/// Splits the mount requirements off the front of a dump envelope, returning
-/// them with the remaining postcard payload. `None` means the envelope is
-/// malformed. The count comes from untrusted bytes, so entries are pushed
-/// without pre-reserving capacity (a bogus count simply runs out of bytes).
-fn take_mount_requirements(bytes: &[u8]) -> Option<(Vec<MountRequirement>, &[u8])> {
-    let (count_bytes, mut rest) = bytes.split_at_checked(4)?;
-    let count = u32::from_le_bytes(count_bytes.try_into().ok()?);
-    let mut requirements = Vec::new();
-    for _ in 0..count {
-        let (virtual_path, after_path) = take_str_field(rest)?;
-        let (mode_bytes, after_mode) = after_path.split_at_checked(4)?;
-        let mode = i32::from_le_bytes(mode_bytes.try_into().ok()?);
-        let (&has_limit, after_flag) = after_mode.split_first()?;
-        let (write_bytes_limit, after_limit) = match has_limit {
-            0 => (None, after_flag),
-            1 => {
-                let (limit_bytes, after) = after_flag.split_at_checked(8)?;
-                (Some(u64::from_le_bytes(limit_bytes.try_into().ok()?)), after)
-            }
-            _ => return None,
-        };
-        requirements.push(MountRequirement {
-            virtual_path,
-            mode,
-            write_bytes_limit,
-        });
-        rest = after_limit;
-    }
-    Some((requirements, rest))
-}
-
-/// Checks that the mounts the parent re-supplied to `Load` match the suspended
-/// feed's recorded requirements exactly (by virtual path, mode, and write cap;
-/// host paths may differ). Returns a human-readable error describing the first
-/// discrepancy — a missing, extra, or altered mount — so a forgotten re-supply
-/// fails loudly instead of silently dropping the feed's mounts.
-fn validate_supplied_mounts(required: &[MountRequirement], supplied: &[pb::Mount]) -> Result<(), String> {
-    for req in required {
-        match supplied.iter().find(|m| m.virtual_path == req.virtual_path) {
-            None => {
-                return Err(format!(
-                    "the dump was suspended with a mount at {:?} that was not re-supplied to load; \
-                     pass the same mounts the original feed used",
-                    req.virtual_path
-                ));
-            }
-            Some(m) if m.mode != req.mode || m.write_bytes_limit != req.write_bytes_limit => {
-                return Err(format!(
-                    "the re-supplied mount at {:?} does not match the dump (mount mode or write limit differs)",
-                    req.virtual_path
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    for mount in supplied {
-        if !required.iter().any(|req| req.virtual_path == mount.virtual_path) {
-            return Err(format!(
-                "a mount at {:?} was supplied to load but the dump's feed had no such mount",
-                mount.virtual_path
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Converts wire named inputs into `(name, value)` pairs for `feed_start`.

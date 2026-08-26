@@ -1,5 +1,5 @@
 import { test } from 'vitest'
-import { t } from './assertions.js'
+import { assertMemoryError, t } from './assertions.js'
 import { kind } from './env.js'
 
 import { MontyRuntimeError, type ResourceLimits } from '@pydantic/monty'
@@ -15,9 +15,8 @@ const isRuntimeError = { instanceOf: MontyRuntimeError }
 
 test('resource limits custom', async () => {
   const limits: ResourceLimits = {
-    maxAllocations: 100,
     maxDurationSecs: 5.0,
-    maxMemory: 1024,
+    maxMemory: 64 * 1024,
     gcInterval: 10,
     maxRecursionDepth: 500,
   }
@@ -59,26 +58,6 @@ recurse(5)
 })
 
 // =============================================================================
-// Allocation limit tests
-// =============================================================================
-
-test('allocation limit', async () => {
-  // Use a more aggressive allocation pattern
-  const code = `
-result = []
-for i in range(10000):
-    result.append([i])
-len(result)
-`
-  const error = await t.throwsAsync(() => run(code, { limits: { maxAllocations: 5 } }), isRuntimeError)
-  t.is(error.message, 'MemoryError: allocation limit exceeded: 6 > 5')
-})
-
-test('allocation limit accepts values above u32 max', async () => {
-  t.is(await run('1 + 1', { limits: { maxAllocations: 2 ** 33 } }), 2)
-})
-
-// =============================================================================
 // Memory limit tests
 // =============================================================================
 
@@ -89,13 +68,9 @@ for i in range(1000):
     result.append('x' * 100)
 len(result)
 `
-  const error = await t.throwsAsync(() => run(code, { limits: { maxMemory: 100 } }), isRuntimeError)
-  t.is(
-    error.message,
-    kind === 'browser'
-      ? 'MemoryError: memory limit exceeded: 180 bytes > 100 bytes'
-      : 'MemoryError: memory limit exceeded: 220 bytes > 100 bytes',
-  )
+  const maxMemory = 64 * 1024
+  const error = await t.throwsAsync(() => run(code, { limits: { maxMemory } }), isRuntimeError)
+  assertMemoryError(error, kind === 'browser' ? 76_160 : 88_673, maxMemory)
 })
 
 test('memory limit accepts values above u32 max', async () => {
@@ -116,12 +91,12 @@ test('limits with inputs', async () => {
 
 test('pow memory limit', async () => {
   const error = await t.throwsAsync(() => run('2 ** 10000000', { limits: { maxMemory: 1_000_000 } }), isRuntimeError)
-  t.is(error.message, 'MemoryError: memory limit exceeded: 10000000 bytes > 1000000 bytes')
+  assertMemoryError(error, kind === 'browser' ? 10_024_700 : 10_031_056, 1_000_000)
 })
 
 test('lshift memory limit', async () => {
   const error = await t.throwsAsync(() => run('1 << 10000000', { limits: { maxMemory: 1_000_000 } }), isRuntimeError)
-  t.is(error.message, 'MemoryError: memory limit exceeded: 1250001 bytes > 1000000 bytes')
+  assertMemoryError(error, kind === 'browser' ? 1_274_701 : 1_281_057, 1_000_000)
 })
 
 test('mult memory limit', async () => {
@@ -130,7 +105,7 @@ big = 2 ** 4000000
 result = big * big
 `
   const error = await t.throwsAsync(() => run(code, { limits: { maxMemory: 1_000_000 } }), isRuntimeError)
-  t.is(error.message, 'MemoryError: memory limit exceeded: 4000000 bytes > 1000000 bytes')
+  assertMemoryError(error, kind === 'browser' ? 4_025_371 : 4_031_724, 1_000_000)
 })
 
 test('small operations within limit', async () => {

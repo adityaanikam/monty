@@ -4,7 +4,7 @@
 //! forward jumps with patching, and tracking source locations for tracebacks.
 
 use super::{
-    code::{Code, ConstPool, ExceptionEntry, LocationEntry},
+    code::{Code, ConstPool, ExceptionEntry, HandlerKind, LocationEntry},
     compiler::CompileError,
     op::{Opcode, Operand},
 };
@@ -51,12 +51,8 @@ pub struct CodeBuilder {
     /// Current focus location within the source range.
     current_focus: Option<CodeRange>,
 
-    /// Operand-stack depth at the point the next opcode will be emitted, or
-    /// `None` if not emitting a code region.
-    ///
-    /// Unconditional terminators (`Jump`, `ReturnValue`, `Raise`, `Reraise`,
-    /// `RaiseImportError`, `RaiseUnboundLocal`)
-    /// finish code regions, transitioning the builder to the dead-code state.
+    /// Operand-stack depth before the next opcode, or `None` in dead code.
+    /// Unconditional terminators include `AssertFailed`, but not `Assert`.
     current_stack_depth: Option<u16>,
 
     /// Maximum stack depth seen during compilation.
@@ -310,6 +306,12 @@ impl CodeBuilder {
         Offset(self.bytecode.len())
     }
 
+    /// Returns the current source position for compile-time diagnostics.
+    #[must_use]
+    pub fn current_position(&self) -> CodeRange {
+        self.current_location.unwrap_or_default()
+    }
+
     /// Returns a `JumpTarget` capturing both the current bytecode position and
     /// the stack depth at that position.
     #[must_use]
@@ -412,11 +414,12 @@ impl CodeBuilder {
         handler: Offset,
         stack_depth: u16,
         exception_stack_count: u16,
+        kind: HandlerKind,
     ) -> Result<(), CompileError> {
         let start = start.as_u32().ok_or_else(|| self.bytecode_too_large())?;
         let end = end.as_u32().ok_or_else(|| self.bytecode_too_large())?;
         let handler = handler.as_u32().ok_or_else(|| self.bytecode_too_large())?;
-        let entry = ExceptionEntry::new(start, end, handler, stack_depth, exception_stack_count);
+        let entry = ExceptionEntry::new(start, end, handler, stack_depth, exception_stack_count, kind);
         self.exception_table.push(entry);
         Ok(())
     }
@@ -512,20 +515,9 @@ impl CodeBuilder {
         Ok(())
     }
 
-    /// Single-source-of-truth emit path for all bytecode emission: records
-    /// location, writes opcode + operand bytes, applies the stack-effect
-    /// computed by `Opcode::stack_effect`, and transitions the tracker to
-    /// dead for unconditional terminators (`Jump`, `ReturnValue`, `Raise`,
-    /// `Reraise`).
-    ///
-    /// In the dead-code state the method silently no-ops. This lets the
-    /// compiler drive emission uniformly without gating individual emits
-    /// on reachability — dead trailers, epilogues, and orphaned cleanup
-    /// pairs all vanish naturally.
-    ///
-    /// `emit_jump` and `emit_jump_to` route their byte emission through here;
-    /// `emit_jump` additionally captures the pre-emit offset and computes the
-    /// jump-taken target depth for the returned `JumpLabel`.
+    /// Emits an instruction, recording its location and stack effect.
+    /// Unconditional terminators enter dead code, where emission is a no-op.
+    /// Jump helpers use this path to keep stack-depth tracking centralized.
     fn emit_with_operand(&mut self, op: Opcode, operand: Operand<'_>) -> Result<(), CompileError> {
         if self.is_dead() {
             return Ok(());
@@ -585,6 +577,7 @@ impl CodeBuilder {
                 | Opcode::Reraise
                 | Opcode::RaiseImportError
                 | Opcode::RaiseUnboundLocal
+                | Opcode::AssertFailed
                 | Opcode::Jump
         ) {
             self.current_stack_depth = None;

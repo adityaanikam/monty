@@ -7,7 +7,7 @@
 //! snapshots). The Python-facing `MontyError` class hierarchy stays in
 //! `pydantic-monty` — this module only maps values.
 
-use monty::{ExcData, ExcType, MontyException, MontyObject, UnicodeErrorObject};
+use monty_types::{ExcData, ExcType, JsonErrorData, MontyException, MontyObject, UnicodeErrorObject};
 use pyo3::{
     PyTypeCheck,
     exceptions::{self},
@@ -61,15 +61,7 @@ pub fn exc_monty_to_py(py: Python<'_>, mut exc: MontyException) -> PyErr {
         ExcType::TypeError => exceptions::PyTypeError::new_err(msg),
         ExcType::ValueError => exceptions::PyValueError::new_err(msg),
         ExcType::UnicodeDecodeError | ExcType::UnicodeEncodeError => unicode_error_to_py(py, exc_type, exc_data, msg),
-        ExcType::JsonDecodeError => {
-            if let Ok(json_decode_error) = get_json_decode_error(py)
-                && let Ok(exc_instance) = json_decode_error.call1((PyString::new(py, &msg),))
-            {
-                PyErr::from_value(exc_instance)
-            } else {
-                exceptions::PyValueError::new_err(msg)
-            }
-        }
+        ExcType::JsonDecodeError => json_decode_error_to_py(py, exc_data, msg),
         ExcType::ImportError => exceptions::PyImportError::new_err(msg),
         ExcType::ModuleNotFoundError => exceptions::PyModuleNotFoundError::new_err(msg),
         ExcType::OSError => exceptions::PyOSError::new_err(msg),
@@ -95,6 +87,16 @@ pub fn exc_monty_to_py(py: Python<'_>, mut exc: MontyException) -> PyErr {
                 PyErr::from_value(exc_instance)
             } else {
                 exceptions::PyRuntimeError::new_err(msg)
+            }
+        }
+        ExcType::BinasciiError => {
+            if let Ok(binascii_error) = get_binascii_error(py)
+                && let Ok(exc_instance) = binascii_error.call1((PyString::new(py, &msg),))
+            {
+                PyErr::from_value(exc_instance)
+            } else {
+                // Fall back to ValueError — the parent we model in `is_subclass_of`.
+                exceptions::PyValueError::new_err(msg)
             }
         }
     }
@@ -128,6 +130,30 @@ fn unicode_error_to_py(py: Python<'_>, exc_type: ExcType, exc_data: ExcData, msg
     exceptions::PyValueError::new_err(msg)
 }
 
+/// Builds a real `json.JSONDecodeError` from the structured [`JsonErrorData`]
+/// Monty attaches to decode errors.
+///
+/// The constructor requires `(msg, doc, pos)` and recomputes `lineno`/`colno`
+/// and the formatted message from `doc` — correct when the payload carries
+/// the document, but wrong when `doc` was dropped (documents over
+/// `JsonErrorData::MAX_DOC_LEN`). The location attributes and `args` are
+/// therefore overwritten with the payload/message values, which are right in
+/// both cases. Falls back to a plain `ValueError` when the payload is absent
+/// (an exception raised manually inside the sandbox) or construction fails.
+fn json_decode_error_to_py(py: Python<'_>, exc_data: ExcData, msg: String) -> PyErr {
+    if let ExcData::Json(data) = exc_data
+        && let Ok(exc_cls) = get_json_decode_error(py)
+        && let Ok(exc_instance) = exc_cls.call1((&data.msg, data.doc.as_deref().unwrap_or(""), data.pos))
+        && exc_instance.setattr("lineno", data.lineno).is_ok()
+        && exc_instance.setattr("colno", data.colno).is_ok()
+        && exc_instance.setattr("args", (PyString::new(py, &msg),)).is_ok()
+    {
+        PyErr::from_value(exc_instance)
+    } else {
+        exceptions::PyValueError::new_err(msg)
+    }
+}
+
 /// Converts a python exception to monty.
 ///
 /// Used when resuming execution with an exception from Python.
@@ -135,8 +161,32 @@ pub fn exc_py_to_monty(py: Python<'_>, py_err: &PyErr) -> MontyException {
     let exc = py_err.value(py);
     let exc_type = py_err_to_exc_type(exc);
     let arg = exc.str().ok().map(|s| s.to_string_lossy().into_owned());
+    let data = if exc_type == ExcType::JsonDecodeError {
+        json_data_from_py(exc)
+    } else {
+        ExcData::None
+    };
 
-    MontyException::new(exc_type, arg)
+    MontyException::new(exc_type, arg).with_data(data)
+}
+
+/// Reads the structured `msg`/`doc`/`pos`/`lineno`/`colno` attributes off a
+/// host-raised `json.JSONDecodeError` so they survive the trip into the
+/// sandbox and back out as a real exception. Returns [`ExcData::None`] when
+/// any attribute is missing or mistyped; over-long documents are dropped
+/// (matching the cap Monty applies when raising) while the rest is kept.
+fn json_data_from_py(exc: &Bound<'_, exceptions::PyBaseException>) -> ExcData {
+    let extract = || -> PyResult<JsonErrorData> {
+        let doc: String = exc.getattr("doc")?.extract()?;
+        Ok(JsonErrorData {
+            msg: exc.getattr("msg")?.extract()?,
+            doc: (doc.len() <= JsonErrorData::MAX_DOC_LEN).then_some(doc),
+            pos: exc.getattr("pos")?.extract()?,
+            lineno: exc.getattr("lineno")?.extract()?,
+            colno: exc.getattr("colno")?.extract()?,
+        })
+    };
+    extract().map_or(ExcData::None, |data| ExcData::Json(Box::new(data)))
 }
 
 /// Converts a Python exception to Monty's `MontyObject::Exception`.
@@ -162,6 +212,8 @@ fn py_err_to_exc_type(exc: &Bound<'_, exceptions::PyBaseException>) -> ExcType {
         } else if exceptions::PyValueError::type_check(exc) {
             if is_json_decode_error(exc) {
                 ExcType::JsonDecodeError
+            } else if is_binascii_error(exc) {
+                ExcType::BinasciiError
             } else if exceptions::PyUnicodeDecodeError::type_check(exc) {
                 ExcType::UnicodeDecodeError
             } else if exceptions::PyUnicodeEncodeError::type_check(exc) {
@@ -229,14 +281,28 @@ fn py_err_to_exc_type(exc: &Bound<'_, exceptions::PyBaseException>) -> ExcType {
                 ExcType::NotADirectoryError
             } else if exceptions::PyPermissionError::type_check(exc) {
                 ExcType::PermissionError
+            // TimeoutError is an OSError subclass since Python 3.3, so it must
+            // be matched here — a standalone check after this branch is dead code
+            } else if exceptions::PyTimeoutError::type_check(exc) {
+                ExcType::TimeoutError
             } else {
                 ExcType::OSError
             }
+        // ImportError hierarchy (check ModuleNotFoundError first as it's a subclass)
+        } else if exceptions::PyImportError::type_check(exc) {
+            if exceptions::PyModuleNotFoundError::type_check(exc) {
+                ExcType::ModuleNotFoundError
+            } else {
+                ExcType::ImportError
+            }
         // other standalone exception types
-        } else if exceptions::PyTimeoutError::type_check(exc) {
-            ExcType::TimeoutError
         } else if exceptions::PyMemoryError::type_check(exc) {
             ExcType::MemoryError
+        } else if exceptions::PyStopIteration::type_check(exc) {
+            ExcType::StopIteration
+        // last as it needs a python isinstance call against an imported class
+        } else if is_re_pattern_error(exc) {
+            ExcType::RePatternError
         } else {
             ExcType::Exception
         }
@@ -266,6 +332,33 @@ fn is_frozen_instance_error(exc: &Bound<'_, exceptions::PyBaseException>) -> boo
 fn is_json_decode_error(exc: &Bound<'_, exceptions::PyBaseException>) -> bool {
     if let Ok(json_decode_error_cls) = get_json_decode_error(exc.py()) {
         exc.is_instance(json_decode_error_cls).unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+/// Checks if an exception is a `binascii.Error` (a stdlib class, not a
+/// PyO3 built-in, so looked up lazily and cached).
+fn is_binascii_error(exc: &Bound<'_, exceptions::PyBaseException>) -> bool {
+    if let Ok(binascii_error_cls) = get_binascii_error(exc.py()) {
+        exc.is_instance(binascii_error_cls).unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+/// Returns the cached `binascii.Error` class — the `ValueError` subclass the
+/// `base64` codecs raise for malformed input.
+fn get_binascii_error(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static BINASCII_ERROR: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    BINASCII_ERROR.import(py, "binascii", "Error")
+}
+
+/// Checks if an exception is a `re.PatternError` (a stdlib class, not a
+/// PyO3 built-in, so looked up lazily and cached).
+fn is_re_pattern_error(exc: &Bound<'_, exceptions::PyBaseException>) -> bool {
+    if let Ok(re_pattern_error_cls) = get_re_pattern_error(exc.py()) {
+        exc.is_instance(re_pattern_error_cls).unwrap_or(false)
     } else {
         false
     }

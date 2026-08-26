@@ -13,16 +13,21 @@
 // `traceback` strings are not yet rendered (frames are decoded; the rendered
 // string is a follow-up); mounts are rejected (no host filesystem in a worker).
 
-import type { NativeException, NativeFrame, NativeFutureResult, NativeTurn } from '../native.js'
+import type { NativeException, NativeFrame, NativeFutureResult, NativeTurn, NotMountedTurn } from '../native.js'
+import {
+  type AssertMessageAnnotations,
+  type TypeCheckFormat,
+  encodeAssertMessageAnnotations,
+  encodeTypeCheckFormat,
+} from '../options.js'
 import type { Dispatcher } from './host.js'
-import { Reader, Wire, Writer, deframe, frame } from './proto.js'
-import { decodeMontyObject, encodeMontyObject } from './value.js'
+import { PROTOCOL_VERSION, Reader, Wire, Writer, deframe, frame } from './proto.js'
+import { decodeMontyObject, decodeTimeZone, encodeMontyObject } from './value.js'
 
 type OnPrint = (stream: 'stdout' | 'stderr', text: string) => void
 
 /** Resource limits enforced inside the worker, mirroring the napi pool's. */
 export interface ResourceLimits {
-  maxAllocations?: number
   maxDurationSecs?: number
   maxMemory?: number
   gcInterval?: number
@@ -35,6 +40,16 @@ export interface WorkerSessionConfig {
   limits?: ResourceLimits
   typeCheck?: boolean
   typeCheckStubs?: string
+  /** How typing diagnostics are rendered by the worker (default `'full'`). */
+  typeCheckFormat?: TypeCheckFormat
+  /** Render typing diagnostics with ANSI colour escapes (default false). */
+  typeCheckColor?: boolean
+  /**
+   * Give failed `assert`s introspected messages. Absent/true means the
+   * child's default (a 120-byte operand-repr truncation), false turns them
+   * off, an integer >= 1 customizes the truncation length.
+   */
+  assertMessageAnnotations?: AssertMessageAnnotations
 }
 
 // ParentRequest oneof field numbers (see proto/monty/v1/monty.proto). Note
@@ -63,13 +78,14 @@ const Ev = {
   DumpResult: 9,
   Ok: 10,
   FatalError: 11,
+  // 12 (ShutdownDump) is only ever fabricated by a serving relay, never by a
+  // worker, so this transport has no arm for it.
 }
 
 export class WorkerTransport {
   /** The id/name of the suspension awaiting an answer, for the `resume*` family. */
   private pendingCallId = 0
   private pendingFunctionName = ''
-  private pendingNotHandled: { excType: string; message: string } | null = null
 
   /** No OS process backs a wasm worker. */
   readonly workerPid: number | null = null
@@ -89,15 +105,25 @@ export class WorkerTransport {
 
   private constructor(private readonly dispatcher: Dispatcher) {}
 
-  /** Creates the REPL session (`ReplCreate`) and returns the ready transport. */
+  /** Creates the REPL session (`Configure`) and returns the ready transport. */
   static async create(dispatcher: Dispatcher, config: WorkerSessionConfig = {}): Promise<WorkerTransport> {
     const transport = new WorkerTransport(dispatcher)
     const create = new Writer()
-    create.string(1, config.scriptName ?? 'main.py') // ReplCreate.script_name
-    if (config.limits) create.lengthDelimited(2, encodeLimits(config.limits)) // ReplCreate.limits
-    if (config.typeCheck) create.bool(3, true) // ReplCreate.type_check
-    if (config.typeCheckStubs !== undefined) create.string(4, config.typeCheckStubs) // ReplCreate.type_check_stubs
-    await transport.control(Req.ReplCreate, create.finish(), Ev.Ok, 'ReplCreate')
+    create.string(1, config.scriptName ?? 'main.py') // Configure.script_name
+    if (config.limits) create.lengthDelimited(2, encodeLimits(config.limits)) // Configure.limits
+    if (config.typeCheck) create.bool(3, true) // Configure.type_check
+    if (config.typeCheckStubs !== undefined) create.string(4, config.typeCheckStubs) // Configure.type_check_stubs
+    // Configure.assert_message_annotations (field 6, optional uint32):
+    // absent = child default (on, 120-byte truncation), 0 = off, n = custom.
+    const assertAnnotations = encodeAssertMessageAnnotations(config.assertMessageAnnotations)
+    if (assertAnnotations !== undefined) create.uint(6, assertAnnotations)
+    // Configure.type_check_format (field 7, enum) and .type_check_color (8).
+    if (config.typeCheckFormat !== undefined) create.uint(7, encodeTypeCheckFormat(config.typeCheckFormat))
+    if (config.typeCheckColor) create.bool(8, true)
+    // Configure.protocol_version (field 9): this codec is versioned with the
+    // schema, so the constant is compiled in rather than read from a build.
+    create.uint(9, PROTOCOL_VERSION)
+    await transport.control(Req.ReplCreate, create.finish(), Ev.Ok, 'Configure')
     return transport
   }
 
@@ -119,7 +145,7 @@ export class WorkerTransport {
       named.lengthDelimited(2, encodeMontyObject(value)) // NamedValue.value
       feed.lengthDelimited(2, named.finish()) // ReplFeed.inputs
     }
-    if (skipTypeCheck) feed.bool(4, true) // ReplFeed.skip_type_check
+    if (skipTypeCheck) feed.bool(3, true) // Feed.skip_type_check
     return this.turn(Req.ReplFeed, feed.finish(), onPrint)
   }
 
@@ -138,8 +164,17 @@ export class WorkerTransport {
   }
 
   resumeNotHandled(onPrint: OnPrint): Promise<NativeTurn> {
-    const exc = this.pendingNotHandled ?? { excType: 'RuntimeError', message: 'OS call is not supported' }
-    return this.resumeCall(extResult(2, raisedException(exc.excType, exc.message)), onPrint)
+    // ExtFunctionResult.not_handled (Unit): the child raises the suspended
+    // call's own no-handler default.
+    return this.resumeCall(extResult(5, new Uint8Array()), onPrint)
+  }
+
+  /**
+   * Always reports "not covered": a wasm worker has no host filesystem, so
+   * `feed`/`restore` reject mounts outright and none can service a call.
+   */
+  resumeFromMounts(_onPrint: OnPrint): Promise<NotMountedTurn> {
+    return Promise.resolve({ kind: 'notMounted' })
   }
 
   resumeFuture(onPrint: OnPrint): Promise<NativeTurn> {
@@ -301,10 +336,9 @@ export class WorkerTransport {
       case Ev.TypingError:
         return { kind: 'typingError', diagnostics: decodeSingleString(event.bytes) }
       case Ev.FunctionCall: {
-        const call = decodeCall(event.bytes, false)
+        const call = decodeCall(event.bytes)
         this.pendingCallId = call.callId
         this.pendingFunctionName = call.functionName
-        this.pendingNotHandled = null
         return {
           kind: 'functionCall',
           functionName: call.functionName,
@@ -315,17 +349,15 @@ export class WorkerTransport {
         }
       }
       case Ev.OsCall: {
-        const call = decodeCall(event.bytes, true)
+        const call = decodeOsCall(event.bytes)
         this.pendingCallId = call.callId
         this.pendingFunctionName = call.functionName
-        this.pendingNotHandled = call.notHandledError ? simpleExc(call.notHandledError) : null
         return {
           kind: 'osCall',
           functionName: call.functionName,
           args: call.args,
           kwargs: call.kwargs,
           callId: call.callId,
-          notHandledError: call.notHandledError,
         }
       }
       case Ev.NameLookup:
@@ -351,13 +383,23 @@ function decodeChildEvents(reply: Uint8Array): ChildEventFrame[] {
   return [...deframe(reply)].map(readChildEvent)
 }
 
-/** Extracts the single oneof kind (1..=11) from a `ChildEvent`, ignoring timing. */
+/**
+ * Extracts the oneof kind from a `ChildEvent`, ignoring the message-level
+ * timing/name fields. Tags 1-19 are reserved for oneof arms and the message's
+ * own fields start at 20 (see `monty.proto`), so this range needs no change
+ * when an arm is added. Mirrors prost's decode: the last arm wins, and an arm
+ * that is not a length-delimited message is rejected rather than surfaced
+ * with an empty payload.
+ */
 function readChildEvent(frameBytes: Uint8Array): ChildEventFrame {
   const reader = new Reader(frameBytes)
   let event: ChildEventFrame | null = null
   while (!reader.done) {
     const f = reader.next()
-    if (f.field >= 1 && f.field <= 11) event = { kind: f.field, bytes: f.bytes }
+    if (f.field >= 1 && f.field <= 19) {
+      if (f.wire !== Wire.LengthDelimited) throw new Error(`ChildEvent kind ${f.field} is not a message`)
+      event = { kind: f.field, bytes: f.bytes }
+    }
   }
   if (!event) throw new Error('ChildEvent carried no kind')
   return event
@@ -387,11 +429,10 @@ interface DecodedCall {
   kwargs: [unknown, unknown][]
   callId: number
   methodCall: boolean
-  notHandledError?: NativeException
 }
 
-/** Decodes a `FunctionCall` (field 5 = method_call) or `OsCall` (field 5 = not_handled_error). */
-function decodeCall(bytes: Uint8Array, isOsCall: boolean): DecodedCall {
+/** Decodes a `FunctionCall`. */
+function decodeCall(bytes: Uint8Array): DecodedCall {
   const reader = new Reader(bytes)
   const call: DecodedCall = { functionName: '', args: [], kwargs: [], callId: 0, methodCall: false }
   while (!reader.done) {
@@ -410,12 +451,206 @@ function decodeCall(bytes: Uint8Array, isOsCall: boolean): DecodedCall {
         call.callId = Number(f.value)
         break
       case 5:
-        if (isOsCall) call.notHandledError = decodeRaisedException(f.bytes)
-        else call.methodCall = f.value !== 0n
+        call.methodCall = f.value !== 0n
         break
     }
   }
   return call
+}
+
+// `OsCall.call` oneof field numbers (see monty.proto).
+const Os = {
+  Exists: 2,
+  IsFile: 3,
+  IsDir: 4,
+  IsSymlink: 5,
+  ReadText: 6,
+  ReadBytes: 7,
+  Stat: 8,
+  Iterdir: 9,
+  Resolve: 10,
+  Absolute: 11,
+  Unlink: 12,
+  Rmdir: 13,
+  WriteText: 14,
+  AppendText: 15,
+  WriteBytes: 16,
+  AppendBytes: 17,
+  Open: 18,
+  Mkdir: 19,
+  Rename: 20,
+  Getenv: 21,
+  GetEnviron: 22,
+  DateToday: 23,
+  DateTimeNow: 24,
+}
+
+/** Stable call name for each path-only arm (the string payload is the path). */
+const OS_PATH_ARMS: Record<number, string> = {
+  [Os.Exists]: 'Path.exists',
+  [Os.IsFile]: 'Path.is_file',
+  [Os.IsDir]: 'Path.is_dir',
+  [Os.IsSymlink]: 'Path.is_symlink',
+  [Os.ReadText]: 'Path.read_text',
+  [Os.ReadBytes]: 'Path.read_bytes',
+  [Os.Stat]: 'Path.stat',
+  [Os.Iterdir]: 'Path.iterdir',
+  [Os.Resolve]: 'Path.resolve',
+  [Os.Absolute]: 'Path.absolute',
+  [Os.Unlink]: 'Path.unlink',
+  [Os.Rmdir]: 'Path.rmdir',
+}
+
+interface DecodedOsCall {
+  functionName: string
+  args: unknown[]
+  kwargs: [unknown, unknown][]
+  callId: number
+}
+
+/**
+ * Decodes the typed `OsCall` oneof back into the `(name, args, kwargs)`
+ * host-callback shape the native path surfaces. Declining the call is
+ * answered child-side (see `resumeNotHandled`), so no error is built here.
+ */
+function decodeOsCall(bytes: Uint8Array): DecodedOsCall {
+  const reader = new Reader(bytes)
+  let callId = 0
+  let arm: { field: number; bytes: Uint8Array } | null = null
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) callId = Number(f.value)
+    else if (f.field >= 2 && f.field <= 24) arm = { field: f.field, bytes: f.bytes }
+  }
+  if (!arm) throw new Error('OsCall carried no call')
+  return { callId, ...decodeOsArm(arm.field, arm.bytes) }
+}
+
+function decodeOsArm(field: number, bytes: Uint8Array): Omit<DecodedOsCall, 'callId'> {
+  const pathArm = OS_PATH_ARMS[field]
+  if (pathArm !== undefined) {
+    const path = decodeString(bytes)
+    return osCall(pathArm, [path])
+  }
+  switch (field) {
+    case Os.WriteText:
+    case Os.AppendText: {
+      const [path, data] = decodePathAndString(bytes)
+      return osCall(field === Os.WriteText ? 'Path.write_text' : 'Path.append_text', [path, data])
+    }
+    case Os.WriteBytes:
+    case Os.AppendBytes: {
+      const [path, data] = decodeBytesWrite(bytes)
+      return osCall(field === Os.WriteBytes ? 'Path.write_bytes' : 'Path.append_bytes', [path, data])
+    }
+    case Os.Open: {
+      const [path, mode] = decodePathAndString(bytes)
+      return osCall('open', [path, mode])
+    }
+    case Os.Mkdir: {
+      const { path, parents, existOk } = decodeMkdir(bytes)
+      return osCall(
+        'Path.mkdir',
+        [path],
+        [
+          ['parents', parents],
+          ['exist_ok', existOk],
+        ],
+      )
+    }
+    case Os.Rename: {
+      const [src, dst] = decodePathAndString(bytes)
+      return osCall('Path.rename', [src, dst])
+    }
+    case Os.Getenv: {
+      const [key, dflt] = decodeGetenv(bytes)
+      return osCall('os.getenv', [key, dflt])
+    }
+    case Os.GetEnviron:
+      return osCall('os.environ', [])
+    case Os.DateToday:
+      return osCall('date.today', [])
+    case Os.DateTimeNow:
+      // typed arm: `DateTimeNow.tz` (field 1) is an optional TimeZone
+      // message; absent means a naive result (tz=None)
+      return osCall('datetime.now', [decodeDateTimeNowTz(bytes)])
+    default:
+      throw new Error(`unknown OsCall arm ${field}`)
+  }
+}
+
+/** The `(name, args, kwargs)` host-callback shape for one decoded arm. */
+function osCall(
+  functionName: string,
+  args: unknown[],
+  kwargs: [unknown, unknown][] = [],
+): Omit<DecodedOsCall, 'callId'> {
+  return { functionName, args, kwargs }
+}
+
+/** `TextWrite`/`Open`/`Rename` bodies: two string fields. */
+function decodePathAndString(bytes: Uint8Array): [string, string] {
+  const reader = new Reader(bytes)
+  let first = ''
+  let second = ''
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) first = decodeString(f.bytes)
+    else if (f.field === 2) second = decodeString(f.bytes)
+  }
+  return [first, second]
+}
+
+/** `BytesWrite` body: `string path = 1; bytes data = 2`. */
+function decodeBytesWrite(bytes: Uint8Array): [string, unknown] {
+  const reader = new Reader(bytes)
+  let path = ''
+  let data: unknown = new Uint8Array(0)
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) path = decodeString(f.bytes)
+    else if (f.field === 2) data = typeof Buffer === 'undefined' ? f.bytes : Buffer.from(f.bytes)
+  }
+  return [path, data]
+}
+
+/** `Mkdir` body: `string path = 1; bool parents = 2; bool exist_ok = 3`. */
+function decodeMkdir(bytes: Uint8Array): { path: string; parents: boolean; existOk: boolean } {
+  const reader = new Reader(bytes)
+  let path = ''
+  let parents = false
+  let existOk = false
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) path = decodeString(f.bytes)
+    else if (f.field === 2) parents = f.value !== 0n
+    else if (f.field === 3) existOk = f.value !== 0n
+  }
+  return { path, parents, existOk }
+}
+
+/** `Getenv` body: `string key = 1; MontyObject default = 2`. */
+function decodeGetenv(bytes: Uint8Array): [string, unknown] {
+  const reader = new Reader(bytes)
+  let key = ''
+  let dflt: unknown = null
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) key = decodeString(f.bytes)
+    else if (f.field === 2) dflt = decodeMontyObject(f.bytes)
+  }
+  return [key, dflt]
+}
+
+/** Decodes `OsCall.DateTimeNow`: an optional `TimeZone` at field 1, `null` (naive) when absent. */
+function decodeDateTimeNowTz(bytes: Uint8Array): unknown {
+  const reader = new Reader(bytes)
+  let tz: unknown = null
+  while (!reader.done) {
+    const f = reader.next()
+    if (f.field === 1) tz = decodeTimeZone(f.bytes)
+  }
+  return tz
 }
 
 function decodePair(bytes: Uint8Array): [unknown, unknown] {
@@ -539,11 +774,10 @@ function decodeSingleString(bytes: Uint8Array): string {
 /** Encodes a `ResourceLimits` message (durations are seconds -> microseconds). */
 function encodeLimits(limits: ResourceLimits): Uint8Array {
   const w = new Writer()
-  if (limits.maxAllocations !== undefined) w.uint(1, limits.maxAllocations) // max_allocations
-  if (limits.maxDurationSecs !== undefined) w.uint(2, Math.round(limits.maxDurationSecs * 1_000_000)) // max_duration_micros
-  if (limits.maxMemory !== undefined) w.uint(3, limits.maxMemory) // max_memory_bytes
-  if (limits.gcInterval !== undefined) w.uint(4, limits.gcInterval) // gc_interval
-  if (limits.maxRecursionDepth !== undefined) w.uint(5, limits.maxRecursionDepth) // max_recursion_depth
+  if (limits.maxDurationSecs !== undefined) w.uint(1, Math.round(limits.maxDurationSecs * 1_000_000)) // max_duration_micros
+  if (limits.maxMemory !== undefined) w.uint(2, limits.maxMemory) // max_memory_bytes
+  if (limits.gcInterval !== undefined) w.uint(3, limits.gcInterval) // gc_interval
+  if (limits.maxRecursionDepth !== undefined) w.uint(4, limits.maxRecursionDepth) // max_recursion_depth
   return w.finish()
 }
 
@@ -577,10 +811,6 @@ function functionValue(name: string): Uint8Array {
   const obj = new Writer()
   obj.lengthDelimited(25, fn.finish()) // MontyObject.function
   return obj.finish()
-}
-
-function simpleExc(exc: NativeException): { excType: string; message: string } {
-  return { excType: exc.excType, message: exc.message }
 }
 
 function crashed(message: string): NativeTurn {

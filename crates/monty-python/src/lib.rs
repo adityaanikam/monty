@@ -18,12 +18,14 @@ mod mount;
 mod pool;
 mod print_target;
 mod snapshot;
+mod telemetry;
 mod version;
 
 use std::sync::OnceLock;
 
 pub use exceptions::{
-    MontyConversionError, MontyCrashedError, MontyError, MontyRuntimeError, MontySyntaxError, MontyTypingError, PyFrame,
+    MontyConversionError, MontyCrashedError, MontyDisconnectError, MontyError, MontyRuntimeError, MontyShutdown,
+    MontySyntaxError, MontyTypingError, PyFrame,
 };
 pub use mount::PyMountDir;
 pub use pool::{PyAsyncMonty, PyAsyncMontySession, PyAsyncMontyWebsocket, PyMonty, PyMontySession};
@@ -41,7 +43,7 @@ use version::cargo_version_to_pep440;
 fn get_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
 
-    VERSION.get_or_init(|| cargo_version_to_pep440(env!("CARGO_PKG_VERSION")))
+    VERSION.get_or_init(|| cargo_version_to_pep440(monty_types::MONTY_VERSION))
 }
 
 /// Private Python object type used for the public `NOT_HANDLED` singleton.
@@ -75,9 +77,8 @@ pub(crate) fn get_not_handled(py: Python<'_>) -> PyResult<&Py<PyAny>> {
 #[pymodule]
 mod _monty {
     // `MontyFileHandle` is produced by the value-conversion layer (in
-    // `monty_proto`, shared with the `monty-cpython` worker) whenever a
-    // `MontyObject::FileHandle` crosses the boundary; export it as part of the
-    // `pydantic_monty` surface.
+    // `monty_proto`) whenever a `MontyObject::FileHandle` crosses the
+    // boundary; export it as part of the `pydantic_monty` surface.
     #[pymodule_export]
     use monty_proto::python::PyMontyFileHandle as MontyFileHandle;
     use pyo3::prelude::*;
@@ -89,9 +90,13 @@ mod _monty {
     #[pymodule_export]
     use super::MontyCrashedError;
     #[pymodule_export]
+    use super::MontyDisconnectError;
+    #[pymodule_export]
     use super::MontyError;
     #[pymodule_export]
     use super::MontyRuntimeError;
+    #[pymodule_export]
+    use super::MontyShutdown;
     #[pymodule_export]
     use super::MontySyntaxError;
     #[pymodule_export]
@@ -126,6 +131,8 @@ mod _monty {
     use super::PyMountDir as MountDir;
     #[pymodule_export]
     use super::PyNameLookupSnapshot as NameLookupSnapshot;
+    #[pymodule_export]
+    use super::telemetry::_install_telemetry_adapter;
     use super::{get_not_handled, get_version};
 
     #[pymodule_init]

@@ -6,10 +6,13 @@ same public API to a Web Worker pool backed by a lean wasm build.
 
 [Monty](https://github.com/pydantic/monty) is a sandboxed Python interpreter
 written in Rust. A sandbox process can never be made fully crash-proof against
-memory errors (stack overflow, allocator aborts), so this package _only_ runs
-the interpreter in worker subprocesses: a worker that crashes raises
-`MontyCrashedError`, is replaced by the pool, and your Node.js process is
-never at risk.
+memory errors (stack overflow, allocator aborts), so the native binding
+(`@pydantic/monty`, `@pydantic/monty/node`) _only_ runs the interpreter in
+worker subprocesses: a worker that crashes raises `MontyCrashedError`, is
+replaced by the pool, and your Node.js process is never at risk. The wasm entry
+(`@pydantic/monty/wasm`, and the `browser` export) has no subprocess to use — it
+runs off-thread in a `Worker` in the browser, and in-process under Node, which
+has no global `Worker`.
 
 The native binding and the `monty` binary ship together via platform-specific
 npm packages installed automatically (like esbuild). Browser builds use the
@@ -141,35 +144,67 @@ if (restored instanceof FunctionSnapshot) await restored.resume('value')
 ```
 
 `session.dump()` between feeds serializes an idle session instead; restore it
-with `await session.load(blob)` (which resolves to `void`) and keep feeding.
-Both `load` and `loadSnapshot` are valid only on a fresh session, before any
-feed; using the wrong one for a dump's kind throws.
+with `await session.loadSession(blob)` (which resolves to `void`) and keep
+feeding. Both `loadSession` and `loadSnapshot` are valid only on a fresh
+session, before any feed; using the wrong one for a dump's kind throws.
 
 ## Print Output
 
+`printCallback` accepts a function or a host collector (`PrintTargetInput` in
+TypeScript). Output is line-buffered; without a callback it goes to the host
+process stdout/stderr.
+
 ```ts
+// Function form
 await session.feedRun('print("hello")', {
   printCallback: (stream, text) => console.log(`[${stream}] ${text}`),
 })
+
+// Collectors — accumulate on the host (not covered by ResourceLimits.maxMemory)
+import { CollectString, CollectStreams, DEFAULT_MAX_PRINT_COLLECT_BYTES } from '@pydantic/monty'
+
+const text = new CollectString()
+await session.feedRun('print("hello")', { printCallback: text })
+text.output // 'hello\n'
+
+const streams = new CollectStreams()
+await session.feedRun('print("hello")', { printCallback: streams })
+streams.output // [{ stream: 'stdout', text: 'hello\n' }]
 ```
 
-Output is line-buffered; without a callback it goes to the host process
-stdout/stderr.
+Both collectors default to a **10 MiB** cap (`DEFAULT_MAX_PRINT_COLLECT_BYTES`).
+Pass `maxBytes: null` to disable (trusted hosts only). `maxBytes` must be a
+finite non-negative number or `null` (constructors throw `TypeError` otherwise).
+Exceeding the cap rejects the feed with `MontyRuntimeError` / `MemoryError`
+(`memory limit exceeded: …`).
 
 ## Filesystem Mounts
 
 Mount host directories into the sandbox at virtual POSIX paths:
 
 ```ts
-import { MountDir } from '@pydantic/monty'
+import { MountDir } from '@pydantic/monty/node'
 
-const mount = new MountDir('/mnt/data', '/path/on/host', { mode: 'read-only' })
+const mount = new MountDir({ hostPath: '/path/on/host', virtualPath: '/mnt/data', mode: 'read-only' })
 await session.feedRun("open('/mnt/data/file.txt').read()", { mount })
 ```
 
+Each mount has a 100 MB aggregate memory budget by default. Configure it with
+`memoryUsageLimit`; retained overlay data and filesystem results share it, and
+operations that exceed it raise a `MontyRuntimeError` wrapping `MemoryError`.
+
 Modes: `'read-only'`, `'read-write'`, and `'overlay'` (default — writes are
-kept in worker memory and discarded at the end of the feed). OS calls mounts
-don't cover can be handled with the `os` callback:
+kept in memory and discarded at the end of the feed). Mount I/O is serviced
+on the host side of the pool, so mounts work even for remote workers.
+
+The constructor opens the host directory, so an unusable path throws there
+rather than at the first feed, and the mount then follows _that directory_ for
+its lifetime — renaming or replacing it afterwards changes nothing.
+
+`feedRun` answers every OS call automatically: mounts get first refusal, then
+the `os` callback. `feedStart` answers none — a mounted read surfaces as a
+`FunctionSnapshot` with `isOsFunction` set, and `resumeAuto()` is what consults
+the mounts and `os`. OS calls mounts don't cover reach the `os` callback:
 
 ```ts
 import { NOT_HANDLED } from '@pydantic/monty'
@@ -178,6 +213,35 @@ await session.feedRun('import os\nos.getenv("HOME")', {
   os: (name, args) => (name === 'os.getenv' && args[0] === 'HOME' ? '/home/user' : NOT_HANDLED),
 })
 ```
+
+Callback-backed virtual files return a `MontyFileHandle` marker from the
+open-time call. Paths are virtual POSIX sandbox paths and `position` defaults
+to zero:
+
+```ts
+import { MontyFileHandle, NOT_HANDLED } from '@pydantic/monty'
+
+const files = new Map([['/data/message.txt', 'hello from the host']])
+await session.feedRun("open('/data/message.txt').read()", {
+  os: (name, args) => {
+    const path = args[0] as string
+    if (name === 'open') {
+      return new MontyFileHandle(path, args[1] as string)
+    }
+    if (name === 'Path.read_text') return files.get(path) ?? NOT_HANDLED
+    return NOT_HANDLED
+  },
+})
+```
+
+`MontyFileHandle` canonicalizes `mode` and exposes the same file metadata as
+the Python host API: `path`, `mode`, `position`, `binary`, `readable`, and
+`writable`. Pass a nonzero initial position with
+`new MontyFileHandle(path, mode, { position: 42 })`.
+
+Returning the handle resolves only `open()` itself. Reads and writes are
+separate OS callbacks whose first argument is the handle's virtual path; the
+host never receives or exposes a live file descriptor.
 
 ## Resource Limits
 
@@ -199,8 +263,21 @@ external function or between feeds. Sessions with the limit also get an
 automatic backstop: the worker reports its execution time on every protocol
 turn and the host kills it `durationLimitGrace` (default 1s) after the
 remaining budget expires, covering cases where the in-sandbox limit cannot
-fire (e.g. a blocking syscall inside a mount). Set `durationLimitGrace: null`
-to disable it.
+fire (its check only runs at interpreter checkpoints). Set
+`durationLimitGrace: null` to disable it.
+
+## Assert message annotations
+
+Failed `assert` statements carry a pytest-style introspected message by
+default (`AssertionError: assert 2 == 5`) — a deliberate divergence from
+CPython's empty `AssertionError`. Each operand's repr is truncated to 120
+characters by default. Disable the messages per session to restore CPython's
+behavior, or pass an integer to customize the truncation length:
+
+```ts
+const session = await pool.checkout({ assertMessageAnnotations: false })
+const verbose = await pool.checkout({ assertMessageAnnotations: 1000 })
+```
 
 ## Type Checking
 
@@ -212,12 +289,24 @@ try {
   await session.feedRun('fetch(123)')
 } catch (err) {
   if (err instanceof MontyTypingError) {
-    console.log(err.display()) // rendered diagnostics, one per line
+    console.log(err.display()) // rendered diagnostics
   }
 }
 ```
 
 A snippet that fails type checking does not run; the session survives.
+
+`typeCheckFormat` picks the rendering — ty's `'full'` (the default: source
+snippet and carets), `'concise'`, `'azure'`, `'json'`, `'jsonlines'`,
+`'rdjson'`, `'pylint'`, `'gitlab'` or `'github'` — and `typeCheckColor` adds
+ANSI colour to `'full'` and `'concise'`. Both are checkout options rather than
+`display()` arguments because the diagnostics are rendered inside the worker:
+ty's structured diagnostics resolve their spans against the type checker's
+database, so only the rendered text crosses the wire.
+
+```ts
+const session = await pool.checkout({ typeCheck: true, typeCheckFormat: 'json' })
+```
 
 ## Error Handling
 
@@ -251,9 +340,28 @@ const pool = await Monty.create({
 })
 ```
 
+A session's `maxMemory` is enforced in the worker's own allocator too (the
+[`monty-alloc`](https://crates.io/crates/monty-alloc) crate), which bounds the
+bytes the worker holds at once — allocated minus freed, plus headroom — instead
+of letting it grow the host without bound. A
+worker that cannot honour the limit raises `MontyRuntimeError` wrapping
+`MemoryError` — but unlike other runtime errors it takes the worker with it, so
+the session is finished (the pool recovers). The wasm worker applies the same
+limit to what it allocates, but a trapped module has no exit status to classify,
+so there it raises `MontyCrashedError`.
+
 The `monty` binary resolves from: explicit `binaryPath` → the `MONTY_BIN`
 environment variable → the installed platform package → `PATH` → a cargo
 workspace `target/` build (development).
+
+The Node-only Logfire integration installs a version-1 adapter through
+`_installTelemetryAdapter(1, adapter)`. At checkout it propagates the active
+host trace context into Monty's exporter-free Rust spans, then reconstructs
+those records through the host SDK, which owns credentials, export, and
+shutdown. Delivery uses a bounded non-blocking queue; overflow permanently
+disables the adapter and sends one global cleanup notification rather than
+risking unbounded host memory. Browser/WASM does not yet implement this adapter
+path.
 
 ## Value Conversion
 
@@ -270,6 +378,7 @@ workspace `target/` build (development).
 | `dict`            | `Map` (preserves key types and order)                   |
 | `set`/`frozenset` | `Set`                                                   |
 | datetime types    | marker objects (`{ __monty_type__: 'DateTime', ... }`)  |
+| file handles      | `MontyFileHandle`                                       |
 | dataclasses       | marker objects (`{ __monty_type__: 'Dataclass', ... }`) |
 
 Plain objects are accepted as dict inputs (string keys).

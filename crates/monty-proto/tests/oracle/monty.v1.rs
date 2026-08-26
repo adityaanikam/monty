@@ -22,7 +22,7 @@ pub struct Unit {}
 pub struct MontyObject {
     #[prost(
         oneof = "monty_object::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29"
     )]
     pub kind: ::core::option::Option<monty_object::Kind>,
 }
@@ -101,6 +101,8 @@ pub mod monty_object {
         /// reconstructed from a name).
         #[prost(string, tag = "28")]
         InstanceType(::prost::alloc::string::String),
+        #[prost(message, tag = "29")]
+        NotImplemented(super::Unit),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -278,7 +280,7 @@ pub struct RaisedException {
 /// payload" (`ExcData::None`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExcData {
-    #[prost(oneof = "exc_data::Kind", tags = "1")]
+    #[prost(oneof = "exc_data::Kind", tags = "1, 2")]
     pub kind: ::core::option::Option<exc_data::Kind>,
 }
 /// Nested message and enum types in `ExcData`.
@@ -287,6 +289,8 @@ pub mod exc_data {
     pub enum Kind {
         #[prost(message, tag = "1")]
         Unicode(super::UnicodeErrorData),
+        #[prost(message, tag = "2")]
+        Json(super::JsonErrorData),
     }
 }
 /// CPython's UnicodeDecodeError/UnicodeEncodeError constructor fields
@@ -321,6 +325,27 @@ pub mod unicode_error_data {
         #[prost(string, tag = "3")]
         ObjectStr(::prost::alloc::string::String),
     }
+}
+/// CPython's json.JSONDecodeError attribute fields (msg, doc, pos, lineno,
+/// colno), letting hosts rebuild the real exception instead of a message-only
+/// fallback. Mirrors monty's `JsonErrorData`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JsonErrorData {
+    /// Bare error message, without the ": line N column M (char K)" suffix.
+    #[prost(string, tag = "1")]
+    pub msg: ::prost::alloc::string::String,
+    /// The document being parsed; absent when larger than the sender's size cap
+    /// or when bytes input is not valid UTF-8.
+    #[prost(string, optional, tag = "2")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
+    /// Character index of the error in `doc`.
+    #[prost(uint64, tag = "3")]
+    pub pos: u64,
+    /// 1-based line and column of the error.
+    #[prost(uint64, tag = "4")]
+    pub lineno: u64,
+    #[prost(uint64, tag = "5")]
+    pub colno: u64,
 }
 /// 1-based line/column source position (columns count characters, not bytes).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -357,38 +382,20 @@ pub struct StackFrame {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceLimits {
     #[prost(uint64, optional, tag = "1")]
-    pub max_allocations: ::core::option::Option<u64>,
-    #[prost(uint64, optional, tag = "2")]
     pub max_duration_micros: ::core::option::Option<u64>,
-    #[prost(uint64, optional, tag = "3")]
+    #[prost(uint64, optional, tag = "2")]
     pub max_memory_bytes: ::core::option::Option<u64>,
-    #[prost(uint64, optional, tag = "4")]
+    #[prost(uint64, optional, tag = "3")]
     pub gc_interval: ::core::option::Option<u64>,
-    #[prost(uint64, optional, tag = "5")]
+    #[prost(uint64, optional, tag = "4")]
     pub max_recursion_depth: ::core::option::Option<u64>,
 }
-/// Mounts a host directory into the sandbox. The child builds its own
-/// MountTable from these, so the host path must be valid on the machine the
-/// child runs on.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Mount {
-    /// Absolute virtual POSIX path, e.g. "/mnt/data".
-    #[prost(string, tag = "1")]
-    pub virtual_path: ::prost::alloc::string::String,
-    /// Host-native directory path.
-    #[prost(string, tag = "2")]
-    pub host_path: ::prost::alloc::string::String,
-    #[prost(enumeration = "MountMode", tag = "3")]
-    pub mode: i32,
-    /// Cap on total bytes written through this mount.
-    #[prost(uint64, optional, tag = "4")]
-    pub write_bytes_limit: ::core::option::Option<u64>,
-}
 /// Outcome of an external function / OS call, decided by the parent. Mirrors
-/// monty's `ExtFunctionResult`.
+/// monty's `ExtFunctionResult`, plus `not_handled` (which only the child can
+/// resolve, against its suspended call).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExtFunctionResult {
-    #[prost(oneof = "ext_function_result::Kind", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "ext_function_result::Kind", tags = "1, 2, 3, 4, 5")]
     pub kind: ::core::option::Option<ext_function_result::Kind>,
 }
 /// Nested message and enum types in `ExtFunctionResult`.
@@ -408,6 +415,12 @@ pub mod ext_function_result {
         /// No handler exists for this name — the child raises NameError.
         #[prost(string, tag = "4")]
         NotFound(::prost::alloc::string::String),
+        /// No handler accepted this OS call — the child raises the call's own
+        /// no-handler default (PermissionError naming the path for filesystem
+        /// calls, RuntimeError for the rest). Only valid answering an `OsCall`
+        /// suspension; the child computes it from its retained call payload.
+        #[prost(message, tag = "5")]
+        NotHandled(super::Unit),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -424,8 +437,20 @@ pub struct NamedValue {
     #[prost(message, optional, tag = "2")]
     pub value: ::core::option::Option<MontyObject>,
 }
+/// Tags 1-19 are reserved for `kind` arms and the message-level fields start
+/// at 20, mirroring `ChildEvent` — a oneof shares its field-number space with
+/// the enclosing message, so a new arm never has to jump the numbering. The
+/// same caveats apply: arms past 15 cost a two-byte key, and a forwarding
+/// server mirrors this numbering to classify frames without decoding them, so
+/// adding an arm degrades to "opaque" while renumbering one would misroute.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParentRequest {
+    /// W3C `traceparent` identifying the caller's span, so a child that exports
+    /// its own telemetry can attach its spans to the trace the request came
+    /// from. Purely additive context: the child's execution of the request must
+    /// not depend on it, and it is absent whenever the parent is not tracing.
+    #[prost(string, optional, tag = "20")]
+    pub trace_parent: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(oneof = "parent_request::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub kind: ::core::option::Option<parent_request::Kind>,
 }
@@ -472,13 +497,38 @@ pub struct Configure {
     /// Optional stub file contents used by type checking.
     #[prost(string, optional, tag = "4")]
     pub type_check_stubs: ::core::option::Option<::prost::alloc::string::String>,
-    /// The parent's monty version (e.g. "0.0.18"). The child rejects the
-    /// session with a `FatalError` when this does not match its own version:
-    /// the protocol has no in-band negotiation and parent and child must be
-    /// deployed in lockstep, so a mismatch is a hard, fail-fast error rather
-    /// than a silent source of frame desync.
+    /// The parent's monty package version (e.g. "0.0.18"). INFORMATIONAL ONLY —
+    /// it is never checked, only reported (in telemetry, and when diagnosing a
+    /// rejected `protocol_version`). Parent and child may run different package
+    /// versions as long as their protocol versions are compatible.
     #[prost(string, tag = "5")]
     pub monty_version: ::prost::alloc::string::String,
+    /// Introspected `assert` failure messages (see limitations/assert.md).
+    /// Absent = on with the default 120-byte operand-repr truncation; 0 disables
+    /// annotations; any other value retains that many bytes per operand before
+    /// any ellipsis, cutting on a character boundary.
+    #[prost(uint32, optional, tag = "6")]
+    pub assert_message_annotations: ::core::option::Option<u32>,
+    /// How the child renders the diagnostics carried by `TypingError`. The
+    /// structured diagnostics borrow the type checker's database and so cannot
+    /// cross the wire — the parent picks the format up front and the child
+    /// renders it. Ignored when `type_check` is false.
+    #[prost(enumeration = "TypeCheckFormat", tag = "7")]
+    pub type_check_format: i32,
+    /// Render typing diagnostics with ANSI colour escapes. Only `FULL` and
+    /// `CONCISE` carry colour; the machine-readable formats ignore it.
+    #[prost(bool, tag = "8")]
+    pub type_check_color: bool,
+    /// Version of the wire schema the parent speaks. The child rejects the
+    /// session with a `FatalError` naming its own supported range when this
+    /// falls outside it, so a parent deployed separately from its worker (over
+    /// a websocket, say) learns what to downgrade to without a handshake.
+    ///
+    /// 0 means the parent declared nothing — either it predates this field or it
+    /// is not a monty parent — and is always rejected. The protocol has no
+    /// in-band negotiation, so an undeclared peer cannot be assumed compatible.
+    #[prost(uint32, tag = "9")]
+    pub protocol_version: u32,
 }
 /// Executes one snippet against the session. Turn ends with `Complete`,
 /// `Error`, `TypingError`, or a suspension event.
@@ -488,12 +538,8 @@ pub struct Feed {
     pub code: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub inputs: ::prost::alloc::vec::Vec<NamedValue>,
-    /// Mounts for this feed; handled entirely inside the child. OS calls the
-    /// mounts do not cover bubble up as `OsCall` events.
-    #[prost(message, repeated, tag = "3")]
-    pub mounts: ::prost::alloc::vec::Vec<Mount>,
     /// Skip type checking for this feed even when the session enables it.
-    #[prost(bool, tag = "4")]
+    #[prost(bool, tag = "3")]
     pub skip_type_check: bool,
 }
 /// Answers a `FunctionCall` or `OsCall` suspension. `call_id` must match the
@@ -531,24 +577,18 @@ pub struct ResumeFutures {
     pub results: ::prost::alloc::vec::Vec<FutureResult>,
 }
 /// Requests an opaque serialized snapshot of the current session state
-/// (idle or suspended). The child stays usable afterwards. The bytes can only
-/// be restored by a monty child of the same version via `Load`.
+/// (idle or suspended). The child stays usable afterwards. The bytes carry
+/// monty's own dump format, versioned independently of this schema, and can
+/// only be restored via `Load` by a child built with the same dump version.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Dump {}
 /// Restores state produced by `Dump`. Valid only from no session. If
 /// the restored state was suspended, the child re-emits the suspension event so
 /// the parent learns the resume point; otherwise it replies `Ok`.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Load {
     #[prost(bytes = "vec", tag = "1")]
     pub state: ::prost::alloc::vec::Vec<u8>,
-    /// Mounts to re-establish for a suspended feed being resumed. Mounts are
-    /// host configuration, not sandbox state, so they are never part of the dump
-    /// — the parent re-supplies the same mounts it used for the original feed.
-    /// Without them a restored feed has no mounts and its OS calls all bubble up.
-    /// When the restored state is idle this must be empty.
-    #[prost(message, repeated, tag = "2")]
-    pub mounts: ::prost::alloc::vec::Vec<Mount>,
 }
 /// Ends the checkout: the child drops all session state and returns to the
 /// no-session state, ready for the next `Configure` or `Load`.
@@ -571,6 +611,14 @@ pub struct InstallDependencies {
     #[prost(string, repeated, tag = "1")]
     pub requirements: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// A oneof shares its field-number space with the enclosing message, so tags
+/// 1-19 are reserved by convention for `kind` arms and the message-level
+/// fields start at 20 — a new arm then never has to jump the numbering. Note
+/// arms past 15 cost a two-byte key instead of one, which forwarding servers
+/// (which walk only field keys, on every frame) pay per event. Such a server
+/// mirrors this numbering to classify frames without decoding them; it treats
+/// a tag it does not know as opaque, so adding an arm degrades rather than
+/// misroutes, but renumbering an existing one would break it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChildEvent {
     /// Cumulative execution time consumed by the session's sandbox code, in
@@ -580,21 +628,21 @@ pub struct ChildEvent {
     /// while a session exists (zero on Print events and outside a session) so
     /// the parent can mirror the `max_duration` budget, e.g. to arm a watchdog
     /// backstop, without keeping a second clock.
-    #[prost(uint64, tag = "12")]
+    #[prost(uint64, tag = "20")]
     pub total_execution_micros: u64,
     /// The session's `max_duration` limit in microseconds, when one is
     /// configured. Reported alongside `total_execution_micros` so a parent that
     /// restored a session via `Load` (where the limits travel inside the opaque
     /// state bytes) still learns the budget.
-    #[prost(uint64, optional, tag = "13")]
+    #[prost(uint64, optional, tag = "21")]
     pub max_duration_micros: ::core::option::Option<u64>,
     /// The session's script name, surfaced on a `Load` reply so a parent that
     /// restored a session (whose script name, like the limits above, travels
     /// inside the opaque dump bytes) learns it without parsing the dump. Set only
     /// on a successful `Load` reply; unset on all other events.
-    #[prost(string, optional, tag = "14")]
+    #[prost(string, optional, tag = "22")]
     pub restored_script_name: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(oneof = "child_event::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(oneof = "child_event::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
     pub kind: ::core::option::Option<child_event::Kind>,
 }
 /// Nested message and enum types in `ChildEvent`.
@@ -623,6 +671,8 @@ pub mod child_event {
         Ok(super::Ok),
         #[prost(message, tag = "11")]
         FatalError(super::FatalError),
+        #[prost(message, tag = "12")]
+        Shutdown(super::ShutdownDump),
     }
 }
 /// Streamed sandbox print() output. Zero or more of these precede each
@@ -650,30 +700,159 @@ pub struct FunctionCall {
     #[prost(bool, tag = "5")]
     pub method_call: bool,
 }
-/// Suspension: the sandbox performed an OS operation no mount handled, e.g.
-/// "Path.read_text" or "os.getenv". Answer with `ResumeCall`. Some calls have
-/// typed result expectations (e.g. "Open" must return a file_handle); a
-/// mismatched result becomes a Python-level error inside the sandbox.
+/// Suspension: the sandbox performed an OS operation, surfaced for the parent
+/// to service (e.g. from a mount) or answer with `ResumeCall`. One typed arm
+/// per call; every path is a virtual POSIX sandbox path, never a host path.
+/// Some calls have typed result expectations (e.g. `open` must return a
+/// file_handle); a mismatched result becomes a Python-level error inside the
+/// sandbox.
 ///
-/// NOTE: an OsCall re-announced after `Load` carries only `call_id` and
-/// `not_handled_error` — the argument payload was consumed when the call was
-/// first announced, before the dump was taken.
+/// A parent with no handler should answer `ResumeCall` with
+/// `ExtFunctionResult.not_handled`: the child raises the call's own default
+/// (PermissionError naming the path for filesystem calls, RuntimeError for
+/// the rest — monty's `OsFunctionCall::on_no_handler`).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OsCall {
-    #[prost(string, tag = "1")]
-    pub function_name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub args: ::prost::alloc::vec::Vec<MontyObject>,
-    #[prost(message, repeated, tag = "3")]
-    pub kwargs: ::prost::alloc::vec::Vec<Pair>,
-    #[prost(uint32, tag = "4")]
+    #[prost(uint32, tag = "1")]
     pub call_id: u32,
-    /// The exception monty would raise for this call when nothing handles it
-    /// (e.g. PermissionError for filesystem calls). A parent with no handler
-    /// should answer `ResumeCall` with this error — only the child knows the
-    /// per-call semantics.
-    #[prost(message, optional, tag = "5")]
-    pub not_handled_error: ::core::option::Option<RaisedException>,
+    #[prost(
+        oneof = "os_call::Call",
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+    )]
+    pub call: ::core::option::Option<os_call::Call>,
+}
+/// Nested message and enum types in `OsCall`.
+pub mod os_call {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct TextWrite {
+        #[prost(string, tag = "1")]
+        pub path: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub data: ::prost::alloc::string::String,
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct BytesWrite {
+        #[prost(string, tag = "1")]
+        pub path: ::prost::alloc::string::String,
+        #[prost(bytes = "vec", tag = "2")]
+        pub data: ::prost::alloc::vec::Vec<u8>,
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Open {
+        #[prost(string, tag = "1")]
+        pub path: ::prost::alloc::string::String,
+        /// Canonical open() mode string, same set as `FileHandle.mode`.
+        #[prost(string, tag = "2")]
+        pub mode: ::prost::alloc::string::String,
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Mkdir {
+        #[prost(string, tag = "1")]
+        pub path: ::prost::alloc::string::String,
+        #[prost(bool, tag = "2")]
+        pub parents: bool,
+        #[prost(bool, tag = "3")]
+        pub exist_ok: bool,
+    }
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Rename {
+        #[prost(string, tag = "1")]
+        pub src: ::prost::alloc::string::String,
+        #[prost(string, tag = "2")]
+        pub dst: ::prost::alloc::string::String,
+    }
+    /// os.getenv(key, default) — `default` may be any Python value.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct Getenv {
+        #[prost(string, tag = "1")]
+        pub key: ::prost::alloc::string::String,
+        #[prost(message, optional, tag = "2")]
+        pub default: ::core::option::Option<super::MontyObject>,
+    }
+    /// datetime.now(tz) — the VM validates the argument to None-or-timezone
+    /// before suspending, so the wire carries a typed TimeZone rather than an
+    /// arbitrary MontyObject.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct DateTimeNow {
+        /// Fixed-offset timezone for an aware result; absent for a naive one.
+        #[prost(message, optional, tag = "1")]
+        pub tz: ::core::option::Option<super::TimeZone>,
+    }
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Call {
+        /// ---- FS read / check / remove — the string is the virtual path -------
+        ///
+        /// Path.exists
+        #[prost(string, tag = "2")]
+        Exists(::prost::alloc::string::String),
+        /// Path.is_file
+        #[prost(string, tag = "3")]
+        IsFile(::prost::alloc::string::String),
+        /// Path.is_dir
+        #[prost(string, tag = "4")]
+        IsDir(::prost::alloc::string::String),
+        /// Path.is_symlink
+        #[prost(string, tag = "5")]
+        IsSymlink(::prost::alloc::string::String),
+        /// Path.read_text
+        #[prost(string, tag = "6")]
+        ReadText(::prost::alloc::string::String),
+        /// Path.read_bytes
+        #[prost(string, tag = "7")]
+        ReadBytes(::prost::alloc::string::String),
+        /// Path.stat
+        #[prost(string, tag = "8")]
+        Stat(::prost::alloc::string::String),
+        /// Path.iterdir
+        #[prost(string, tag = "9")]
+        Iterdir(::prost::alloc::string::String),
+        /// Path.resolve
+        #[prost(string, tag = "10")]
+        Resolve(::prost::alloc::string::String),
+        /// Path.absolute
+        #[prost(string, tag = "11")]
+        Absolute(::prost::alloc::string::String),
+        /// Path.unlink
+        #[prost(string, tag = "12")]
+        Unlink(::prost::alloc::string::String),
+        /// Path.rmdir
+        #[prost(string, tag = "13")]
+        Rmdir(::prost::alloc::string::String),
+        /// ---- FS write / mutate -----------------------------------------------
+        ///
+        /// Path.write_text (truncating)
+        #[prost(message, tag = "14")]
+        WriteText(TextWrite),
+        /// Path.append_text
+        #[prost(message, tag = "15")]
+        AppendText(TextWrite),
+        /// Path.write_bytes (truncating)
+        #[prost(message, tag = "16")]
+        WriteBytes(BytesWrite),
+        /// Path.append_bytes
+        #[prost(message, tag = "17")]
+        AppendBytes(BytesWrite),
+        #[prost(message, tag = "18")]
+        Open(Open),
+        #[prost(message, tag = "19")]
+        Mkdir(Mkdir),
+        #[prost(message, tag = "20")]
+        Rename(Rename),
+        /// ---- Non-FS ----------------------------------------------------------
+        ///
+        /// os.getenv
+        #[prost(message, tag = "21")]
+        Getenv(Getenv),
+        /// the os.environ snapshot
+        #[prost(message, tag = "22")]
+        GetEnviron(super::Unit),
+        /// date.today()
+        #[prost(message, tag = "23")]
+        DateToday(super::Unit),
+        /// datetime.now(tz) — the timezone argument (absent for a naive result).
+        #[prost(message, tag = "24")]
+        DateTimeNow(DateTimeNow),
+    }
 }
 /// Suspension: the sandbox read an undefined name — typically probing whether
 /// the parent provides an external function. Answer with `ResumeNameLookup`.
@@ -708,7 +887,7 @@ pub struct Error {
 /// survives.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TypingError {
-    /// Rendered diagnostics, one per line.
+    /// Diagnostics rendered in the session's `TypeCheckFormat`.
     #[prost(string, tag = "1")]
     pub diagnostics: ::prost::alloc::string::String,
 }
@@ -730,36 +909,71 @@ pub struct FatalError {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
 }
+/// Turn end: the serving relay (monty-server, never a child) is shutting down
+/// and did NOT run the request it is replying to. Sent only in reply to an
+/// in-flight request, so the client is always reading when it arrives.
+///
+/// Every other server policy action (idle/session/turn timeout, capacity) is
+/// just a dropped connection, which the client already classifies as a dead
+/// worker — only shutdown needs a message, because only shutdown has state to
+/// hand back.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShutdownDump {
+    /// Session state captured immediately before shutdown (same bytes as
+    /// `DumpResult.state`), restorable into a fresh worker via `Load`. Absent
+    /// when there was no session yet or the dump itself failed.
+    #[prost(bytes = "vec", optional, tag = "1")]
+    pub dump: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+/// Rendering of the typing diagnostics a `TypingError` carries; mirrors ty's
+/// `DiagnosticFormat`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
-pub enum MountMode {
+pub enum TypeCheckFormat {
+    /// Unset by an older parent — the child renders `FULL`.
     Unspecified = 0,
-    ReadOnly = 1,
-    ReadWrite = 2,
-    /// Copy-on-write overlay backed by child-local memory; writes are discarded
-    /// when the session ends.
-    Overlay = 3,
+    Full = 1,
+    Concise = 2,
+    Azure = 3,
+    Json = 4,
+    JsonLines = 5,
+    Rdjson = 6,
+    Pylint = 7,
+    Gitlab = 8,
+    Github = 9,
 }
-impl MountMode {
+impl TypeCheckFormat {
     /// String value of the enum field names used in the ProtoBuf definition.
     ///
     /// The values are not transformed in any way and thus are considered stable
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::Unspecified => "MOUNT_MODE_UNSPECIFIED",
-            Self::ReadOnly => "MOUNT_MODE_READ_ONLY",
-            Self::ReadWrite => "MOUNT_MODE_READ_WRITE",
-            Self::Overlay => "MOUNT_MODE_OVERLAY",
+            Self::Unspecified => "TYPE_CHECK_FORMAT_UNSPECIFIED",
+            Self::Full => "TYPE_CHECK_FORMAT_FULL",
+            Self::Concise => "TYPE_CHECK_FORMAT_CONCISE",
+            Self::Azure => "TYPE_CHECK_FORMAT_AZURE",
+            Self::Json => "TYPE_CHECK_FORMAT_JSON",
+            Self::JsonLines => "TYPE_CHECK_FORMAT_JSON_LINES",
+            Self::Rdjson => "TYPE_CHECK_FORMAT_RDJSON",
+            Self::Pylint => "TYPE_CHECK_FORMAT_PYLINT",
+            Self::Gitlab => "TYPE_CHECK_FORMAT_GITLAB",
+            Self::Github => "TYPE_CHECK_FORMAT_GITHUB",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "MOUNT_MODE_UNSPECIFIED" => Some(Self::Unspecified),
-            "MOUNT_MODE_READ_ONLY" => Some(Self::ReadOnly),
-            "MOUNT_MODE_READ_WRITE" => Some(Self::ReadWrite),
-            "MOUNT_MODE_OVERLAY" => Some(Self::Overlay),
+            "TYPE_CHECK_FORMAT_UNSPECIFIED" => Some(Self::Unspecified),
+            "TYPE_CHECK_FORMAT_FULL" => Some(Self::Full),
+            "TYPE_CHECK_FORMAT_CONCISE" => Some(Self::Concise),
+            "TYPE_CHECK_FORMAT_AZURE" => Some(Self::Azure),
+            "TYPE_CHECK_FORMAT_JSON" => Some(Self::Json),
+            "TYPE_CHECK_FORMAT_JSON_LINES" => Some(Self::JsonLines),
+            "TYPE_CHECK_FORMAT_RDJSON" => Some(Self::Rdjson),
+            "TYPE_CHECK_FORMAT_PYLINT" => Some(Self::Pylint),
+            "TYPE_CHECK_FORMAT_GITLAB" => Some(Self::Gitlab),
+            "TYPE_CHECK_FORMAT_GITHUB" => Some(Self::Github),
             _ => None,
         }
     }

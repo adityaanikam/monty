@@ -3,7 +3,8 @@
 //! which therefore cannot live in `test_cases/` — that suite runs every file
 //! against CPython too.
 
-use monty::{MontyException, MontyRun, UnicodeErrorData, UnicodeErrorObject};
+use monty::MontyRun;
+use monty_types::{CompileOptions, MontyException, UnicodeErrorData, UnicodeErrorObject};
 
 /// Runs `code` and returns the resulting error's full traceback rendering.
 fn run_err(code: &str) -> String {
@@ -12,7 +13,7 @@ fn run_err(code: &str) -> String {
 
 /// Runs `code` and returns the resulting `MontyException`.
 fn run_exc(code: &str) -> MontyException {
-    MontyRun::new(code.to_owned(), "test.py", vec![])
+    MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
         .run_no_limits(vec![])
         .unwrap_err()
@@ -20,7 +21,7 @@ fn run_exc(code: &str) -> MontyException {
 
 /// Runs `code` and returns its resulting string value.
 fn run_str(code: &str) -> String {
-    let result = MontyRun::new(code.to_owned(), "test.py", vec![])
+    let result = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default())
         .unwrap()
         .run_no_limits(vec![])
         .unwrap();
@@ -145,8 +146,8 @@ fn unicode_error_data_survives_reraise() {
 }
 
 /// Objects larger than `UnicodeErrorData::MAX_OBJECT_LEN` produce no payload
-/// (hosts fall back to the message-only form) so a huge input can't be pinned
-/// in memory, outside the sandbox's resource tracker, by its exception.
+/// (hosts fall back to the message-only form) so a huge input can't be copied
+/// into and pinned by the host exception.
 #[test]
 fn unicode_error_data_omitted_for_huge_objects() {
     let exc = run_exc("(b'a' * 100_000 + b'\\xff').decode()");

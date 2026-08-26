@@ -1,5 +1,7 @@
 [package]
 name = "monty-wasm-runtime"
+# Used by the monty-js build which is distributed via npm, not crates.io
+publish = false
 version = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
@@ -18,6 +20,7 @@ repository = { workspace = true }
 crate-type = ["cdylib"]
 
 [dependencies]
+monty-alloc = { workspace = true }
 monty-proto = { workspace = true, features = ["worker"] }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

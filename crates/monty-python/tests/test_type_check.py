@@ -6,12 +6,14 @@ for subsequent feeds; failures raise `MontyTypingError` with pre-rendered text.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
+from typing import Any, get_args
 
 import pytest
 from inline_snapshot import snapshot
 
-from pydantic_monty import Monty, MontyError, MontyRuntimeError, MontySession, MontyTypingError
+from pydantic_monty import Monty, MontyError, MontyRuntimeError, MontySession, MontyTypingError, TypeCheckFormat
 
 
 @pytest.fixture
@@ -47,36 +49,63 @@ error[unsupported-operator]: Unsupported `+` operation
 """)
 
 
-def test_type_check_no_cross_session_state_leak(pool: Monty):
-    """A later checkout must not see stale results from an earlier one."""
-    # Valid code first.
-    with pool.checkout(type_check=True) as session:
-        session.feed_run('x = 1')
-    # Invalid code — must produce a fresh error, not a cached pass.
-    with pool.checkout(type_check=True) as session:
-        with pytest.raises(MontyTypingError):
-            session.feed_run('"hello" + 1')
-    # Back to valid code — must pass again, not report a stale error.
-    with pool.checkout(type_check=True) as session:
-        session.feed_run('x = 1')
+def test_type_check_no_cross_session_state_leak():
+    """A later checkout must not see stale results from an earlier one.
+
+    Pinned to a single-worker pool so the later checkouts reuse the first
+    session's process — on the shared fixture a fresh worker could make this
+    pass vacuously. The deterministic same-process pins live in Rust
+    (`reset_scrubs_type_check_state_from_the_next_session` and the pool's
+    same-pid test); this covers the bindings surface.
+    """
+    with Monty(min_processes=1, max_processes=1) as pool:
+        # Valid code first.
+        with pool.checkout(type_check=True) as session:
+            session.feed_run('x = 1')
+        # Invalid code — must produce a fresh error, not a cached pass.
+        with pool.checkout(type_check=True) as session:
+            with pytest.raises(MontyTypingError):
+                session.feed_run('"hello" + 1')
+        # Back to valid code — must pass again, not report a stale error.
+        with pool.checkout(type_check=True) as session:
+            session.feed_run('x = 1')
 
 
-def test_type_check_stubs_not_leaked_to_later_session(pool: Monty):
-    """Stub declarations from one checkout must not be visible to a later one."""
-    with pool.checkout(type_check=True, type_check_stubs='call1_stub_var = 0') as session:
-        session.feed_run('result = call1_stub_var + 1', inputs={'call1_stub_var': 1})
-    with pool.checkout(type_check=True) as session:
-        with pytest.raises(MontyTypingError) as exc_info:
-            session.feed_run('result = call1_stub_var + 1')
-        assert str(exc_info.value) == snapshot("""\
-error[unresolved-reference]: Name `call1_stub_var` used when not defined
- --> main.py:1:10
-  |
-1 | result = call1_stub_var + 1
-  |          ^^^^^^^^^^^^^^
-  |
+def test_type_check_module_not_leaked_to_later_session():
+    """One session's script must not be importable by the next session's checks.
 
-""")
+    The reused checker retains the previous session's `a.py` until the
+    `Reset`-time scrub removes it; a broken scrub would let session B
+    type-check `from a import SECRET` clean and only fail at runtime.
+    """
+    with Monty(min_processes=1, max_processes=1) as pool:
+        with pool.checkout(type_check=True, script_name='a.py') as session:
+            session.feed_run('SECRET = "hunter2"')
+        with pool.checkout(type_check=True, script_name='b.py', type_check_format='concise') as session:
+            with pytest.raises(MontyTypingError) as exc_info:
+                session.feed_run('from a import SECRET')
+            assert str(exc_info.value) == snapshot(
+                'b.py:1:6: error[unresolved-import] Cannot resolve imported module `a`\n'
+            )
+
+
+def test_type_check_stubs_not_leaked_to_later_session():
+    """Stub declarations from one checkout must not be visible to a later one,
+    neither as bare names nor as the `repl_type_stubs` module itself."""
+    with Monty(min_processes=1, max_processes=1) as pool:
+        with pool.checkout(type_check=True, type_check_stubs='call1_stub_var = 0') as session:
+            session.feed_run('result = call1_stub_var + 1', inputs={'call1_stub_var': 1})
+        with pool.checkout(type_check=True, type_check_format='concise') as session:
+            with pytest.raises(MontyTypingError) as exc_info:
+                session.feed_run('result = call1_stub_var + 1')
+            assert str(exc_info.value) == snapshot(
+                'main.py:1:10: error[unresolved-reference] Name `call1_stub_var` used when not defined\n'
+            )
+            with pytest.raises(MontyTypingError) as exc_info:
+                session.feed_run('from repl_type_stubs import call1_stub_var')
+            assert str(exc_info.value) == snapshot(
+                'main.py:1:6: error[unresolved-import] Cannot resolve imported module `repl_type_stubs`\n'
+            )
 
 
 def test_type_check_function_return_type(tc_session: MontySession):
@@ -180,6 +209,86 @@ def test_monty_typing_error_display_matches_str(tc_session: MontySession):
     with pytest.raises(MontyTypingError) as exc_info:
         tc_session.feed_run('"hello" + 1')
     assert exc_info.value.display() == str(exc_info.value)
+
+
+# === type_check_format ===
+
+
+@pytest.mark.parametrize(
+    'fmt,expected',
+    [
+        (
+            'concise',
+            snapshot(
+                'main.py:1:1: error[unsupported-operator] Operator `+` is not supported between objects of type `Literal["hello"]` and `Literal[1]`\n'
+            ),
+        ),
+        (
+            'pylint',
+            snapshot(
+                'main.py:1: [unsupported-operator] Operator `+` is not supported between objects of type `Literal["hello"]` and `Literal[1]`\n'
+            ),
+        ),
+    ],
+)
+def test_type_check_format(pool: Monty, fmt: Any, expected: str):
+    """The format is chosen at checkout — the worker renders it before the error crosses the wire."""
+    with pool.checkout(type_check=True, type_check_format=fmt) as session:
+        with pytest.raises(MontyTypingError) as exc_info:
+            session.feed_run('"hello" + 1')
+    assert str(exc_info.value) == expected
+
+
+def test_type_check_format_json(pool: Monty):
+    """The machine-readable formats are what a host parses instead of scraping `full`."""
+    with pool.checkout(type_check=True, type_check_format='json') as session:
+        with pytest.raises(MontyTypingError) as exc_info:
+            session.feed_run('"hello" + 1')
+    [diagnostic] = json.loads(str(exc_info.value))
+    assert diagnostic['name'] == snapshot('unsupported-operator')
+    assert diagnostic['location'] == snapshot({'column': 1, 'row': 1})
+
+
+def test_type_check_color(pool: Monty):
+    """Colour is part of the same up-front choice; only full and concise carry it."""
+    with pool.checkout(type_check=True, type_check_format='concise', type_check_color=True) as session:
+        with pytest.raises(MontyTypingError) as exc_info:
+            session.feed_run('"hello" + 1')
+    assert str(exc_info.value).startswith('\x1b[')
+
+
+def test_type_check_format_names_match_the_worker(pool: Monty):
+    """Every name `TypeCheckFormat` advertises is one the worker accepts, and vice versa.
+
+    The stub's list and Rust's `TypeCheckingFormat` are separate declarations;
+    this is what stops them drifting apart.
+    """
+    declared = list(get_args(TypeCheckFormat))
+    for fmt in declared:
+        with pool.checkout(type_check=True, type_check_format=fmt) as session:
+            with pytest.raises(MontyTypingError):
+                session.feed_run('"hello" + 1')
+
+    # the worker lists its own names when it rejects one, so compare against that
+    with pytest.raises(ValueError) as exc_info:
+        pool.checkout(type_check=True, type_check_format='nonsense')  # pyright: ignore[reportArgumentType]
+    _, _, accepted = exc_info.value.args[0].partition('expected one of: ')
+    assert accepted.split(', ') == declared
+
+
+def test_type_check_format_invalid(pool: Monty):
+    with pytest.raises(ValueError) as exc_info:
+        pool.checkout(type_check=True, type_check_format='nonsense')  # pyright: ignore[reportArgumentType]
+    assert exc_info.value.args[0] == snapshot(
+        "unknown type check format 'nonsense', expected one of: "
+        'full, concise, azure, json, jsonlines, rdjson, pylint, gitlab, github'
+    )
+
+
+def test_type_check_format_not_a_string(pool: Monty):
+    with pytest.raises(TypeError) as exc_info:
+        pool.checkout(type_check=True, type_check_format=123)  # pyright: ignore[reportArgumentType]
+    assert exc_info.value.args[0] == snapshot('type_check_format must be a str')
 
 
 # === type_check_stubs ===

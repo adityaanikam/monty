@@ -5,17 +5,25 @@
 //! `Child` state machine over the message-based transport without any wasm
 //! toolchain.
 
-use monty::MontyObject;
+use monty::{DUMP_VERSION, MontyRepl, ReplProgress, SessionRef, dump};
 use monty_proto::{
-    FrameReader, MONTY_VERSION, WireObject, pb,
+    FrameReader, PROTOCOL_VERSION, WireObject, pb,
     worker::{Child, HandleOutcome, dispatch_frame},
     write_frame,
 };
+use monty_types::{CompileOptions, MONTY_VERSION, MontyObject, PrintWriter, ResourceTracker};
 
 /// Frames one request the way a host transport would before posting it.
 fn frame_request(kind: pb::parent_request::Kind) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_frame(&mut buf, &pb::ParentRequest { kind: Some(kind) }).expect("framing a request never fails");
+    write_frame(
+        &mut buf,
+        &pb::ParentRequest {
+            kind: Some(kind),
+            trace_parent: None,
+        },
+    )
+    .expect("framing a request never fails");
     buf
 }
 
@@ -50,7 +58,10 @@ fn create_repl(child: &mut Child) {
         limits: None,
         type_check: false,
         type_check_stubs: None,
+        assert_message_annotations: None,
         monty_version: MONTY_VERSION.to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        ..Default::default()
     }));
     let (bytes, outcome) = dispatch_frame(child, &request);
     assert_eq!(outcome, HandleOutcome::Continue);
@@ -64,7 +75,6 @@ fn feed(child: &mut Child, code: &str) -> (Vec<pb::Print>, pb::child_event::Kind
     let request = frame_request(pb::parent_request::Kind::Feed(pb::Feed {
         code: code.to_owned(),
         inputs: vec![],
-        mounts: vec![],
         skip_type_check: false,
     }));
     let (bytes, outcome) = dispatch_frame(child, &request);
@@ -85,7 +95,7 @@ fn expect_complete(event: pb::child_event::Kind) -> MontyObject {
 
 #[test]
 fn feed_round_trips_a_value() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let (_, event) = feed(&mut child, "1 + 2");
@@ -94,7 +104,7 @@ fn feed_round_trips_a_value() {
 
 #[test]
 fn session_state_persists_across_feeds() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let (_, first) = feed(&mut child, "x = 21");
@@ -106,7 +116,7 @@ fn session_state_persists_across_feeds() {
 
 #[test]
 fn print_output_is_streamed_before_the_terminator() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let (prints, event) = feed(&mut child, "print('hello'); print('world')");
@@ -117,7 +127,7 @@ fn print_output_is_streamed_before_the_terminator() {
 
 #[test]
 fn inputs_are_injected() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let request = frame_request(pb::parent_request::Kind::Feed(pb::Feed {
@@ -126,7 +136,6 @@ fn inputs_are_injected() {
             name: "n".to_owned(),
             value: Some(WireObject::new(MontyObject::Int(41))),
         }],
-        mounts: vec![],
         skip_type_check: false,
     }));
     let (bytes, outcome) = dispatch_frame(&mut child, &request);
@@ -137,7 +146,7 @@ fn inputs_are_injected() {
 
 #[test]
 fn malformed_request_frame_is_recoverable() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     // a length prefix claiming bytes that aren't there: structurally broken
     // framing, not a decode error
     let (bytes, outcome) = dispatch_frame(&mut child, &[0xff, 0xff, 0xff, 0x7f]);
@@ -150,7 +159,7 @@ fn malformed_request_frame_is_recoverable() {
 
 #[test]
 fn shutdown_request_reports_shutdown() {
-    let mut child = Child::new();
+    let mut child = Child::default();
     create_repl(&mut child);
 
     let request = frame_request(pb::parent_request::Kind::Shutdown(pb::Shutdown {}));
@@ -160,4 +169,69 @@ fn shutdown_request_reports_shutdown() {
         matches!(decode_events(&bytes).as_slice(), [pb::child_event::Kind::Ok(_)]),
         "Shutdown answers with a single Ok"
     );
+}
+
+/// A dump written by a different `DUMP_VERSION` is rejected, and the error
+/// names both versions so a host can tell a stale snapshot from a corrupt one.
+#[test]
+fn load_rejects_old_dump_version() {
+    // a real dump rewound to the previous version, so only the version is wrong
+    let repl = MontyRepl::new("main.py", ResourceTracker::default(), CompileOptions::default());
+    let mut state = dump("main.py", None, SessionRef::Idle(&repl)).expect("dumping an idle repl succeeds");
+    state[6..8].copy_from_slice(&(DUMP_VERSION - 1).to_le_bytes());
+
+    let mut child = Child::default();
+    create_repl(&mut child);
+    let request = frame_request(pb::parent_request::Kind::Load(pb::Load { state }));
+    let (bytes, outcome) = dispatch_frame(&mut child, &request);
+    assert_eq!(outcome, HandleOutcome::Continue);
+    let (_, event) = split_turn(&bytes);
+    let pb::child_event::Kind::Error(error) = event else {
+        panic!("expected an Error event, got {event:?}");
+    };
+    assert_eq!(
+        error.exception.unwrap().message.unwrap(),
+        format!(
+            "protocol violation: failed to load session: dump format version {}, this build reads {DUMP_VERSION}",
+            DUMP_VERSION - 1
+        )
+    );
+}
+
+/// A forged suspended dump whose call arguments nest deeper than the wire
+/// depth bound must be rejected at `Load` with a protocol violation — not
+/// re-announced as an event the parent cannot decode.
+#[test]
+fn load_rejects_dump_with_over_deep_suspension_args() {
+    // suspend in-process (no wire depth bound) at `f(x)` with x nested 100
+    // lists deep — over the ~48 wire bound, shallow enough that postcard's
+    // recursive deserialize doesn't overflow the test stack
+    let repl = MontyRepl::new("main.py", ResourceTracker::default(), CompileOptions::default());
+    let code = "x = []\nfor _ in range(100):\n    x = [x]\nf(x)";
+    let progress = repl
+        .feed_start(code, vec![], PrintWriter::Stdout)
+        .expect("feed_start suspends");
+    assert!(
+        matches!(progress, ReplProgress::FunctionCall(_)),
+        "expected a FunctionCall suspension"
+    );
+    let state = dump("main.py", None, SessionRef::Suspended(&progress)).expect("in-process dump has no depth bound");
+
+    let mut child = Child::default();
+    create_repl(&mut child);
+    let request = frame_request(pb::parent_request::Kind::Load(pb::Load { state }));
+    let (bytes, outcome) = dispatch_frame(&mut child, &request);
+    assert_eq!(outcome, HandleOutcome::Continue);
+    let (_, event) = split_turn(&bytes);
+    let pb::child_event::Kind::Error(error) = event else {
+        panic!("expected an Error event, got {event:?}");
+    };
+    assert_eq!(
+        error.exception.unwrap().message.unwrap(),
+        "protocol violation: dump suspension arguments exceed the maximum wire depth"
+    );
+
+    // the rejected load adopted nothing: the child is still fresh and usable
+    let (_, event) = feed(&mut child, "1 + 1");
+    assert_eq!(expect_complete(event), MontyObject::Int(2));
 }

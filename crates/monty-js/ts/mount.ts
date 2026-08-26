@@ -1,73 +1,74 @@
 // Filesystem mounts: expose a host directory inside the sandbox at a virtual
-// POSIX path. Mounts are sent per-feed and handled entirely inside the
-// worker, so the host path must be valid on the machine the worker runs on.
-// OS calls the mounts do not cover bubble up to the `os` callback.
+// POSIX path. Mounts apply per-feed and are serviced entirely on the host
+// side of the pool (the worker never sees host paths), so they work even for
+// remote workers. OS calls the mounts do not cover bubble up to the `os`
+// callback.
+//
+// The `MountDir` class lives in `mountDir.js` because constructing one loads
+// the native addon; everything here stays importable from the wasm bundle,
+// which shares `session.ts`.
 
-import type { NativeMount } from '../native-addon.js'
+import type { NativeMountDir } from '../native-addon.js'
+import type { MountDir } from './mountDir.js'
+
+// Mirrors monty-fs's DEFAULT_MEMORY_USAGE_LIMIT (100 MB in decimal bytes).
+export const DEFAULT_MEMORY_USAGE_LIMIT = 100_000_000
 
 /** Sandbox access mode for a mounted directory. */
 export type MountDirMode = 'read-only' | 'read-write' | 'overlay'
 
-/** Options for [`MountDir`]. */
+/** Configuration for [`MountDir`]. The paths are named fields (never
+ *  positional): mount tools disagree on host-first (docker `-v`) vs
+ *  virtual-first (nginx `alias`) ordering, so requiring names removes the
+ *  ambiguity. */
 export interface MountDirOptions {
+  /** Real host directory to expose. Sandbox code can never see this path or
+   *  reach outside it. Opened by the constructor and held for the mount's
+   *  lifetime, so on macOS/BSD it must be readable (a search-only directory
+   *  cannot be mounted there) and, on Windows, cannot be renamed or deleted by
+   *  anyone until the mount is dropped. The mount then follows that directory,
+   *  not the path: renaming or replacing it afterwards changes nothing.
+   *  Symlinks inside it are followed only if their targets are relative. */
+  hostPath: string
+  /** Absolute virtual POSIX path prefix inside the sandbox (e.g. `'/data'`),
+   *  regardless of host OS. */
+  virtualPath: string
   /**
    * Access mode (default `'overlay'`): `'read-only'` rejects writes,
    * `'read-write'` writes through to the host, `'overlay'` keeps writes in
-   * worker-local memory and discards them when the feed ends.
+   * memory and discards them when the feed ends.
+   *
+   * With `'read-write'`, files written by sandboxed code persist on the host.
+   * Read the warning on [`MountDir`] before choosing it.
    */
   mode?: MountDirMode
   /** Cap on total bytes written through this mount. */
   writeBytesLimit?: number
+  /** Aggregate mount memory budget in bytes (default 100 MB). */
+  memoryUsageLimit?: number
 }
 
-const VALID_MODES: Record<MountDirMode, true> = {
+export const VALID_MODES: Record<MountDirMode, true> = {
   'read-only': true,
   'read-write': true,
   overlay: true,
 }
 
-/**
- * Mounts a real host directory into the sandbox at a virtual path.
+/** Key under which a `MountDir` carries its opened native handle.
  *
- * ```ts
- * const mount = new MountDir('/mnt/data', '/path/on/host', { mode: 'read-only' })
- * await session.feedRun("open('/mnt/data/file.txt').read()", { mount })
- * ```
- */
-export class MountDir {
-  readonly virtualPath: string
-  readonly hostPath: string
-  readonly mode: MountDirMode
-  readonly writeBytesLimit: number | null
+ *  `private` is what `Monty` and `MontySession` use, but it would put the
+ *  handle out of reach of `mountsToNative` below, which lives in this module
+ *  so the wasm bundle can import it without loading the addon. A symbol keeps
+ *  the handle off the public surface — absent from `Object.keys`, JSON and
+ *  completions — while both modules can still reach it. Deliberately not
+ *  re-exported from `node.ts`. */
+export const NATIVE_MOUNT: unique symbol = Symbol('nativeMount')
 
-  constructor(virtualPath: string, hostPath: string, options: MountDirOptions = {}) {
-    const mode = options.mode ?? 'overlay'
-    // hasOwn, not `in`: prototype keys like 'toString' must not pass as modes
-    if (!Object.hasOwn(VALID_MODES, mode)) {
-      throw new Error(`invalid mount mode: '${mode}'. Expected 'read-only', 'read-write' or 'overlay'`)
-    }
-    this.virtualPath = virtualPath
-    this.hostPath = hostPath
-    this.mode = mode
-    this.writeBytesLimit = options.writeBytesLimit ?? null
-  }
-
-  /** Returns a string representation of the mount. */
-  repr(): string {
-    return `MountDir(virtual_path='${this.virtualPath}', host_path='${this.hostPath}', mode='${this.mode}')`
-  }
-}
-
-/** Encodes the `mount` option (one or many) for the native binding. */
-export function mountsToNative(mount: MountDir | MountDir[] | undefined): NativeMount[] {
+/** Collects the `mount` option (one or many) for the native binding. */
+export function mountsToNative(mount: MountDir | MountDir[] | undefined): NativeMountDir[] {
   if (mount === undefined) {
     return []
   }
   const mounts = Array.isArray(mount) ? mount : [mount]
-  return mounts.map((m) => ({
-    virtualPath: m.virtualPath,
-    hostPath: m.hostPath,
-    mode: m.mode,
-    ...(m.writeBytesLimit !== null ? { writeBytesLimit: m.writeBytesLimit } : {}),
-  }))
+  return mounts.map((m) => m[NATIVE_MOUNT])
 }

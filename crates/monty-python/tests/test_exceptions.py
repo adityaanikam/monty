@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import binascii
+import json
+
 import pytest
 from conftest import RunMonty
 from inline_snapshot import snapshot
@@ -75,6 +78,59 @@ def test_unicode_error_message_only_fallback(monty_run: RunMonty):
     assert str(inner) == snapshot('nope')
 
 
+def test_json_decode_error(monty_run: RunMonty):
+    # A `json.loads` failure inside the sandbox surfaces as a real
+    # `json.JSONDecodeError`: the structured `msg`/`doc`/`pos`/`lineno`/`colno`
+    # fields travel with the exception, like unicode errors above.
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import json\njson.loads('[1,\\n2,]')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, json.JSONDecodeError)
+    assert isinstance(inner, ValueError)
+    assert str(inner) == snapshot('Illegal trailing comma before end of array: line 2 column 2 (char 5)')
+    assert inner.msg == snapshot('Illegal trailing comma before end of array')
+    assert inner.lineno == snapshot(2)
+    assert inner.colno == snapshot(2)
+    assert inner.pos == snapshot(5)
+    assert inner.doc == '[1,\n2,]'
+
+
+def test_json_decode_error_doc_dropped_for_huge_documents(monty_run: RunMonty):
+    # Documents over the payload size cap are not carried: `doc` is '' on the
+    # surfaced exception. The location attributes and message must still be
+    # right — the constructor recomputes them from `doc`, so this exercises
+    # the empty-doc overrides (a multi-line document makes wrong recomputed
+    # values distinguishable: from '' they would be lineno=1, colno=pos+1).
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import json\njson.loads('[' + '1,\\n' * 30000 + 'x')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, json.JSONDecodeError)
+    assert str(inner) == snapshot('Expecting value: line 30001 column 1 (char 90001)')
+    assert (inner.msg, inner.lineno, inner.colno, inner.pos) == snapshot(('Expecting value', 30001, 1, 90001))
+    assert inner.doc == ''
+
+
+def test_json_decode_error_message_only_fallback(monty_run: RunMonty):
+    # A `JSONDecodeError` raised manually inside the sandbox has no location
+    # suffix to parse, so `.exception()` falls back to a `ValueError`.
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import json\nraise json.JSONDecodeError('nope')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, ValueError)
+    assert not isinstance(inner, json.JSONDecodeError)
+    assert str(inner) == snapshot('nope')
+
+
+def test_binascii_error(monty_run: RunMonty):
+    # A sandbox `base64` failure surfaces as the real stdlib class, not a bare `ValueError`.
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import base64\nbase64.b64decode(b'YWJ')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, binascii.Error)
+    assert isinstance(inner, ValueError)
+    assert str(inner) == snapshot('Incorrect padding')
+
+
 def test_type_error(monty_run: RunMonty):
     with pytest.raises(MontyRuntimeError) as exc_info:
         monty_run("'string' + 1")
@@ -108,9 +164,47 @@ def test_name_error(monty_run: RunMonty):
 
 
 def test_assertion_error(monty_run: RunMonty):
+    # `assert False` adds no information, so no pytest-style detail is added.
     with pytest.raises(MontyRuntimeError) as exc_info:
         monty_run('assert False')
-    assert isinstance(exc_info.value.exception(), AssertionError)
+    inner = exc_info.value.exception()
+    assert isinstance(inner, AssertionError)
+    assert str(inner) == snapshot('')
+
+
+def test_assertion_error_comparison(monty_run: RunMonty):
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run('assert 1 == 2')
+    inner = exc_info.value.exception()
+    assert isinstance(inner, AssertionError)
+    assert str(inner) == snapshot('assert 1 == 2')
+
+
+def test_assertion_error_annotations_disabled(pool: Monty):
+    # `assert_message_annotations=False` restores CPython's empty AssertionError.
+    with pool.checkout(assert_message_annotations=False) as session:
+        with pytest.raises(MontyRuntimeError) as exc_info:
+            session.feed_run('assert 1 == 2')
+    inner = exc_info.value.exception()
+    assert isinstance(inner, AssertionError)
+    assert str(inner) == snapshot('')
+
+
+def test_assertion_error_annotations_custom_limit(pool: Monty):
+    # An int customizes the per-operand repr truncation length.
+    with pool.checkout(assert_message_annotations=6) as session:
+        with pytest.raises(MontyRuntimeError) as exc_info:
+            session.feed_run("assert 'abcdefghij' == ''")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, AssertionError)
+    assert str(inner) == snapshot("assert 'abcde… == ''")
+
+
+@pytest.mark.parametrize('value', [0, -1, 2**32])
+def test_assertion_error_annotations_invalid_limit(pool: Monty, value: int):
+    with pytest.raises(ValueError) as exc_info:
+        pool.checkout(assert_message_annotations=value)
+    assert exc_info.value.args[0] == snapshot('assert_message_annotations int value must be between 1 and 2**32 - 1')
 
 
 def test_assertion_error_with_message(monty_run: RunMonty):
@@ -278,6 +372,24 @@ Traceback (most recent call last):
   File "<python-input-0>", line 1, in <module>
     raise ValueError('test message')
 ValueError: test message\
+""")
+
+
+def test_multiline_span_traceback(monty_run: RunMonty):
+    # Regression test for #631: a frame spanning multiple lines can end on a
+    # lower column than it starts (hanging-indent `)`); the parent-side wire
+    # validation used to reject the whole exception payload as malformed.
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run('def f(a):\n    raise ValueError("boom")\n\nr = f(\n    a=1,\n)\n')
+    assert exc_info.value.display() == snapshot("""\
+Traceback (most recent call last):
+  File "<python-input-0>", line 4, in <module>
+    r = f(
+        a=1,
+    )
+  File "<python-input-0>", line 2, in f
+    raise ValueError("boom")
+ValueError: boom\
 """)
 
 

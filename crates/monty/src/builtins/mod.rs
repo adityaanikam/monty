@@ -21,6 +21,7 @@ mod len;
 mod map;
 mod min_max; // min and max share implementation
 mod next;
+pub(crate) mod object_setattr;
 mod oct;
 pub(crate) mod open;
 mod ord;
@@ -37,14 +38,12 @@ mod zip;
 
 use std::{fmt, fmt::Write, str::FromStr};
 
-use strum::{Display, EnumString, FromRepr, IntoStaticStr};
-
 use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
-    exception_private::{ExcType, RunResult},
-    resource::ResourceTracker,
+    exception_private::{ExcType, ExcTypeExt, RunResult},
     types::Type,
+    value::Value,
 };
 
 /// Enumerates every interpreter-native Python builtins
@@ -62,14 +61,24 @@ pub(crate) enum Builtins {
 }
 
 impl Builtins {
+    /// Resolves builtin names that evaluate directly to singleton values.
+    #[must_use]
+    pub fn value_from_name(name: &str) -> Option<Value> {
+        match name {
+            "Ellipsis" => Some(Value::Ellipsis),
+            "NotImplemented" => Some(Value::NotImplemented),
+            _ => name.parse::<Self>().ok().map(Value::Builtin),
+        }
+    }
+
     /// Calls this builtin, allowing builtins that need host involvement to yield.
     ///
     /// Most builtins complete synchronously and produce a [`CallResult::Value`].
     /// `open()` is the exception: it must touch the host filesystem at call
     /// time to perform the open-time effect, so it returns a
-    /// [`CallResult::OsCall`] for [`crate::os::OsFunction::Open`] (see
+    /// [`CallResult::OsCall`] for [`OsFunctionCall::Open`](monty_types::OsFunctionCall) (see
     /// [`crate::builtins::open`]).
-    pub fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
+    pub fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
         match self {
             Self::Function(b) => b.call(vm, args),
             Self::ExcType(exc) => exc.call(vm, args).map(CallResult::Value),
@@ -114,116 +123,14 @@ impl FromStr for Builtins {
     }
 }
 
-/// Enumerates every interpreter-native Python builtin function.
-///
-/// Listed alphabetically per https://docs.python.org/3/library/functions.html
-/// Commented-out variants are not yet implemented.
-///
-/// Note: Type constructors are handled by the `Type` enum, not here.
-///
-/// Uses strum derives for automatic `Display`, `FromStr`, and `IntoStaticStr` implementations.
-/// All variants serialize to lowercase (e.g., `Print` -> "print").
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Display,
-    EnumString,
-    FromRepr,
-    IntoStaticStr,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-#[strum(serialize_all = "lowercase")]
-#[repr(u8)]
-pub enum BuiltinsFunctions {
-    Abs,
-    // Aiter,
-    All,
-    // Anext,
-    Any,
-    // Ascii,
-    Bin,
-    // bool - handled by Type enum
-    // Breakpoint,
-    // bytearray - handled by Type enum
-    // bytes - handled by Type enum
-    // Callable,
-    Chr,
-    // Classmethod,
-    // Compile,
-    // complex - handled by Type enum
-    // Delattr,
-    // dict - handled by Type enum
-    // Dir,
-    Divmod,
-    Enumerate,
-    // Eval,
-    // Exec,
-    Filter,
-    // float - handled by Type enum
-    // Format,
-    // frozenset - handled by Type enum
-    Getattr,
-    // Globals,
-    Hasattr,
-    Hash,
-    // Help,
-    Hex,
-    Id,
-    // Input,
-    // int - handled by Type enum
-    Isinstance,
-    // Issubclass,
-    // Iter - handled by Type enum
-    Len,
-    // list - handled by Type enum
-    // Locals,
-    Map,
-    Max,
-    // memoryview - handled by Type enum
-    Min,
-    Next,
-    // object - handled by Type enum
-    Oct,
-    Open,
-    Ord,
-    Pow,
-    Print,
-    // Property,
-    // range - handled by Type enum
-    Repr,
-    Reversed,
-    Round,
-    // set - handled by Type enum
-    Setattr,
-    // Slice,
-    Sorted,
-    // Staticmethod,
-    // str - handled by Type enum
-    Sum,
-    // Super,
-    // tuple - handled by Type enum
-    Type,
-    // Vars,
-    Zip,
-    // __import__ - not planned
+pub use monty_types::BuiltinsFunctions;
+
+pub(crate) trait BuiltinsFunctionsExt: Sized {
+    fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult>;
 }
 
-impl BuiltinsFunctions {
-    /// Executes the builtin with the provided arguments.
-    ///
-    /// All builtins receive the full VM context, which provides access to the
-    /// heap, interned strings, and print output.
-    ///
-    /// Almost every builtin completes synchronously and produces a
-    /// [`CallResult::Value`]. `open()` is the exception: it performs the
-    /// open-time file effect via a host filesystem round-trip, so it returns a
-    /// [`CallResult::OsCall`] directly.
-    pub(crate) fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
+impl BuiltinsFunctionsExt for BuiltinsFunctions {
+    fn call(self, vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
         let r = match self {
             Self::Abs => abs::builtin_abs(vm, args),
             Self::All => all::builtin_all(vm, args),
@@ -254,6 +161,7 @@ impl BuiltinsFunctions {
             Self::Reversed => reversed::builtin_reversed(vm, args),
             Self::Round => round::builtin_round(vm, args),
             Self::Setattr => setattr::builtin_setattr(vm, args),
+            Self::ObjectSetattr => object_setattr::builtin_object_setattr(vm, args),
             Self::Sorted => sorted::builtin_sorted(vm, args),
             Self::Sum => sum::builtin_sum(vm, args),
             Self::Type => type_::builtin_type(vm, args),

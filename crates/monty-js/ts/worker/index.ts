@@ -73,8 +73,10 @@ export type {
   LoadSnapshotOptions,
   OsCallback,
   PrintCallback,
+  PrintTargetInput,
   Snapshot,
 } from '../session.js'
+export { CollectString, CollectStreams, DEFAULT_MAX_PRINT_COLLECT_BYTES, type CollectedStreamEntry } from '../print.js'
 export {
   MontyCrashedError,
   MontyError,
@@ -89,13 +91,15 @@ export {
   type MontyDate,
   type MontyDateTime,
   type MontyException,
-  type MontyFileHandle,
+  MontyFileHandle,
+  type MontyFileHandleOptions,
   type MontyTimeDelta,
   type MontyTimeZone,
 } from '../types.js'
 export type { PooledWorker, WorkerFactory, WorkerPoolOptions } from './pool.js'
 export { WorkerTransport } from './transport.js'
 export type { ResourceLimits, WorkerSessionConfig } from './transport.js'
+export type { AssertMessageAnnotations, TypeCheckFormat } from '../options.js'
 export { WasmHost, inProcessDispatcher } from './host.js'
 export type { Dispatcher } from './host.js'
 export { WorkerChannel } from './channel.js'

@@ -24,11 +24,15 @@ use std::{
 
 use ahash::AHashMap;
 use chrono::{Datelike, Timelike};
-use monty::{
-    ExcType, ExtFunctionResult, FileMode, LimitedTracker, MontyDate, MontyDateTime, MontyException, MontyFileHandle,
-    MontyObject, MontyRun, NameLookupResult, OsFunctionCall, PrintWriter, ResourceLimits, RunProgress, dir_stat,
-    file_stat,
-    fs::{MountMode, MountTable, OverlayState},
+// only the dump round-trip needs these, and it is skipped under memory-model-checks
+#[cfg(not(feature = "memory-model-checks"))]
+use monty::{Dump, Session, SessionRef, dump};
+use monty::{MontyRun, RunProgress};
+use monty_fs::{MountCallOutcome, MountMode, MountTable, OverlayState};
+use monty_types::{
+    CompileOptions, ExcType, ExtFunctionResult, FileMode, MontyDate, MontyDateTime, MontyException, MontyFileHandle,
+    MontyObject, MontyTimeZone, NameLookupResult, OsFunctionCall, PrintWriter, ResourceLimits, ResourceTracker,
+    dir_stat, file_stat,
 };
 use pyo3::{prelude::*, types::PyDict};
 use similar::TextDiff;
@@ -64,7 +68,15 @@ const TEST_RECURSION_LIMIT: usize = 50;
 /// 100_000 otherwise — tests that need a larger value to stay within the
 /// timeout opt into it via `# gc-interval=<N>`.
 fn default_test_limits() -> ResourceLimits {
-    ResourceLimits::new().max_recursion_depth(Some(TEST_RECURSION_LIMIT))
+    ResourceLimits::default().max_recursion_depth(TEST_RECURSION_LIMIT)
+}
+
+/// Builds a `MontyRun` with production-default [`CompileOptions`] so fixtures
+/// exercise the same bytecode real embedders run. Fixtures with a *failing*
+/// assert whose message diverges from CPython can't live in `test_cases/` —
+/// they belong in `crates/monty/tests/assert_messages.rs`.
+fn new_monty_run(code: &str, test_name: &str) -> Result<MontyRun, MontyException> {
+    MontyRun::new(code.to_owned(), test_name, vec![], CompileOptions::default())
 }
 
 /// Test configuration parsed from directive comments.
@@ -931,7 +943,7 @@ fn dispatch_os_call(call: &OsFunctionCall) -> ExtFunctionResult {
             day: 15,
         })
         .into(),
-        OsFunctionCall::DateTimeNow(tz) => dispatch_datetime_now(tz).into(),
+        OsFunctionCall::DateTimeNow(tz) => dispatch_datetime_now(tz.as_ref()).into(),
         OsFunctionCall::GetEnviron => {
             let env_dict = vec![
                 (
@@ -1215,7 +1227,6 @@ fn dispatch_os_call(call: &OsFunctionCall) -> ExtFunctionResult {
                 .into()
             }
         }
-        OsFunctionCall::Used => unreachable!("OsFunctionCall::Used dispatched"),
     }
 }
 
@@ -1227,9 +1238,9 @@ const DATETIME_FIXTURE_TIMESTAMP: i64 = 1_700_000_000;
 /// The `tz` argument determines whether a naive or aware datetime is returned.
 /// The deterministic timestamp is 1_700_000_000 UTC (2023-11-14 22:13:20 UTC).
 /// For naive datetimes the virtual local offset is UTC+02:00.
-fn dispatch_datetime_now(tz: &MontyObject) -> MontyObject {
+fn dispatch_datetime_now(tz: Option<&MontyTimeZone>) -> MontyObject {
     match tz {
-        MontyObject::None => {
+        None => {
             // Naive datetime: apply local offset to get local wall-clock time
             // 1_700_000_000 UTC + 7200 = 2023-11-15 00:13:20 local
             MontyObject::DateTime(MontyDateTime {
@@ -1244,7 +1255,7 @@ fn dispatch_datetime_now(tz: &MontyObject) -> MontyObject {
                 timezone_name: None,
             })
         }
-        MontyObject::TimeZone(tz) => {
+        Some(tz) => {
             // Aware datetime: convert UTC timestamp to the requested timezone
             let offset_delta = chrono::TimeDelta::try_seconds(i64::from(tz.offset_seconds)).expect("valid offset");
             let utc = chrono::DateTime::from_timestamp(DATETIME_FIXTURE_TIMESTAMP, 0).expect("valid timestamp");
@@ -1261,7 +1272,6 @@ fn dispatch_datetime_now(tz: &MontyObject) -> MontyObject {
                 timezone_name: tz.name.clone(),
             })
         }
-        _ => panic!("DateTimeNow: tz argument must be None or TimeZone, got {tz:?}"),
     }
 }
 
@@ -1325,23 +1335,22 @@ fn try_run_test(path: &Path, code: &str, expectation: &Expectation, limits: Reso
     // Handle ref-count-return tests separately since they need run_ref_counts()
     #[cfg(feature = "ref-count-return")]
     if let Expectation::RefCounts(expected) = expectation {
-        match MontyRun::new(code.to_owned(), &test_name, vec![]) {
+        match new_monty_run(code, &test_name) {
             Ok(ex) => {
                 let result = ex.run_ref_counts(vec![]);
                 match result {
                     Ok(monty::RefCountOutput {
-                        counts,
-                        unique_refs,
-                        heap_count,
-                        ..
+                        counts, unreachable, ..
                     }) => {
-                        // Strict matching: verify all heap objects are accounted for by variables
-                        if unique_refs != heap_count {
+                        // Strict matching: every live heap object must be reachable from a
+                        // named variable, transitively. Leftovers are leaks — a missed
+                        // `drop_with` — and are named here so the culprit is identifiable.
+                        if !unreachable.is_empty() {
                             return Err(TestFailure {
                                 test_name,
                                 kind: "Strict matching".to_string(),
-                                expected: format!("{heap_count} heap objects"),
-                                actual: format!("{unique_refs} referenced by variables, counts: {counts:?}"),
+                                expected: "no unreachable heap objects".to_string(),
+                                actual: format!("leaked {}: {}", unreachable.len(), unreachable.join(", ")),
                             });
                         }
                         if &counts != expected {
@@ -1375,9 +1384,9 @@ fn try_run_test(path: &Path, code: &str, expectation: &Expectation, limits: Reso
         }
     }
 
-    match MontyRun::new(code.to_owned(), &test_name, vec![]) {
+    match new_monty_run(code, &test_name) {
         Ok(ex) => {
-            let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+            let result = ex.run(vec![], ResourceTracker::new(limits), PrintWriter::Stdout);
             match result {
                 Ok(obj) => match expectation {
                     Expectation::ReturnStr(expected) => {
@@ -1527,7 +1536,7 @@ fn try_run_iter_test(
         });
     }
 
-    let exec = match MontyRun::new(code.to_owned(), &test_name, vec![]) {
+    let exec = match new_monty_run(code, &test_name) {
         Ok(e) => e,
         Err(parse_err) => {
             if let Expectation::Raise(expected) = expectation {
@@ -1673,7 +1682,7 @@ fn try_run_mount_fs_test(
         )
         .expect("failed to mount temp dir for mount-fs test");
 
-    let exec = match MontyRun::new(code.to_owned(), &test_name, vec![]) {
+    let exec = match new_monty_run(code, &test_name) {
         Ok(e) => e,
         Err(parse_err) => {
             return Err(TestFailure {
@@ -1743,7 +1752,7 @@ fn run_mount_fs_iter_loop(
     mount_table: &mut MountTable,
     limits: ResourceLimits,
 ) -> Result<MontyObject, MontyException> {
-    let mut progress = exec.start(vec![], LimitedTracker::new(limits), PrintWriter::Stdout)?;
+    let mut progress = exec.start(vec![], ResourceTracker::new(limits), PrintWriter::Stdout)?;
 
     loop {
         match progress {
@@ -1764,16 +1773,12 @@ fn run_mount_fs_iter_loop(
             }
             RunProgress::OsCall(call) => {
                 // Dispatch through the mount table first.
-                let result = mount_table.handle_os_call(&call.function_call);
-                let ext_result = match result {
-                    Some(Ok(obj)) => ExtFunctionResult::Return(obj),
-                    Some(Err(err)) => ExtFunctionResult::Error(err.into_exception()),
-                    None => {
-                        // Non-filesystem operation — dispatch to the regular handler.
-                        dispatch_os_call(&call.function_call)
-                    }
-                };
-                progress = call.resume(ext_result, PrintWriter::Stdout)?;
+                progress = call.resume_with(PrintWriter::Stdout, |fc| match mount_table.handle_os_call(fc) {
+                    MountCallOutcome::Handled(Ok(obj)) => ExtFunctionResult::Return(obj),
+                    MountCallOutcome::Handled(Err(err)) => ExtFunctionResult::Error(err.into_exception()),
+                    // Non-filesystem operation — dispatch to the regular handler.
+                    MountCallOutcome::NotHandled(function_call) => dispatch_os_call(&function_call),
+                })?;
             }
         }
     }
@@ -1789,7 +1794,7 @@ fn run_mount_fs_iter_loop(
 /// - Sync functions: result is passed immediately via `state.run()`
 /// - Async functions: `state.run_pending()` creates a future, resolved via `ResolveFutures`
 fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, MontyException> {
-    let mut progress = exec.start(vec![], LimitedTracker::new(limits), PrintWriter::Stdout)?;
+    let mut progress = exec.start(vec![], ResourceTracker::new(limits), PrintWriter::Stdout)?;
 
     // Track pending async calls: (call_id, pre-built ExtFunctionResult).
     // Successful async calls produce `Return(value)`; `async_fail` produces
@@ -1798,12 +1803,13 @@ fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, 
     let mut pending_results: Vec<(u32, ExtFunctionResult)> = Vec::new();
 
     loop {
-        // Test serialization round-trip at each step (skip when memory-model-checks is enabled
-        // since the old RunProgress would panic on drop without proper cleanup)
+        // Dump and reload the suspended state at each step, so every test case's
+        // heap shape goes through the real dump format. (Skipped under
+        // memory-model-checks: the discarded `RunProgress` would panic on drop
+        // without proper cleanup.)
         #[cfg(not(feature = "memory-model-checks"))]
         {
-            let bytes = progress.dump().expect("failed to dump RunProgress");
-            progress = RunProgress::load(&bytes).expect("failed to load RunProgress");
+            progress = dump_load_round_trip(&progress);
         }
 
         match progress {
@@ -1888,6 +1894,17 @@ fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, 
                 progress = call.resume(result, PrintWriter::Stdout)?;
             }
         }
+    }
+}
+
+/// Dumps a suspended run and reloads it, so every test case exercises the real
+/// dump format rather than only the underlying serde impls.
+#[cfg(not(feature = "memory-model-checks"))]
+fn dump_load_round_trip(progress: &RunProgress) -> RunProgress {
+    let bytes = dump("test.py", None, SessionRef::Running(progress)).expect("failed to dump RunProgress");
+    match Dump::load(&bytes).expect("failed to load RunProgress").state {
+        Session::Running(progress) => *progress,
+        _ => panic!("dumped a running session, loaded something else"),
     }
 }
 

@@ -1,10 +1,18 @@
 export declare const MAX_VALUE_DEPTH: number
 
+export declare function _installTelemetryAdapter(version: number, callback: (event: string) => void): void
+
 export interface NativeMount {
   virtualPath: string
   hostPath: string
   mode?: string
   writeBytesLimit?: number
+  memoryUsageLimit: number
+}
+
+export declare class NativeMountDir {
+  constructor(mount: NativeMount)
+  close(): void
 }
 
 export declare class NativePool {
@@ -16,7 +24,7 @@ export declare class NativePool {
 
 export declare class NativeSession {
   readonly workerPid?: number
-  enter(): Promise<void>
+  enter(telemetryContext?: unknown): Promise<void>
   feed(...args: unknown[]): Promise<object>
   feedStart(...args: unknown[]): Promise<object>
   restore(...args: unknown[]): Promise<object>
@@ -27,6 +35,7 @@ export declare class NativeSession {
   resumeError(...args: unknown[]): Promise<object>
   resumeNotFound(...args: unknown[]): Promise<object>
   resumeNotHandled(...args: unknown[]): Promise<object>
+  resumeFromMounts(...args: unknown[]): Promise<object>
   resumeFuture(...args: unknown[]): Promise<object>
   resumeNameLookup(...args: unknown[]): Promise<object>
   resolveFutures(...args: unknown[]): Promise<object>

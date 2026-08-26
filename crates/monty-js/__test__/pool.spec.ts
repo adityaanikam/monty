@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { t } from './assertions.js'
 import { skipIfBrowser } from './env.js'
 
-import { Monty, MontyCrashedError, MountDir } from '@pydantic/monty/node'
+import { Monty, MontyCrashedError, MontyRuntimeError, MountDir } from '@pydantic/monty/node'
 
 // =============================================================================
 // Pool lifecycle
@@ -59,6 +59,49 @@ test('maxCheckoutsPerWorker recycles the worker', async (ctx) => {
   const second = await pool.checkout()
   t.not(second.workerPid, pid)
   await second.close()
+})
+
+test('maxMemory leaves normal work alone', async (ctx) => {
+  skipIfBrowser(ctx)
+  // a session's limit must not disturb work that stays inside it
+  await using pool = await Monty.create()
+  const session = await pool.checkout({ limits: { maxMemory: 1024 ** 2 } })
+  t.is(await session.feedRun('1 + 1'), 2)
+  await session.close()
+})
+
+test('a refused allocation raises MemoryError and the pool recovers', async (ctx) => {
+  skipIfBrowser(ctx)
+  await using pool = await Monty.create()
+  const session = await pool.checkout()
+  // no maxMemory, so the sandbox tracker allows this outright: the allocation is
+  // refused below the interpreter, killing the worker but still reporting
+  // MemoryError rather than an unclassifiable crash
+  const error = await t.throwsAsync(() => session.feedRun("x = ' ' * (1 << 60)"), {
+    instanceOf: MontyRuntimeError,
+  })
+  t.is(error.message, 'MemoryError: the worker exceeded its memory limit and was terminated')
+  t.is(error.exception.typeName, 'MemoryError')
+  const next = await pool.checkout()
+  t.is(await next.feedRun('1 + 1'), 2)
+  await next.close()
+})
+
+test('exceeding maxMemory in the allocator raises MemoryError and the pool recovers', async (ctx) => {
+  skipIfBrowser(ctx)
+  await using pool = await Monty.create()
+  const session = await pool.checkout({ limits: { maxMemory: 1024 } })
+  // the fed snippet is memory the interpreter never accounts for — the worker
+  // buys a frame buffer for it before it sees the code — so a snippet far
+  // larger than the limit is caught by the allocator
+  const error = await t.throwsAsync(() => session.feedRun('# ' + 'a'.repeat(16 * 1024 * 1024)), {
+    instanceOf: MontyRuntimeError,
+  })
+  t.is(error.message, 'MemoryError: the worker exceeded its memory limit and was terminated')
+  t.is(error.exception.typeName, 'MemoryError')
+  const next = await pool.checkout()
+  t.is(await next.feedRun('1 + 1'), 2)
+  await next.close()
 })
 
 test('concurrent sessions run in distinct workers', async (ctx) => {
@@ -163,11 +206,11 @@ test('requestTimeout kills a wedged worker', async (ctx) => {
   await session.close()
 })
 
-// Reading a FIFO blocks the worker inside the OS, where the sandbox's
-// periodic time check can never run — the host-side maxDurationSecs backstop
-// (remaining budget + durationLimitGrace) is the only thing that can end the
-// turn. Note no requestTimeout is configured. Unix-only (mkfifo).
-test('duration backstop kills a worker blocked in a syscall', async (ctx) => {
+// Mount I/O runs on the host side of the pool, so reading a FIFO must fail
+// fast (a real read would block the host with no watchdog able to rescue it).
+// The sandbox sees a catchable PermissionError and the session stays usable.
+// Unix-only (mkfifo).
+test('special files in mounts are rejected without blocking', async (ctx) => {
   skipIfBrowser(ctx)
   if (process.platform === 'win32') {
     ctx.skip()
@@ -175,16 +218,16 @@ test('duration backstop kills a worker blocked in a syscall', async (ctx) => {
   const dir = await mkdtemp(join(tmpdir(), 'monty-fifo-'))
   try {
     t.is(spawnSync('mkfifo', [join(dir, 'pipe')]).status, 0)
-    await using pool = await Monty.create({ durationLimitGrace: 0.3 })
-    const session = await pool.checkout({ limits: { maxDurationSecs: 0.1 } })
+    await using pool = await Monty.create()
+    const session = await pool.checkout()
     const error = await t.throwsAsync(
       () =>
         session.feedRun("from pathlib import Path\nPath('/mnt/pipe').read_text()", {
-          mount: new MountDir('/mnt', dir, { mode: 'read-only' }),
+          mount: new MountDir({ hostPath: dir, virtualPath: '/mnt', mode: 'read-only' }),
         }),
-      { instanceOf: MontyCrashedError },
+      { instanceOf: MontyRuntimeError },
     )
-    t.true(error.timedOut)
+    t.is(error.message, "PermissionError: [Errno 13] Permission denied: '/mnt/pipe'")
     await session.close()
   } finally {
     await rm(dir, { recursive: true, force: true })

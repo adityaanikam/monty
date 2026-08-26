@@ -10,10 +10,13 @@
 # qualifies method names that CPython leaves bare (e.g. `str.expandtabs()`
 # vs `expandtabs()`).
 import asyncio
+import base64
+import binascii
 import datetime
 import json
 import re
 import sys
+import unicodedata
 
 is_monty = sys.platform == 'monty'
 
@@ -145,6 +148,28 @@ try:
 except TypeError as e:
     assert str(e) == 'groupdict() takes at most 1 argument (2 given)', f'py-atmost-total-3: {e}'
 
+# === at_most_total: the all-keyword pivot ===
+# Both C parsers say "keyword argument" when the call passed no positionals
+# at all (the `nargs == 0` branch in vgetargskeywords /
+# vgetargskeywordsfast_impl); one positional is enough to drop it again.
+try:
+    'hello'.expandtabs(tabsize=8, bogus=1)
+    assert False, 'expandtabs all-keyword overflow should raise'
+except TypeError as e:
+    assert str(e) == 'expandtabs() takes at most 1 keyword argument (2 given)', f'py-atmost-kw-1: {e}'
+
+try:
+    round(number=1, ndigits=2, bogus=3)
+    assert False, 'round all-keyword overflow should raise'
+except TypeError as e:
+    assert str(e) == 'round() takes at most 2 keyword arguments (3 given)', f'named-atmost-kw: {e}'
+
+try:
+    int(x='1', base=10, bogus=2)
+    assert False, 'int all-keyword overflow should raise'
+except TypeError as e:
+    assert str(e) == 'int() takes at most 2 keyword arguments (3 given)', f'vectorcall-atmost-kw: {e}'
+
 # === Python: sorted() positional-arity wording (PyArg_UnpackTuple style) ===
 # `builtin_sorted` manually checks the positional iterator length and
 # emits CPython's `"sorted expected N argument(s), got M"` wording before
@@ -223,7 +248,7 @@ except TypeError as e:
 
 try:
     datetime.date(2024, day=3, month=2)
-    assert datetime.date(2024, day=3, month=2).day == 3, 'date kwarg-filled required succeeds'
+    assert datetime.date(2024, day=3, month=2).day == 3
 except TypeError as e:
     assert False, f'unexpected error: {e}'
 
@@ -469,3 +494,343 @@ try:
     assert False, 'datetime double conflict should report month'
 except TypeError as e:
     assert str(e) == "argument for function given by name ('month') and position (2)", f'c-earliest-conflict: {e}'
+
+# =====================================================================
+# === Unpack style (`style = unpack` — positional-only, no keywords) ===
+# =====================================================================
+
+# === unpack: any keyword is rejected wholesale, before arity ===
+try:
+    next(iter([]), 1, 2, bogus=1)
+    assert False, 'next with kwargs should raise no-keyword error'
+except TypeError as e:
+    assert str(e) == 'next() takes no keyword arguments'
+
+try:
+    reversed(sequence=[1])
+    assert False, 'reversed with kwargs should raise no-keyword error'
+except TypeError as e:
+    assert str(e) == 'reversed() takes no keyword arguments'
+
+try:
+    unicodedata.name('a', bogus=1)
+    assert False, 'unicodedata.name with kwargs should raise no-keyword error'
+except TypeError as e:
+    # `kwarg_error_name` qualifies the module function like CPython does.
+    assert str(e) == 'unicodedata.name() takes no keyword arguments'
+
+# === unpack: exact arity (min == max collapses the wording) ===
+try:
+    reversed([1], [2])
+    assert False, 'reversed with 2 args should raise'
+except TypeError as e:
+    assert str(e) == 'reversed expected 1 argument, got 2'
+
+# =====================================================================
+# === Newly bound builtins: sum (clinic), round (c_named)            ===
+# =====================================================================
+
+# === sum: positional-only iterable cannot be passed by keyword ===
+try:
+    sum(iterable=[1])
+    assert False, 'sum(iterable=...) should raise'
+except TypeError as e:
+    assert str(e) == 'sum() takes at least 1 positional argument (0 given)'
+
+# === sum: at_most_total pre-count ===
+try:
+    sum([1], 1, 1)
+    assert False, 'sum with 3 args should raise'
+except TypeError as e:
+    assert str(e) == 'sum() takes at most 2 arguments (3 given)'
+
+# === sum: unknown kwarg ===
+try:
+    sum([1], bogus=1)
+    assert False, 'sum with unknown kwarg should raise'
+except TypeError as e:
+    assert str(e) == "sum() got an unexpected keyword argument 'bogus'"
+
+# === round: c_named missing required argument ===
+try:
+    round()
+    assert False, 'round() should raise'
+except TypeError as e:
+    assert str(e) == "round() missing required argument 'number' (pos 1)"
+
+try:
+    round(ndigits=1)
+    assert False, 'round(ndigits=1) should raise'
+except TypeError as e:
+    assert str(e) == "round() missing required argument 'number' (pos 1)"
+
+# === round: at_most_total pre-count ===
+try:
+    round(1, 2, 3)
+    assert False, 'round with 3 args should raise'
+except TypeError as e:
+    assert str(e) == 'round() takes at most 2 arguments (3 given)'
+
+# === round: unknown kwarg ===
+try:
+    round(1, bogus=2)
+    assert False, 'round with unknown kwarg should raise'
+except TypeError as e:
+    assert str(e) == "round() got an unexpected keyword argument 'bogus'"
+
+# =====================================================================
+# === enumerate — CPython's hand-written vectorcall parser           ===
+# =====================================================================
+# CPython special-cases enumerate's argument parsing (enumobject.c
+# `enumerate_vectorcall`), so its errors match no parser family; Monty
+# mirrors that parser exactly, quirks included.
+
+try:
+    enumerate()
+    assert False, 'enumerate() should raise'
+except TypeError as e:
+    assert str(e) == "enumerate() missing required argument 'iterable'"
+
+# Quirk: any unrecognised zero-positional keyword shape reports the missing
+# iterable — even when `iterable=` was actually passed.
+try:
+    enumerate(start=1, bogus=1, iterable=[1])
+    assert False, 'enumerate 3-kwarg form should raise'
+except TypeError as e:
+    assert str(e) == "enumerate() missing required argument 'iterable'"
+
+# Quirk: keyword names are validated positionally against the accepted
+# shapes, so a lone `start=` reports 'start' as invalid.
+try:
+    enumerate(start=1)
+    assert False, 'enumerate(start=1) should raise'
+except TypeError as e:
+    assert str(e) == "'start' is an invalid keyword argument for enumerate()"
+
+try:
+    enumerate([1], iterable=[2])
+    assert False, 'enumerate positional + iterable= should raise'
+except TypeError as e:
+    assert str(e) == "'iterable' is an invalid keyword argument for enumerate()"
+
+try:
+    enumerate([1], bogus=1)
+    assert False, 'enumerate with unknown kwarg should raise'
+except TypeError as e:
+    assert str(e) == "'bogus' is an invalid keyword argument for enumerate()"
+
+# Total pre-count fires whenever at least one positional is present.
+try:
+    enumerate([1], 0, 0)
+    assert False, 'enumerate with 3 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'enumerate() takes at most 2 arguments (3 given)'
+
+try:
+    enumerate([1], bogus=1, worse=2)
+    assert False, 'enumerate 1-pos 2-kwarg should raise'
+except TypeError as e:
+    assert str(e) == 'enumerate() takes at most 2 arguments (3 given)'
+
+# === unpack: arity wording (`{name} expected …`, no parentheses) ===
+try:
+    next()
+    assert False, 'next() should raise'
+except TypeError as e:
+    assert str(e) == 'next expected at least 1 argument, got 0'
+
+try:
+    next(iter([]), 1, 2)
+    assert False, 'next with 3 args should raise'
+except TypeError as e:
+    assert str(e) == 'next expected at most 2 arguments, got 3'
+
+try:
+    reversed()
+    assert False, 'reversed() should raise'
+except TypeError as e:
+    assert str(e) == 'reversed expected 1 argument, got 0'
+
+# === sum: body type-check reachable through the keyword path ===
+try:
+    sum([1], start='x')
+    assert False, 'sum string start= should raise'
+except TypeError as e:
+    assert str(e) == "sum() can't sum strings [use ''.join(seq) instead]"
+
+# === enumerate: lone unknown keyword ===
+try:
+    enumerate(bogus=1)
+    assert False, 'enumerate(bogus=1) should raise'
+except TypeError as e:
+    assert str(e) == "'bogus' is an invalid keyword argument for enumerate()"
+
+# === enumerate: two-kwarg form, each rejection branch ===
+# swapped order (start first) with a bad second name
+try:
+    enumerate(start=1, bogus=2)
+    assert False, 'enumerate(start=, bogus=) should raise'
+except TypeError as e:
+    assert str(e) == "'bogus' is an invalid keyword argument for enumerate()"
+
+# unswapped order with a bad first name
+try:
+    enumerate(bogus=2, start=1)
+    assert False, 'enumerate(bogus=, start=) should raise'
+except TypeError as e:
+    assert str(e) == "'bogus' is an invalid keyword argument for enumerate()"
+
+# unswapped order with a good first and bad second name
+try:
+    enumerate(iterable=[1], bogus=1)
+    assert False, 'enumerate(iterable=, bogus=) should raise'
+except TypeError as e:
+    assert str(e) == "'bogus' is an invalid keyword argument for enumerate()"
+
+# === enumerate: non-string keys reach its hand-written key check ===
+try:
+    enumerate([1], **{1: 2})
+    assert False, 'enumerate non-string key should raise'
+except TypeError as e:
+    assert str(e) == 'keywords must be strings'
+
+try:
+    enumerate(**{1: 2})
+    assert False, 'enumerate lone non-string key should raise'
+except TypeError as e:
+    assert str(e) == 'keywords must be strings'
+
+# =====================================================================
+# === def style: the base64 module (pure-Python defs in CPython) ===
+# =====================================================================
+
+try:
+    base64.b64encode()
+    assert False, 'b64encode() with no args should raise'
+except TypeError as e:
+    assert str(e) == "b64encode() missing 1 required positional argument: 's'"
+
+try:
+    base64.b64encode(b'a', b'-_', 1)
+    assert False, 'b64encode() with 3 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'b64encode() takes from 1 to 2 positional arguments but 3 were given'
+
+try:
+    base64.b64encode(b'a', bogus=1)
+    assert False, 'b64encode() with unknown kwarg should raise'
+except TypeError as e:
+    assert str(e) == "b64encode() got an unexpected keyword argument 'bogus'"
+
+try:
+    base64.b64decode(b'a', b'-_', True, 9)
+    assert False, 'b64decode() with 4 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'b64decode() takes from 1 to 3 positional arguments but 4 were given'
+
+try:
+    base64.b64decode(b'a', s=b'x')
+    assert False, 'b64decode() with a duplicated first argument should raise'
+except TypeError as e:
+    assert str(e) == "b64decode() got multiple values for argument 's'"
+
+# single-parameter functions report the fixed-arity form, not a range
+try:
+    base64.encodebytes(b'a', b'b')
+    assert False, 'encodebytes() with 2 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'encodebytes() takes 1 positional argument but 2 were given'
+
+try:
+    base64.b32decode()
+    assert False, 'b32decode() with no args should raise'
+except TypeError as e:
+    assert str(e) == "b32decode() missing 1 required positional argument: 's'"
+
+# =====================================================================
+# === binascii: the C parser families base64's pure Python delegates to ===
+# =====================================================================
+
+# === c_named + at_most_total: hexlify ===
+try:
+    binascii.hexlify()
+    assert False, 'hexlify() with no args should raise'
+except TypeError as e:
+    assert str(e) == "hexlify() missing required argument 'data' (pos 1)"
+
+try:
+    binascii.hexlify(b'a', b'-', 1, 2)
+    assert False, 'hexlify() with 4 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'hexlify() takes at most 3 arguments (4 given)'
+
+try:
+    binascii.hexlify(b'a', bogus=1)
+    assert False, 'hexlify() with unknown kwarg should raise'
+except TypeError as e:
+    assert str(e) == "hexlify() got an unexpected keyword argument 'bogus'"
+
+# === c_named: a required positional-only slot before keyword-only ones
+# reports the exact count in both directions, never a range ===
+try:
+    binascii.b2a_base64()
+    assert False, 'b2a_base64() with no args should raise'
+except TypeError as e:
+    assert str(e) == 'b2a_base64() takes exactly 1 positional argument (0 given)'
+
+try:
+    binascii.b2a_base64(b'a', False)
+    assert False, 'b2a_base64() with 2 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'b2a_base64() takes exactly 1 positional argument (2 given)'
+
+# `data` is positional-only, so naming it is an unfilled slot, not a conflict
+try:
+    binascii.b2a_base64(data=b'a')
+    assert False, 'b2a_base64() with data as a keyword should raise'
+except TypeError as e:
+    assert str(e) == 'b2a_base64() takes exactly 1 positional argument (0 given)'
+
+try:
+    binascii.a2b_base64(b'YWJj', True)
+    assert False, 'a2b_base64() with 2 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'a2b_base64() takes exactly 1 positional argument (2 given)'
+
+# === METH_O: unhexlify rejects keywords before counting positionals ===
+try:
+    binascii.unhexlify()
+    assert False, 'unhexlify() with no args should raise'
+except TypeError as e:
+    assert str(e) == 'binascii.unhexlify() takes exactly one argument (0 given)'
+
+try:
+    binascii.unhexlify(b'ab', 1)
+    assert False, 'unhexlify() with 2 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'binascii.unhexlify() takes exactly one argument (2 given)'
+
+try:
+    binascii.unhexlify(data=b'ab')
+    assert False, 'unhexlify() with a keyword should raise'
+except TypeError as e:
+    assert str(e) == 'binascii.unhexlify() takes no keyword arguments'
+
+# === unpack: crc32's `{name} expected …` arity, kwargs rejected wholesale ===
+try:
+    binascii.crc32()
+    assert False, 'crc32() with no args should raise'
+except TypeError as e:
+    assert str(e) == 'crc32 expected at least 1 argument, got 0'
+
+try:
+    binascii.crc32(b'a', 1, 2)
+    assert False, 'crc32() with 3 positionals should raise'
+except TypeError as e:
+    assert str(e) == 'crc32 expected at most 2 arguments, got 3'
+
+try:
+    binascii.crc32(data=b'a')
+    assert False, 'crc32() with a keyword should raise'
+except TypeError as e:
+    assert str(e) == 'binascii.crc32() takes no keyword arguments'

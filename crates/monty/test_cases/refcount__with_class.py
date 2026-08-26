@@ -1,10 +1,8 @@
 # Reference counts stay balanced through the `with` machinery's pushed
 # frames: `BeforeWith` pushes the ctx and the `__enter__` frame binds self;
 # `WithExit`/`WithExceptStart` bind self plus the exception triple. The
-# suppressed exception survives through the attribute written by `__exit__`;
-# we bind it to `survived` at the end so the strict ref-count check (which
-# requires every live heap object to be reachable from a named variable)
-# accounts for it rather than seeing an unreferenced third heap object.
+# suppressed exception survives through the attribute written by `__exit__`,
+# which we assert by binding it to `survived` at the end.
 class CM:
     def __enter__(self):
         return self
