@@ -58,6 +58,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // A clean shutdown lets instrumented workers flush their `.profraw` data.
+    // Dropping the pool kills idle workers, which can discard buffered profiles.
+    pool.close().await;
     println!(
         "Exercised {} test cases, {completed} completed, {typing_errors} retried without type checking",
         test_cases.len()
