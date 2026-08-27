@@ -628,7 +628,7 @@ jobs:
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       - name: build Python wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1.50.1
@@ -645,14 +645,14 @@ jobs:
           name: pypi_files-python-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'manylinux' }}
           path: crates/monty-python/dist
 
-      # Maturin performs one PGO cycle for bin bindings, then packages the
-      # runtime for each supported Python tag.
+      # Maturin performs one PGO cycle for bin bindings for all versions (runtime is not
+      # tied to the Python ABI).
       - name: build runtime wheel
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1.50.1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'manylinux_2_28' }}
-          args: --release ${{ matrix.pgo-runtime && '--pgo' || '' }} --out dist
+          args: --release ${{ matrix.pgo-runtime && '--pgo' || '' }} --out dist -i 3.14
           rust-toolchain: stable
           rustup-components: ${{ matrix.pgo-runtime && 'llvm-tools-preview' || '' }}
           docker-options: -e CI
