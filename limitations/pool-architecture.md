@@ -198,7 +198,9 @@ properties that real CPython does not provide, per the caveat above.
   decodes straight into its final type with no intermediate copy, so the
   worst-case host *peak* is ~1× the budget plus the ≤256 MiB frame buffer, and
   the bound applies per concurrent worker. The browser component applies the
-  same expanded-value budget before lifting a semantic event into JavaScript.
+  same expanded-value budget across all WIT value arenas in a request before
+  constructing their `MontyObject`s, and before lifting a semantic event into
+  JavaScript.
 - Semantic validation of protobuf values (date ranges, timedelta normalization,
   exception/type/builtin names) happens *while decoding* the frame; the browser
   component applies the same checks while converting its WIT value arena. A frame

@@ -92,8 +92,12 @@ function pushMarked(object: Record<string, unknown>, nodes: ValueNode[]): ValueN
           minute: Number(object.minute),
           second: Number(object.second),
           microsecond: Number(object.microsecond),
-          ...(object.offsetSeconds === undefined ? {} : { offsetSeconds: Number(object.offsetSeconds) }),
-          ...(object.timezoneName === undefined ? {} : { timezoneName: String(object.timezoneName) }),
+          ...(object.offsetSeconds === undefined || object.offsetSeconds === null
+            ? {}
+            : {
+                offsetSeconds: Number(object.offsetSeconds),
+                ...(typeof object.timezoneName === 'string' ? { timezoneName: object.timezoneName } : {}),
+              }),
         },
       }
     case 'TimeDelta':

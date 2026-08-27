@@ -252,7 +252,9 @@ export class WorkerTransport {
   private async run(request: ComponentRequest, onPrint: OnPrint | undefined): Promise<ComponentEvent | null> {
     let events: ComponentEvent[]
     try {
-      events = (await this.dispatcher(request)).events
+      const result = await this.dispatcher(request)
+      if (result.status === 'shutdown') this.dead = true
+      events = result.events
     } catch {
       return null
     }

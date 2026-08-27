@@ -184,6 +184,7 @@ fn object_host_size(object: &MontyObject) -> usize {
 
 /// Converts a semantic component request into the child state machine's type.
 fn request_from_component(request: Request) -> Result<pb::ParentRequest, String> {
+    let mut budget = value::DecodeBudget::default();
     let kind = match request {
         Request::Configure(request) => pb::parent_request::Kind::Configure(configure_from_component(request)),
         Request::Feed(request) => pb::parent_request::Kind::Feed(pb::Feed {
@@ -194,7 +195,7 @@ fn request_from_component(request: Request) -> Result<pb::ParentRequest, String>
                 .map(|input| {
                     Ok(pb::NamedValue {
                         name: input.name,
-                        value: Some(value::from_component(input.value)?.into()),
+                        value: Some(value::from_component(input.value, &mut budget)?.into()),
                     })
                 })
                 .collect::<Result<_, String>>()?,
@@ -202,12 +203,12 @@ fn request_from_component(request: Request) -> Result<pb::ParentRequest, String>
         }),
         Request::ResumeCall(request) => pb::parent_request::Kind::ResumeCall(pb::ResumeCall {
             call_id: request.call_id,
-            result: Some(call_result_from_component(request.outcome)?),
+            result: Some(call_result_from_component(request.outcome, &mut budget)?),
         }),
         Request::ResumeNameLookup(result) => {
             let kind = match result {
                 NameLookupResult::Value(value) => {
-                    pb::resume_name_lookup::Kind::Value(value::from_component(value)?.into())
+                    pb::resume_name_lookup::Kind::Value(value::from_component(value, &mut budget)?.into())
                 }
                 NameLookupResult::Undefined => pb::resume_name_lookup::Kind::Undefined(pb::Unit {}),
             };
@@ -219,7 +220,7 @@ fn request_from_component(request: Request) -> Result<pb::ParentRequest, String>
                 .map(|result| {
                     Ok(pb::FutureResult {
                         call_id: result.call_id,
-                        result: Some(call_result_from_component(result.outcome)?),
+                        result: Some(call_result_from_component(result.outcome, &mut budget)?),
                     })
                 })
                 .collect::<Result<_, String>>()?,
@@ -270,10 +271,13 @@ fn type_check_format_from_component(format: TypeCheckFormat) -> pb::TypeCheckFor
 }
 
 /// Converts a host call outcome into the child state machine's result type.
-fn call_result_from_component(result: CallResult) -> Result<pb::ExtFunctionResult, String> {
+fn call_result_from_component(
+    result: CallResult,
+    budget: &mut value::DecodeBudget,
+) -> Result<pb::ExtFunctionResult, String> {
     let kind = match result {
         CallResult::ReturnValue(value) => {
-            pb::ext_function_result::Kind::ReturnValue(value::from_component(value)?.into())
+            pb::ext_function_result::Kind::ReturnValue(value::from_component(value, budget)?.into())
         }
         CallResult::Error(error) => pb::ext_function_result::Kind::Error(pb::RaisedException {
             exc_type: error.exc_type,
