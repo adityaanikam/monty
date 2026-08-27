@@ -7,7 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use monty_pool::{Pool, PoolConfig, PoolError, ReplConfig, TurnEvent, on_print_sync};
+use monty_pool::{Checkout, OnPrint, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue, TurnEvent, on_print_sync};
+use monty_types::MontyObject;
 
 /// Runs Monty's test-case corpus through subprocess pool sessions.
 #[tokio::main]
@@ -36,25 +37,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
         let mut on_print = on_print_sync(|_, _| {});
 
-        match session.feed(&code, vec![], vec![], false, &mut on_print).await {
-            Ok(TurnEvent::Complete(_)) => {
+        match run_code(&mut session, &code, false, &mut on_print).await {
+            Ok(()) => {
                 completed += 1;
                 session.finish().await?;
             }
             Err(PoolError::Typing(_)) => {
                 typing_errors += 1;
-                match session.feed(&code, vec![], vec![], true, &mut on_print).await {
-                    Ok(TurnEvent::Complete(_)) => {
+                match run_code(&mut session, &code, true, &mut on_print).await {
+                    Ok(()) => {
                         completed += 1;
                         session.finish().await?;
                     }
                     Err(PoolError::Runtime(_)) => session.finish().await?,
-                    Ok(_) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
             Err(PoolError::Runtime(_)) => session.finish().await?,
-            Ok(_) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -64,6 +63,67 @@ async fn main() -> Result<(), Box<dyn Error>> {
         test_cases.len()
     );
     Ok(())
+}
+
+/// Runs a snippet through completion, answering every suspension with fixture-like values.
+async fn run_code(
+    session: &mut Checkout,
+    code: &str,
+    skip_type_check: bool,
+    on_print: OnPrint<'_>,
+) -> Result<(), PoolError> {
+    let mut event = session
+        .feed(code, vec![], vec![], skip_type_check, &mut *on_print)
+        .await?;
+    loop {
+        event = match event {
+            TurnEvent::Complete(_) => break Ok(()),
+            TurnEvent::FunctionCall { .. } => {
+                session
+                    .resume(ResumeValue::Return(MontyObject::None), &mut *on_print)
+                    .await?
+            }
+            TurnEvent::OsCall { .. } => match session.resume_from_mounts(&mut *on_print).await? {
+                Some(event) => event,
+                None => session.resume(ResumeValue::NotHandled, &mut *on_print).await?,
+            },
+            TurnEvent::NameLookup { name } => {
+                session
+                    .resume_name_lookup(name_lookup_value(name), &mut *on_print)
+                    .await?
+            }
+            TurnEvent::ResolveFutures { pending_call_ids } => {
+                let results = pending_call_ids
+                    .into_iter()
+                    .map(|call_id| (call_id, ResumeValue::Return(MontyObject::None)))
+                    .collect();
+                session.resume_futures(results, &mut *on_print).await?
+            }
+        };
+    }
+}
+
+/// Returns representative host values for names used by the shared test corpus.
+fn name_lookup_value(name: String) -> Option<MontyObject> {
+    match name.as_str() {
+        "add_ints" | "concat_strings" | "return_value" | "get_list" | "raise_error" | "make_point"
+        | "make_mutable_point" | "make_user" | "make_empty" | "async_call" | "async_fail" => {
+            Some(MontyObject::Function { name, docstring: None })
+        }
+        "CONST_INT" => Some(MontyObject::Int(42)),
+        "CONST_STR" => Some(MontyObject::String("hello".to_owned())),
+        #[expect(clippy::approx_constant, reason = "3.14 is the test fixture value")]
+        "CONST_FLOAT" => Some(MontyObject::Float(3.14)),
+        "CONST_BOOL" => Some(MontyObject::Bool(true)),
+        "CONST_LIST" => Some(MontyObject::List(vec![
+            MontyObject::Int(1),
+            MontyObject::Int(2),
+            MontyObject::Int(3),
+        ])),
+        "CONST_NONE" => Some(MontyObject::None),
+        "root" => Some(MontyObject::Path("/mnt".to_owned())),
+        _ => None,
+    }
 }
 
 /// Resolves `monty` from the environment maturin prepares for PGO training.
