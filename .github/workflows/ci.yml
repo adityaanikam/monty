@@ -652,7 +652,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'manylinux_2_28' }}
-          args: --release ${{ matrix.pgo-runtime && '--pgo' || '' }} --out dist -i 3.14
+          args: --release ${{ matrix.pgo-runtime && '--pgo -i 3.14' || '' }} --out dist
           rust-toolchain: stable
           rustup-components: ${{ matrix.pgo-runtime && 'llvm-tools-preview' || '' }}
           docker-options: -e CI
