@@ -652,10 +652,15 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'manylinux_2_28' }}
+          # `uv` provides Python 3.14 inside the manylinux container for the
+          # interpreter maturin uses while running the PGO build.
+          before-script-linux: |
+            curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+            uv python install 3.14
           args: --release ${{ matrix.pgo-runtime && '--pgo -i 3.14' || '' }} --out dist
           rust-toolchain: stable
           rustup-components: ${{ matrix.pgo-runtime && 'llvm-tools-preview' || '' }}
-          docker-options: -e CI
+          docker-options: -e CI -e UV_PYTHON
           working-directory: crates/monty-runtime
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
