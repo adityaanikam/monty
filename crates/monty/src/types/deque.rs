@@ -337,7 +337,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
 
     /// `in` walks the deque comparing each item by `==`, like `list`.
     fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let len = self.get(vm.heap).len();
+        let this = self.get(vm.heap);
+        let (len, start_state) = (this.len(), this.state());
         for i in 0..len {
             let el = self
                 .get(vm.heap)
@@ -348,6 +349,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
             el.drop_with(vm);
             if eq? {
                 return Ok(Some(true));
+            }
+            // A user `__eq__` mutating the deque invalidates the walk (and the
+            // indices above); CPython raises, checking only after a false compare.
+            if self.get(vm.heap).state() != start_state {
+                return Err(ExcType::runtime_error_deque_mutated());
             }
         }
         Ok(Some(false))
@@ -412,6 +418,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
         if len != other.get(vm.heap).len() {
             return Ok(Some(false));
         }
+        let start_states = states(self, &other, vm);
         // Charge a recursion level: two distinct cyclic deques (`a.append(a);
         // b.append(b); a == b`) re-enter here per level and would otherwise
         // overflow the host stack. A deque walks by index, so it charges directly.
@@ -424,6 +431,12 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
             defer_drop!(b, vm);
             if !a.py_eq(b, vm)? {
                 return Ok(Some(false));
+            }
+            // A user `__eq__` mutating either deque leaves `len` and the indices
+            // above stale. CPython walks both with iterators, which notice on the
+            // step after the comparison — so check here, not before the compare.
+            if states(self, &other, vm) != start_states {
+                return Err(ExcType::runtime_error_deque_mutated());
             }
         }
         Ok(Some(true))
@@ -438,6 +451,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
     fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
         let self_len = self.get(vm.heap).len();
         let other_len = other.get(vm.heap).len();
+        let start_states = states(self, other, vm);
         let mut guard = vm.recursion_guard()?;
         let vm = &mut *guard;
         for i in 0..self_len.min(other_len) {
@@ -459,6 +473,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
                         return Ok(CmpOrder::Incomparable);
                     }
                 }
+            }
+            // Either comparison above can run a user `__eq__`/`__lt__` that
+            // resizes a deque, invalidating the indices — see `py_eq_impl`.
+            if states(self, other, vm) != start_states {
+                return Err(ExcType::runtime_error_deque_mutated());
             }
         }
         // All shared items equal — the shorter deque sorts first.
@@ -514,7 +533,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
     fn py_iadd_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
         // `deque_extend` consumes the iterable, so hand it an owned clone.
         let iterable = other.clone_with_heap(vm.heap);
-        deque_extend(self.id(), iterable, ExtendEnd::Right, vm)?;
+        deque_extend(self, iterable, ExtendEnd::Right, vm)?;
         Ok(true)
     }
 
@@ -559,8 +578,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
             args.drop_with(vm);
             return Err(ExcType::attribute_error(Type::Deque, attr.as_str(vm.interns)));
         };
-        let self_id = self.id();
-        call_deque_method(self, self_id, method, args, vm).map(CallResult::Value)
+        call_deque_method(self, method, args, vm).map(CallResult::Value)
     }
 }
 
@@ -581,6 +599,14 @@ impl HeapItem for Deque {
             }
         }
     }
+}
+
+/// Reads both deques' mutation counters, for comparing against a captured pair.
+///
+/// The deque comparisons walk `self` and `other` by index, so a user `__eq__`
+/// resizing *either* one invalidates the walk; both counters must be watched.
+fn states<'h>(a: &HeapObjectRead<'h, Deque>, b: &HeapObjectRead<'h, Deque>, vm: &VM<'h>) -> (u64, u64) {
+    (a.get(vm.heap).state(), b.get(vm.heap).state())
 }
 
 /// Iterates over a deque, raising if it is structurally mutated mid-iteration.
@@ -691,8 +717,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, DequeIterator> {
 /// name the type), while `index`/`insert`/`rotate` use `PyArg_UnpackTuple` (which
 /// does not). The messages are reproduced verbatim.
 fn call_deque_method<'h>(
-    deque: &mut HeapRead<'h, Deque>,
-    self_id: HeapId,
+    deque: &mut HeapObjectRead<'h, Deque>,
     method: StaticStrings,
     args: ArgValues,
     vm: &mut VM<'h>,
@@ -757,13 +782,13 @@ fn call_deque_method<'h>(
         }
         StaticStrings::Extend => {
             let iterable = args.get_one_arg("deque.extend", vm.heap)?;
-            deque_extend(self_id, iterable, ExtendEnd::Right, vm)?;
+            deque_extend(deque, iterable, ExtendEnd::Right, vm)?;
             Ok(Value::None)
         }
         StaticStrings::Extendleft => {
             let iterable = args.get_one_arg("deque.extendleft", vm.heap)?;
             // extendleft REVERSES the input: each item is pushed to the front in turn.
-            deque_extend(self_id, iterable, ExtendEnd::Left, vm)?;
+            deque_extend(deque, iterable, ExtendEnd::Left, vm)?;
             Ok(Value::None)
         }
         StaticStrings::Rotate => rotate(deque, args, vm),
@@ -852,11 +877,20 @@ fn remove<'h>(deque: &mut HeapRead<'h, Deque>, args: ArgValues, vm: &mut VM<'h>)
     let target = args.get_one_arg("deque.remove", vm.heap)?;
     defer_drop!(target, vm);
 
-    let len = deque.get(vm.heap).len();
+    let (len, start_state) = {
+        let this = deque.get(vm.heap);
+        (this.len(), this.state())
+    };
     for i in 0..len {
         let item = deque.get(vm.heap).items[i].clone_with_heap(vm.heap);
         defer_drop!(item, vm);
-        if item.py_eq(target, vm)? {
+        let eq = item.py_eq(target, vm)?;
+        // CPython checks for mutation by the user `__eq__` before acting on the
+        // comparison — even a matching one — and quirkily raises IndexError here.
+        if deque.get(vm.heap).state() != start_state {
+            return Err(ExcType::index_error_deque_mutated());
+        }
+        if eq {
             let this = deque.get_mut(vm.heap);
             let removed = this.items.remove(i).expect("index in range");
             // Only a successful removal bumps: a `remove()` that raises ValueError
@@ -892,11 +926,17 @@ fn index<'h>(deque: &mut HeapRead<'h, Deque>, args: ArgValues, vm: &mut VM<'h>) 
     };
     let stop = bound_arg(stop, len, len, vm)?;
 
+    let start_state = deque.get(vm.heap).state();
     for i in start..stop.min(len) {
         let item = deque.get(vm.heap).items[i].clone_with_heap(vm.heap);
         defer_drop!(item, vm);
         if item.py_eq(target, vm)? {
             return Ok(Value::Int(i64::try_from(i).expect("index fits in i64")));
+        }
+        // A user `__eq__` mutating the deque invalidates the walk; CPython
+        // raises, checking only after a false compare.
+        if deque.get(vm.heap).state() != start_state {
+            return Err(ExcType::runtime_error_deque_mutated());
         }
     }
     Err(ExcType::value_error_deque_index())
@@ -907,13 +947,21 @@ fn count<'h>(deque: &mut HeapRead<'h, Deque>, args: ArgValues, vm: &mut VM<'h>) 
     let target = args.get_one_arg("deque.count", vm.heap)?;
     defer_drop!(target, vm);
 
-    let len = deque.get(vm.heap).len();
+    let (len, start_state) = {
+        let this = deque.get(vm.heap);
+        (this.len(), this.state())
+    };
     let mut total: i64 = 0;
     for i in 0..len {
         let item = deque.get(vm.heap).items[i].clone_with_heap(vm.heap);
         defer_drop!(item, vm);
         if item.py_eq(target, vm)? {
             total += 1;
+        }
+        // A user `__eq__` mutating the deque invalidates the walk; CPython
+        // checks after counting each compare.
+        if deque.get(vm.heap).state() != start_state {
+            return Err(ExcType::runtime_error_deque_mutated());
         }
     }
     Ok(Value::Int(total))
@@ -959,7 +1007,7 @@ pub(crate) enum ExtendEnd {
     Left,
 }
 
-/// Extends `deque_id` in place by every item of `iterable` — `deque.extend`
+/// Extends `deque` in place by every item of `iterable` — `deque.extend`
 /// and `extendleft`, and CPython's `deque.__iadd__` (`+=` *is* `extend`).
 ///
 /// Each item is appended as the source yields it, so an iterator that raises
@@ -969,17 +1017,23 @@ pub(crate) enum ExtendEnd {
 /// Extending a deque *by itself* is the one case that cannot append while it
 /// iterates, or it would chase its own tail; it snapshots the original items
 /// first, as CPython does.
-///
-/// The deque is re-read for each append rather than held across the loop: the
-/// source's `__next__` can run sandbox code, and a live read handle would block
-/// the heap from freeing the entry.
-pub(crate) fn deque_extend(deque_id: HeapId, iterable: Value, end: ExtendEnd, vm: &mut VM<'_>) -> RunResult<()> {
-    if iterable.ref_id() == Some(deque_id) {
-        let items = deque_snapshot(deque_id, vm).into_iter();
+pub(crate) fn deque_extend<'h>(
+    deque: &mut HeapObjectRead<'h, Deque>,
+    iterable: Value,
+    end: ExtendEnd,
+    vm: &mut VM<'h>,
+) -> RunResult<()> {
+    if iterable.ref_id() == Some(deque.id()) {
+        let items = deque
+            .get(vm.heap)
+            .iter()
+            .map(|item| item.clone_with_heap(vm.heap))
+            .collect::<Vec<_>>()
+            .into_iter();
         iterable.drop_with(vm);
         defer_drop_mut!(items, vm);
         for item in items.by_ref() {
-            deque_push(deque_id, item, end, vm);
+            deque_push(deque, item, end, vm);
         }
         Ok(())
     } else {
@@ -993,40 +1047,17 @@ pub(crate) fn deque_extend(deque_id: HeapId, iterable: Value, end: ExtendEnd, vm
         // retains at most `maxlen` items however long the iterator, so cap
         // the estimate at what it can actually keep.
         let hint = iter.iter_size_hint(vm);
-        let retained = deque_maxlen(deque_id, vm).map_or(hint, |maxlen| hint.min(maxlen));
+        let retained = deque.get(vm.heap).maxlen().map_or(hint, |maxlen| hint.min(maxlen));
         check_estimated_size(retained.saturating_mul(VALUE_SIZE), &vm.heap.tracker)?;
         while let Some(item) = iter.py_next(vm)? {
-            deque_push(deque_id, item, end, vm);
+            deque_push(deque, item, end, vm);
         }
         Ok(())
     }
 }
 
-/// The `maxlen` bound of the deque `deque_id`, or `None` if unbounded.
-fn deque_maxlen(deque_id: HeapId, vm: &VM<'_>) -> Option<usize> {
-    let HeapReadOutput::Deque(deque) = vm.heap.read(deque_id) else {
-        unreachable!("deque id must reference a deque");
-    };
-    deque.get(vm.heap).maxlen()
-}
-
-/// Clones every item of the deque `deque_id`, for the self-extension case.
-fn deque_snapshot(deque_id: HeapId, vm: &mut VM<'_>) -> Vec<Value> {
-    let HeapReadOutput::Deque(deque) = vm.heap.read(deque_id) else {
-        unreachable!("deque id must reference a deque");
-    };
-    deque
-        .get(vm.heap)
-        .iter()
-        .map(|item| item.clone_with_heap(vm.heap))
-        .collect()
-}
-
-/// Appends one item to whichever end of `deque_id` the extension targets.
-fn deque_push(deque_id: HeapId, item: Value, end: ExtendEnd, vm: &mut VM<'_>) {
-    let HeapReadOutput::Deque(mut deque) = vm.heap.read(deque_id) else {
-        unreachable!("deque id must reference a deque");
-    };
+/// Appends one item to whichever end the extension targets.
+fn deque_push<'h>(deque: &mut HeapRead<'h, Deque>, item: Value, end: ExtendEnd, vm: &mut VM<'h>) {
     match end {
         ExtendEnd::Right => deque.append(vm, item),
         ExtendEnd::Left => deque.appendleft(vm, item),
