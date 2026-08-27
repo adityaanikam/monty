@@ -322,7 +322,7 @@ impl<'h> VM<'h> {
             // Load or initialize the next task's context
             self.load_or_init_task(next_task_id)?;
 
-            // Continue execution - return FramePushed to reload cache and continue run loop
+            // Continue execution with the newly current frame
             Ok(AwaitResult::FramePushed)
         } else {
             // No ready tasks - yield control to host.
@@ -481,7 +481,7 @@ impl<'h> VM<'h> {
             self.scheduler.set_current_task(Some(next_task_id));
             self.load_or_init_task(next_task_id)?;
         }
-        // If no ready tasks, frames will be empty and run loop will yield
+        // If no task is ready, the placeholder frame remains parked until resume.
 
         Ok(())
     }
@@ -491,8 +491,8 @@ impl<'h> VM<'h> {
     /// Serializes frames, moves stack/exception_stack, stores instruction_ip,
     /// and adjusts the global recursion depth counter.
     fn save_task_context(&mut self, task_id: TaskId) {
-        let frames: Vec<SerializedTaskFrame> = self
-            .frames
+        let mut frames: Vec<SerializedTaskFrame> = self
+            .suspended_frames
             .drain(..)
             .map(|f| {
                 assert!(
@@ -510,6 +510,20 @@ impl<'h> VM<'h> {
                 }
             })
             .collect();
+        let current = &self.current_frame;
+        assert!(
+            current.generator_id.is_none(),
+            "cannot save an actively executing generator frame as an async task"
+        );
+        frames.push(SerializedTaskFrame {
+            function_id: current.function_id,
+            ip: current.ip,
+            stack_base: current.stack_base,
+            locals_count: current.locals_count,
+            exception_stack_base: current.exception_stack_base,
+            call_offset: current.call_offset,
+            is_initializer: current.is_initializer,
+        });
 
         // Count this task's recursion depth contribution and subtract it from
         // the global counter so the next task gets a clean budget.
@@ -551,8 +565,8 @@ impl<'h> VM<'h> {
             self.exception_stack = exception_stack;
             self.instruction_ip = instruction_ip;
 
-            // Reconstruct CallFrames from serialized form
-            self.frames = frames
+            // Reconstruct the suspended callers and current frame.
+            let mut frames: Vec<_> = frames
                 .into_iter()
                 .map(|sf| {
                     let code = match sf.function_id {
@@ -564,6 +578,7 @@ impl<'h> VM<'h> {
                     };
                     CallFrame {
                         code,
+                        bytecode: code.bytecode(),
                         ip: sf.ip,
                         stack_base: sf.stack_base,
                         locals_count: sf.locals_count,
@@ -572,18 +587,19 @@ impl<'h> VM<'h> {
                         call_offset: sf.call_offset,
                         generator_id: None,
                         should_return: false,
+                        is_parked: false,
                         is_initializer: sf.is_initializer,
                     }
                 })
                 .collect();
+            self.current_frame = frames.pop().expect("task context contains no active frame");
+            self.suspended_frames = frames;
         } else if let Some(coro_id) = coroutine_id {
             // New task: pre-check the coroutine state here rather than letting
             // `init_task_from_coroutine` raise. By this point the calling task's
-            // frames have already been saved away, so any error raised from
-            // inside `init_task_from_coroutine` would reach `handle_exception`
-            // with no active frame and panic. Instead, route already-awaited
-            // failures through `handle_task_failure`, which restores the waiter's
-            // (or next task's) frames before the error propagates.
+            // frames have already been saved, so route already-awaited failures
+            // through `handle_task_failure`, which restores the waiter before
+            // the error propagates.
             let HeapReadOutput::Coroutine(coro) = self.heap.read(coro_id) else {
                 panic!("task coroutine_id doesn't point to a Coroutine")
             };
@@ -640,14 +656,15 @@ impl<'h> VM<'h> {
         self.stack.extend(namespace_values);
 
         let exc_stack_base = self.exception_stack.len();
-        self.push_frame(CallFrame::new_function(
+        self.current_frame = CallFrame::new_function(
             &func.code,
             stack_base,
             locals_count,
             exc_stack_base,
             func_id,
             None, // No call position — this is the root frame for a spawned task
-        ))?;
+        );
+        self.suspended_frames.clear();
 
         Ok(())
     }
@@ -703,7 +720,7 @@ impl<'h> VM<'h> {
             return;
         }
 
-        let task_is_current = self.scheduler.current_task_id() == Some(task_id) && !self.frames.is_empty();
+        let task_is_current = self.scheduler.current_task_id() == Some(task_id) && !self.current_frame.is_parked;
         if task_is_current {
             self.stack.push(value);
         } else {

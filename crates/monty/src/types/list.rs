@@ -790,21 +790,21 @@ fn list_index<'h>(list: &HeapRead<'h, List>, args: ArgValues, vm: &mut VM<'h>) -
     let pos_args = args.into_pos_only("list.index", vm.heap)?;
     defer_drop!(pos_args, vm);
 
-    let len = list.get(vm.heap).items.len();
-    let (value, start, end) = match pos_args.as_slice() {
+    // Bounds are coerced before the length is read: `as_int` may dispatch a user
+    // `__index__` that mutates this list, and CPython normalizes against the
+    // length *after* argument parsing. Reading it first would resolve a negative
+    // bound against a stale length and search the wrong window.
+    let (value, start_arg, end_arg) = match pos_args.as_slice() {
         [] => return Err(ExcType::type_error_at_least("list.index", 1, 0)),
-        [value] => (value, 0, len),
-        [value, start_arg] => {
-            let start = normalize_sequence_index(start_arg.as_int(vm)?, len);
-            (value, start, len)
-        }
-        [value, start_arg, end_arg] => {
-            let start = normalize_sequence_index(start_arg.as_int(vm)?, len);
-            let end = normalize_sequence_index(end_arg.as_int(vm)?, len).max(start);
-            (value, start, end)
-        }
+        [value] => (value, None, None),
+        [value, start_arg] => (value, Some(start_arg.as_int(vm)?), None),
+        [value, start_arg, end_arg] => (value, Some(start_arg.as_int(vm)?), Some(end_arg.as_int(vm)?)),
         other => return Err(ExcType::type_error_at_most("list.index", 3, other.len())),
     };
+
+    let len = list.get(vm.heap).items.len();
+    let start = start_arg.map_or(0, |i| normalize_sequence_index(i, len));
+    let end = end_arg.map_or(len, |i| normalize_sequence_index(i, len)).max(start);
 
     // Search for the value in the specified range
     let iter = list.iter(vm)?;
@@ -1056,6 +1056,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        bytecode::Code,
         heap::{Heap, HeapReader},
         intern::{InternerBuilder, Interns},
         types::LongInt,
@@ -1089,14 +1090,16 @@ mod tests {
         let (mut heap, list_id, index_id) =
             create_heap_with_list_and_longint(vec![Value::Int(10), Value::Int(20), Value::Int(30)], BigInt::from(1));
         let mut interns = create_test_interns();
+        let code = Code::empty();
 
         let key = Value::Ref(index_id);
         let new_value = Value::Int(99);
         heap.inc_ref(index_id);
 
-        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
             let mut vm = VM::new(
                 Vec::new(),
+                code,
                 reader,
                 interns,
                 PrintWriter::Disabled,
@@ -1128,14 +1131,16 @@ mod tests {
             BigInt::from(-1), // Last element
         );
         let mut interns = create_test_interns();
+        let code = Code::empty();
 
         let key = Value::Ref(index_id);
         let new_value = Value::Int(99);
         heap.inc_ref(index_id);
 
-        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
             let mut vm = VM::new(
                 Vec::new(),
+                code,
                 reader,
                 interns,
                 PrintWriter::Disabled,
@@ -1164,14 +1169,16 @@ mod tests {
         let (mut heap, list_id, index_id) =
             create_heap_with_list_and_longint(vec![Value::Int(10)], BigInt::from(i64::MAX));
         let mut interns = create_test_interns();
+        let code = Code::empty();
 
         let key = Value::Ref(index_id);
         let new_value = Value::Int(99);
         heap.inc_ref(index_id);
 
-        let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
+        let result = HeapReader::with(&mut heap, &mut (&code, &mut interns), |reader, (code, interns)| {
             let mut vm = VM::new(
                 Vec::new(),
+                code,
                 reader,
                 interns,
                 PrintWriter::Disabled,

@@ -137,23 +137,22 @@ impl VM<'_> {
 
     /// Moves the current generator frame's stack region back into its heap state.
     pub(super) fn suspend_generator(&mut self, ip: usize) -> RunResult<()> {
-        let frame = self.frames.pop().expect("YieldValue without a frame");
-        let Some(generator_id) = frame.generator_id else {
-            self.frames.push(frame);
+        let Some(generator_id) = self.current_frame.generator_id else {
             return Err(RunError::internal("YieldValue outside a generator frame"));
         };
-        debug_assert_eq!(self.exception_stack.len(), frame.exception_stack_base);
-        let stack = self.stack.split_off(frame.stack_base);
+        debug_assert_eq!(self.exception_stack.len(), self.current_frame.exception_stack_base);
+        let stack = self.stack.split_off(self.current_frame.stack_base);
         let HeapReadOutput::Generator(mut generator) = self.heap.read(generator_id) else {
             return Err(RunError::internal("generator frame owner changed heap type"));
         };
         let generator = generator.get_mut(self.heap);
         debug_assert!(matches!(generator.state, GeneratorState::Running));
         generator.state = GeneratorState::Suspended { ip, stack };
-        if let Some(parent) = self.frames.last() {
-            self.instruction_ip = parent.ip;
-        }
-        if !self.frames.is_empty() {
+
+        let caller = self.suspended_frames.pop().expect("generator frame has no caller");
+        self.current_frame = caller;
+        self.instruction_ip = self.current_frame.ip;
+        if !self.current_frame.is_parked {
             self.decr_recursion();
         }
         Ok(())
