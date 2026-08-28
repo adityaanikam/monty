@@ -344,8 +344,7 @@ pub(super) fn host_iterdir(dir: &Dir, rel: &str, vpath: &str, budget: MemoryBudg
 /// `overlay::append_bytes` already applies when materializing a backing file.
 pub(super) fn existing_file_len(dir: &Dir, rel: &str) -> usize {
     dir.metadata(rel)
-        .map(|meta| usize::try_from(meta.len()).unwrap_or(usize::MAX))
-        .unwrap_or(0)
+        .map_or(0, |meta| usize::try_from(meta.len()).unwrap_or(usize::MAX))
 }
 
 /// Validates that writing `bytes` would not exceed the mount's quota.
